@@ -1,5 +1,5 @@
 /*
-Copyright 2018 The Kubernetes Authors.
+Copyright 2020 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"net/http"
 	_ "net/http/pprof" //nolint
 	"os"
@@ -36,6 +37,7 @@ import (
 	infrav1alpha3 "sigs.k8s.io/cluster-api-provider-azure/api/v1alpha3"
 	"sigs.k8s.io/cluster-api-provider-azure/controllers"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
+	expv1 "sigs.k8s.io/cluster-api/exp/api/v1alpha3"
 	"sigs.k8s.io/cluster-api/feature"
 	"sigs.k8s.io/cluster-api/util/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -56,6 +58,8 @@ func init() {
 	_ = infrav1alpha3.AddToScheme(scheme)
 	_ = clusterv1.AddToScheme(scheme)
 	_ = infrastructurev1alpha3.AddToScheme(scheme)
+	_ = expv1.AddToScheme(scheme)
+
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -133,10 +137,16 @@ func InitFlags(fs *pflag.FlagSet) {
 	feature.MutableGates.AddFlag(fs)
 }
 
+func init() {
+	fmt.Println("logging startup")
+	fmt.Println(os.Args)
+}
+
 func main() {
+
 	InitFlags(pflag.CommandLine)
 	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
-	pflag.Parse()
+	// pflag.Parse()
 
 	if watchNamespace != "" {
 		setupLog.Info("Watching cluster-api objects only in namespace for reconciliation", "namespace", watchNamespace)
@@ -191,6 +201,22 @@ func main() {
 			Recorder: mgr.GetEventRecorderFor("azurecluster-reconciler"),
 		}).SetupWithManager(mgr, controller.Options{MaxConcurrentReconciles: azureClusterConcurrency}); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "AzureCluster")
+			os.Exit(1)
+		}
+		if err = (&controllers.AzureManagedMachinePoolReconciler{
+			Client:   mgr.GetClient(),
+			Log:      ctrl.Log.WithName("controllers").WithName("AzureManagedMachinePool"),
+			Recorder: mgr.GetEventRecorderFor("azuremachine-reconciler"),
+		}).SetupWithManager(mgr, controller.Options{MaxConcurrentReconciles: azureMachineConcurrency}); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "AzureManagedMachinePool")
+			os.Exit(1)
+		}
+		if err = (&controllers.AzureManagedClusterReconciler{
+			Client:   mgr.GetClient(),
+			Log:      ctrl.Log.WithName("controllers").WithName("AzureManagedCluster"),
+			Recorder: mgr.GetEventRecorderFor("azurecluster-reconciler"),
+		}).SetupWithManager(mgr, controller.Options{MaxConcurrentReconciles: azureClusterConcurrency}); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "AzureManagedCluster")
 			os.Exit(1)
 		}
 	} else {

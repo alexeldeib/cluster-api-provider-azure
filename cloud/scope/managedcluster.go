@@ -1,0 +1,131 @@
+/*
+Copyright 2018 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package scope
+
+import (
+	"context"
+
+	"github.com/go-logr/logr"
+	"github.com/pkg/errors"
+	"k8s.io/klog/klogr"
+	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1alpha3"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
+	"sigs.k8s.io/cluster-api/util/patch"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+// ManagedClusterScopeParams defines the input parameters used to create a new Scope.
+type ManagedClusterScopeParams struct {
+	AzureClients
+	Client              client.Client
+	Logger              logr.Logger
+	Cluster             *clusterv1.Cluster
+	AzureManagedCluster *infrav1.AzureManagedCluster
+	Context             context.Context
+}
+
+// NewManagedClusterScope creates a new Scope from the supplied parameters.
+// This is meant to be called for each reconcile iteration.
+func NewManagedClusterScope(params ManagedClusterScopeParams) (*ManagedClusterScope, error) {
+	if params.Cluster == nil {
+		return nil, errors.New("failed to generate new scope from nil Cluster")
+	}
+	if params.AzureManagedCluster == nil {
+		return nil, errors.New("failed to generate new scope from nil AzureManagedCluster")
+	}
+
+	if params.Logger == nil {
+		params.Logger = klogr.New()
+	}
+
+	err := params.AzureClients.setCredentials()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create Azure session")
+	}
+
+	helper, err := patch.NewHelper(params.AzureManagedCluster, params.Client)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to init patch helper")
+	}
+	return &ManagedClusterScope{
+		Logger:              params.Logger,
+		client:              params.Client,
+		AzureClients:        params.AzureClients,
+		Cluster:             params.Cluster,
+		AzureManagedCluster: params.AzureManagedCluster,
+		patchHelper:         helper,
+		Context:             context.Background(),
+	}, nil
+}
+
+// ManagedClusterScope defines the basic context for an actuator to operate upon.
+type ManagedClusterScope struct {
+	logr.Logger
+	client      client.Client
+	patchHelper *patch.Helper
+
+	AzureClients
+	Cluster             *clusterv1.Cluster
+	AzureManagedCluster *infrav1.AzureManagedCluster
+	Context             context.Context
+}
+
+// ResourceGroup returns the cluster resource group.
+func (s *ManagedClusterScope) ResourceGroup() string {
+	return s.AzureManagedCluster.Spec.ResourceGroup
+}
+
+// Name returns the cluster name.
+func (s *ManagedClusterScope) Name() string {
+	return s.Cluster.Name
+}
+
+// Namespace returns the cluster namespace.
+func (s *ManagedClusterScope) Namespace() string {
+	return s.Cluster.Namespace
+}
+
+// Location returns the cluster location.
+func (s *ManagedClusterScope) Location() string {
+	return s.AzureManagedCluster.Spec.Location
+}
+
+// ListOptionsLabelSelector returns a ListOptions with a label selector for clusterName.
+func (s *ManagedClusterScope) ListOptionsLabelSelector() client.ListOption {
+	return client.MatchingLabels(map[string]string{
+		clusterv1.ClusterLabelName: s.Cluster.Name,
+	})
+}
+
+// PatchObject persists the cluster configuration and status.
+func (s *ManagedClusterScope) PatchObject() error {
+	return s.patchHelper.Patch(context.TODO(), s.AzureManagedCluster)
+}
+
+// Close closes the current scope persisting the cluster configuration and status.
+func (s *ManagedClusterScope) Close() error {
+	return s.patchHelper.Patch(context.TODO(), s.AzureManagedCluster)
+}
+
+// AdditionalTags returns AdditionalTags from the scope's AzureManagedCluster.
+func (s *ManagedClusterScope) AdditionalTags() infrav1.Tags {
+	tags := make(infrav1.Tags)
+	if s.AzureManagedCluster.Spec.AdditionalTags != nil {
+		tags = s.AzureManagedCluster.Spec.AdditionalTags.DeepCopy()
+	}
+	return tags
+}
