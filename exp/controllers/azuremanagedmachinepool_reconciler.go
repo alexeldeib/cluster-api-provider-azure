@@ -26,35 +26,28 @@ import (
 	"sigs.k8s.io/cluster-api-provider-azure/cloud/scope"
 	"sigs.k8s.io/cluster-api-provider-azure/cloud/services/agentpools"
 	"sigs.k8s.io/cluster-api-provider-azure/cloud/services/scalesets"
-	"sigs.k8s.io/cluster-api-provider-azure/cloud/services/scalesetvms"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // azureManagedMachinePoolReconciler are list of services required by cluster controller
 type azureManagedMachinePoolReconciler struct {
-	kubeclient     client.Client
-	agentPoolsSvc  azure.GetterService
-	scaleSetVMsSvc NodeLister
-	scaleSetsSvc   Lister
+	kubeclient    client.Client
+	agentPoolsSvc azure.GetterService
+	scaleSetsSvc  NodeLister
 }
 
-// NodeLister is a service interface exclusively for returning a list of VMSS instance provider IDs.
+// NodeLister is a service interface for returning generic lists.
 type NodeLister interface {
-	ListInstances(context.Context, interface{}) ([]string, error)
-}
-
-// Lister is a service interface for returning generic lists.
-type Lister interface {
-	List(context.Context, interface{}) ([]interface{}, error)
+	ListInstances(context.Context, string, string) ([]compute.VirtualMachineScaleSetVM, error)
+	List(context.Context, string) ([]compute.VirtualMachineScaleSet, error)
 }
 
 // newAzureManagedMachinePoolReconciler populates all the services based on input scope
 func newAzureManagedMachinePoolReconciler(scope *scope.ManagedControlPlaneScope) *azureManagedMachinePoolReconciler {
 	return &azureManagedMachinePoolReconciler{
-		kubeclient:     scope.Client,
-		agentPoolsSvc:  agentpools.NewService(scope.AzureClients.Authorizer, scope.AzureClients.SubscriptionID),
-		scaleSetVMsSvc: scalesetvms.NewService(scope.AzureClients.Authorizer, scope.AzureClients.SubscriptionID),
-		scaleSetsSvc:   scalesets.NewService(scope.AzureClients.Authorizer, scope.AzureClients.SubscriptionID),
+		kubeclient:    scope.Client,
+		agentPoolsSvc: agentpools.NewService(scope.AzureClients.Authorizer, scope.AzureClients.SubscriptionID),
+		scaleSetsSvc:  scalesets.NewService(scope.AzureClients.Authorizer, scope.AzureClients.SubscriptionID),
 	}
 }
 
@@ -83,7 +76,7 @@ func (r *azureManagedMachinePoolReconciler) Reconcile(ctx context.Context, scope
 	}
 
 	nodeResourceGroup := fmt.Sprintf("MC_%s_%s_%s", scope.ControlPlane.Spec.ResourceGroup, scope.ControlPlane.Name, scope.ControlPlane.Spec.Location)
-	vmss, err := r.scaleSetsSvc.List(ctx, &scalesets.Spec{ResourceGroup: nodeResourceGroup})
+	vmss, err := r.scaleSetsSvc.List(ctx, nodeResourceGroup)
 	if err != nil {
 		return errors.Wrapf(err, "failed to list vmss in resource group %s", nodeResourceGroup)
 	}
@@ -91,14 +84,9 @@ func (r *azureManagedMachinePoolReconciler) Reconcile(ctx context.Context, scope
 	var match *compute.VirtualMachineScaleSet
 	for _, ss := range vmss {
 		ss := ss
-		switch scaleset := ss.(type) {
-		case compute.VirtualMachineScaleSet:
-			if scaleset.Tags["poolName"] != nil && *scaleset.Tags["poolName"] == scope.InfraMachinePool.Name {
-				match = &scaleset
-				break
-			}
-		default:
-			return errors.New("expected vmss but found wrong interface type")
+		if ss.Tags["poolName"] != nil && *ss.Tags["poolName"] == scope.InfraMachinePool.Name {
+			match = &ss
+			break
 		}
 	}
 
@@ -106,12 +94,15 @@ func (r *azureManagedMachinePoolReconciler) Reconcile(ctx context.Context, scope
 		return errors.New("failed to find vm scale set matching pool")
 	}
 
-	providerIDs, err := r.scaleSetVMsSvc.ListInstances(ctx, &scalesetvms.Spec{
-		Name:          *match.Name,
-		ResourceGroup: nodeResourceGroup,
-	})
+	instances, err := r.scaleSetsSvc.ListInstances(ctx, nodeResourceGroup, *match.Name)
 	if err != nil {
 		return errors.Wrapf(err, "failed to reconcile machine pool %s", scope.InfraMachinePool.Name)
+	}
+
+	var providerIDs []string
+	for _, vm := range instances {
+		vm := vm
+		providerIDs = append(providerIDs, fmt.Sprintf("azure://%s", *vm.ID))
 	}
 
 	scope.InfraMachinePool.Spec.ProviderIDList = providerIDs

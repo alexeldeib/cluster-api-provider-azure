@@ -83,13 +83,13 @@ func (s *Service) Reconcile(ctx context.Context, spec interface{}) error {
 
 		diff := cmp.Diff(profile, existingProfile)
 		if diff != "" {
-			fmt.Printf("update required (+new -old):\n%s", diff)
+			klog.V(2).Infof("update required (+new -old):\n%s", diff)
 			err = s.Client.CreateOrUpdate(ctx, agentPoolSpec.ResourceGroup, agentPoolSpec.Cluster, agentPoolSpec.Name, profile)
 			if err != nil {
 				return fmt.Errorf("failed to create or update agent pool, %#+v", err)
 			}
 		} else {
-			fmt.Println("normalized and desired managed cluster matched, no update needed (go-cmp)")
+			klog.V(2).Infof("normalized and desired managed cluster matched, no update needed")
 		}
 	} else if azure.ResourceNotFound(err) {
 		err = s.Client.CreateOrUpdate(ctx, agentPoolSpec.ResourceGroup, agentPoolSpec.Cluster, agentPoolSpec.Name, profile)

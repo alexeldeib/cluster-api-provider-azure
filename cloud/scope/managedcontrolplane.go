@@ -31,7 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// ManagedControlPlaneScopeParams defines the input parameters used to create a new Scope.
+// ManagedControlPlaneScopeParams defines the input parameters used to create a new
 type ManagedControlPlaneScopeParams struct {
 	AzureClients
 	Client           client.Client
@@ -58,7 +58,7 @@ func NewManagedControlPlaneScope(params ManagedControlPlaneScopeParams) (*Manage
 		params.Logger = klogr.New()
 	}
 
-	err := params.AzureClients.setCredentials(params.ControlPlane.Spec.SubscriptionID)
+	err := params.AzureClients.SetCredentials(params.ControlPlane.Spec.SubscriptionID)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create Azure session")
 	}

@@ -1,5 +1,5 @@
 /*
-Copyright 2020 The Kubernetes Authors.
+Copyright 2019 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,18 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package scalesetvms
-
-import "github.com/Azure/go-autorest/autorest"
-
-// Service provides operations on azure resources
-type Service struct {
-	Client
-}
-
-// NewService creates a new service.
-func NewService(authorizer autorest.Authorizer, subscriptionID string) *Service {
-	return &Service{
-		Client: NewClient(subscriptionID, authorizer),
-	}
-}
+// Run go generate to regenerate this mock.
+//go:generate ../../../../hack/tools/bin/mockgen -destination scalesets_mock.go -package mock_scalesets -source ../client.go Client
+//go:generate /usr/bin/env bash -c "cat ../../../../hack/boilerplate/boilerplate.generatego.txt scalesets_mock.go > _scalesets_mock.go && mv _scalesets_mock.go scalesets_mock.go"
+package mock_scalesets //nolint

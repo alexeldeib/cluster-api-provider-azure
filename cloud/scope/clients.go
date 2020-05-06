@@ -30,7 +30,7 @@ type AzureClients struct {
 	Authorizer     autorest.Authorizer
 }
 
-func (c *AzureClients) setCredentials(subscriptionID string) error {
+func (c *AzureClients) SetCredentials(subscriptionID string) error {
 	subID, err := getSubscriptionID(subscriptionID)
 	if err != nil {
 		return err
