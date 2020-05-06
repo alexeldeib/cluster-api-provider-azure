@@ -52,12 +52,12 @@ func newAgentPoolsClient(subscriptionID string, authorizer autorest.Authorizer) 
 	return agentPoolsClient
 }
 
-// Get gets a agent pool.
+// Get gets an agent pool.
 func (ac *AzureClient) Get(ctx context.Context, resourceGroupName, cluster, name string) (containerservice.AgentPool, error) {
 	return ac.agentpools.Get(ctx, resourceGroupName, cluster, name)
 }
 
-// CreateOrUpdate creates or updates a agent pool.
+// CreateOrUpdate creates or updates an agent pool.
 func (ac *AzureClient) CreateOrUpdate(ctx context.Context, resourceGroupName, cluster, name string, properties containerservice.AgentPool) error {
 	future, err := ac.agentpools.CreateOrUpdate(ctx, resourceGroupName, cluster, name, properties)
 	if err != nil {
@@ -71,7 +71,7 @@ func (ac *AzureClient) CreateOrUpdate(ctx context.Context, resourceGroupName, cl
 	return err
 }
 
-// Delete deletes a agent pool.
+// Delete deletes an agent pool.
 func (ac *AzureClient) Delete(ctx context.Context, resourceGroupName, cluster, name string) error {
 	future, err := ac.agentpools.Delete(ctx, resourceGroupName, cluster, name)
 	if err != nil {
