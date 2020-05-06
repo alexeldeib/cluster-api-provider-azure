@@ -568,15 +568,14 @@ func (s *azureMachinePoolService) Get() (*infrav1exp.VMSS, error) {
 func getOwnerMachinePool(ctx context.Context, c client.Client, obj metav1.ObjectMeta) (*capiv1exp.MachinePool, error) {
 	for _, ref := range obj.OwnerReferences {
 		if ref.Kind == "MachinePool" && ref.APIVersion == capiv1exp.GroupVersion.String() {
-
-			return getMachineByName(ctx, c, obj.Namespace, ref.Name)
+			return getMachinePoolByName(ctx, c, obj.Namespace, ref.Name)
 		}
 	}
 	return nil, nil
 }
 
 // getMachinePoolByName finds and return a Machine object using the specified params.
-func getMachineByName(ctx context.Context, c client.Client, namespace, name string) (*capiv1exp.MachinePool, error) {
+func getMachinePoolByName(ctx context.Context, c client.Client, namespace, name string) (*capiv1exp.MachinePool, error) {
 	m := &capiv1exp.MachinePool{}
 	key := client.ObjectKey{Name: name, Namespace: namespace}
 	if err := c.Get(ctx, key, m); err != nil {
