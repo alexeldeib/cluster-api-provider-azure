@@ -33,7 +33,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		var sshFrontendPort int32 = 22
 		ports := make(map[int32]struct{})
 
-		lb, err := s.LoadBalancersClient.Get(ctx, s.Scope.ResourceGroup(), inboundNatSpec.LoadBalancerName)
+		lb, err := s.LoadBalancersClient.Get(ctx, s.Scope.NodeResourceGroup(), inboundNatSpec.LoadBalancerName)
 		if err != nil {
 			return errors.Wrapf(err, "failed to get Load Balancer %s", inboundNatSpec.LoadBalancerName)
 		}
@@ -78,7 +78,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		}
 		s.Scope.V(3).Info("Creating rule %s using port %d", "NAT rule", inboundNatSpec.Name, "port", sshFrontendPort)
 
-		err = s.Client.CreateOrUpdate(ctx, s.Scope.ResourceGroup(), to.String(lb.Name), inboundNatSpec.Name, rule)
+		err = s.Client.CreateOrUpdate(ctx, s.Scope.NodeResourceGroup(), to.String(lb.Name), inboundNatSpec.Name, rule)
 		if err != nil {
 			return errors.Wrapf(err, "failed to create inbound NAT rule %s", inboundNatSpec.Name)
 		}
@@ -92,7 +92,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 func (s *Service) Delete(ctx context.Context) error {
 	for _, inboundNatSpec := range s.Scope.InboundNatSpecs() {
 		s.Scope.V(2).Info("deleting inbound NAT rule", "NAT rule", inboundNatSpec.Name)
-		err := s.Client.Delete(ctx, s.Scope.ResourceGroup(), inboundNatSpec.LoadBalancerName, inboundNatSpec.Name)
+		err := s.Client.Delete(ctx, s.Scope.NodeResourceGroup(), inboundNatSpec.LoadBalancerName, inboundNatSpec.Name)
 		if err != nil && !azure.ResourceNotFound(err) {
 			return errors.Wrapf(err, "failed to delete inbound NAT rule %s", inboundNatSpec.Name)
 		}

@@ -190,10 +190,10 @@ func (r *AzureMachinePoolReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result,
 
 	// Create the cluster scope
 	clusterScope, err := scope.NewClusterScope(scope.ClusterScopeParams{
-		Client:       r.Client,
-		Logger:       logger,
-		Cluster:      cluster,
-		AzureCluster: azureCluster,
+		Client:           r.Client,
+		Logger:           logger,
+		Cluster:          cluster,
+		ClusterDescriber: azureCluster,
 	})
 	if err != nil {
 		return reconcile.Result{}, err
@@ -397,7 +397,7 @@ func (r *AzureMachinePoolReconciler) reconcileTags(ctx context.Context, machineP
 			Name: machinePoolScope.Name(),
 		}
 		svc := scalesets.NewService(machinePoolScope, skuCache)
-		vm, err := svc.Client.Get(ctx, clusterScope.ResourceGroup(), machinePoolScope.Name())
+		vm, err := svc.Client.Get(ctx, clusterScope.NodeResourceGroup(), machinePoolScope.Name())
 		if err != nil {
 			return errors.Wrapf(err, "failed to query AzureMachine VMSS")
 		}
@@ -411,7 +411,7 @@ func (r *AzureMachinePoolReconciler) reconcileTags(ctx context.Context, machineP
 		}
 
 		vm.Tags = tags
-		if err := svc.Client.CreateOrUpdate(ctx, clusterScope.ResourceGroup(), vmssSpec.Name, vm); err != nil {
+		if err := svc.Client.CreateOrUpdate(ctx, clusterScope.NodeResourceGroup(), vmssSpec.Name, vm); err != nil {
 			return errors.Wrapf(err, "cannot update VMSS tags")
 		}
 
@@ -511,7 +511,7 @@ func (s *azureMachinePoolService) CreateOrUpdate(ctx context.Context) (*infrav1e
 
 	vmssSpec := &scalesets.Spec{
 		Name:                   s.machinePoolScope.Name(),
-		ResourceGroup:          s.clusterScope.ResourceGroup(),
+		ResourceGroup:          s.clusterScope.NodeResourceGroup(),
 		Location:               s.clusterScope.Location(),
 		ClusterName:            s.clusterScope.ClusterName(),
 		MachinePoolName:        s.machinePoolScope.Name(),
@@ -523,7 +523,7 @@ func (s *azureMachinePoolService) CreateOrUpdate(ctx context.Context) (*infrav1e
 		DataDisks:              ampSpec.Template.DataDisks,
 		CustomData:             bootstrapData,
 		AdditionalTags:         s.machinePoolScope.AdditionalTags(),
-		SubnetID:               s.clusterScope.AzureCluster.Spec.NetworkSpec.GetNodeSubnet().ID,
+		SubnetID:               s.clusterScope.NodeSubnet().ID,
 		PublicLoadBalancerName: s.clusterScope.ClusterName(),
 		AcceleratedNetworking:  ampSpec.Template.AcceleratedNetworking,
 	}
@@ -560,7 +560,7 @@ func (s *azureMachinePoolService) CreateOrUpdate(ctx context.Context) (*infrav1e
 func (s *azureMachinePoolService) Delete(ctx context.Context) error {
 	vmssSpec := &scalesets.Spec{
 		Name:          s.machinePoolScope.Name(),
-		ResourceGroup: s.clusterScope.ResourceGroup(),
+		ResourceGroup: s.clusterScope.NodeResourceGroup(),
 	}
 
 	err := s.virtualMachinesScaleSetSvc.Delete(ctx, vmssSpec)

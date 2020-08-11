@@ -78,13 +78,13 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			}
 			if subnetSpec.RouteTableName != "" {
 				subnetProperties.RouteTable = &network.RouteTable{
-					ID: to.StringPtr(azure.RouteTableID(s.Scope.SubscriptionID(), s.Scope.ResourceGroup(), subnetSpec.RouteTableName)),
+					ID: to.StringPtr(azure.RouteTableID(s.Scope.SubscriptionID(), s.Scope.NodeResourceGroup(), subnetSpec.RouteTableName)),
 				}
 			}
 
 			if subnetSpec.SecurityGroupName != "" {
 				subnetProperties.NetworkSecurityGroup = &network.SecurityGroup{
-					ID: to.StringPtr(azure.SecurityGroupID(s.Scope.SubscriptionID(), s.Scope.ResourceGroup(), subnetSpec.SecurityGroupName)),
+					ID: to.StringPtr(azure.SecurityGroupID(s.Scope.SubscriptionID(), s.Scope.NodeResourceGroup(), subnetSpec.SecurityGroupName)),
 				}
 			}
 

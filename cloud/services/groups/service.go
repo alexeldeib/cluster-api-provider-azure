@@ -32,7 +32,7 @@ type Service struct {
 type GroupScope interface {
 	logr.Logger
 	azure.SubscriptionAuthorizer
-	ResourceGroup() string
+	ControlPlaneResourceGroup() string
 	ClusterName() string
 	Location() string
 	AdditionalTags() infrav1.Tags

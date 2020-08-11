@@ -243,18 +243,18 @@ func (mr *MockGroupScopeMockRecorder) SubscriptionID() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SubscriptionID", reflect.TypeOf((*MockGroupScope)(nil).SubscriptionID))
 }
 
-// ResourceGroup mocks base method.
-func (m *MockGroupScope) ResourceGroup() string {
+// ControlPlaneResourceGroup mocks base method.
+func (m *MockGroupScope) ControlPlaneResourceGroup() string {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "ResourceGroup")
+	ret := m.ctrl.Call(m, "ControlPlaneResourceGroup")
 	ret0, _ := ret[0].(string)
 	return ret0
 }
 
-// ResourceGroup indicates an expected call of ResourceGroup.
-func (mr *MockGroupScopeMockRecorder) ResourceGroup() *gomock.Call {
+// ControlPlaneResourceGroup indicates an expected call of ControlPlaneResourceGroup.
+func (mr *MockGroupScopeMockRecorder) ControlPlaneResourceGroup() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ResourceGroup", reflect.TypeOf((*MockGroupScope)(nil).ResourceGroup))
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ControlPlaneResourceGroup", reflect.TypeOf((*MockGroupScope)(nil).ControlPlaneResourceGroup))
 }
 
 // ClusterName mocks base method.

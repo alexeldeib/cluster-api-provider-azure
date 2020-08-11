@@ -33,13 +33,13 @@ func (s *Service) Reconcile(ctx context.Context) error {
 func (s *Service) Delete(ctx context.Context) error {
 	for _, diskSpec := range s.Scope.DiskSpecs() {
 		s.Scope.V(2).Info("deleting disk", "disk", diskSpec.Name)
-		err := s.Client.Delete(ctx, s.Scope.ResourceGroup(), diskSpec.Name)
+		err := s.Client.Delete(ctx, s.Scope.NodeResourceGroup(), diskSpec.Name)
 		if err != nil && azure.ResourceNotFound(err) {
 			// already deleted
 			return nil
 		}
 		if err != nil {
-			return errors.Wrapf(err, "failed to delete disk %s in resource group %s", diskSpec.Name, s.Scope.ResourceGroup())
+			return errors.Wrapf(err, "failed to delete disk %s in resource group %s", diskSpec.Name, s.Scope.NodeResourceGroup())
 		}
 
 		s.Scope.V(2).Info("successfully deleted disk", "disk", diskSpec.Name)

@@ -27,7 +27,7 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
 	expv1 "sigs.k8s.io/cluster-api/exp/api/v1alpha3"
 
-	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1alpha3"
+	azure "sigs.k8s.io/cluster-api-provider-azure/cloud"
 	infrav1exp "sigs.k8s.io/cluster-api-provider-azure/exp/api/v1alpha3"
 
 	"sigs.k8s.io/cluster-api/util/patch"
@@ -44,6 +44,7 @@ type ManagedControlPlaneScopeParams struct {
 	InfraMachinePool *infrav1exp.AzureManagedMachinePool
 	MachinePool      *expv1.MachinePool
 	PatchTarget      runtime.Object
+	Scheme           *runtime.Scheme
 }
 
 // NewManagedControlPlaneScope creates a new Scope from the supplied parameters.
@@ -53,8 +54,16 @@ func NewManagedControlPlaneScope(params ManagedControlPlaneScopeParams) (*Manage
 		return nil, errors.New("failed to generate new scope from nil Cluster")
 	}
 
+	if params.PatchTarget == nil {
+		return nil, errors.New("failed to generate new scope with nil patch target")
+	}
+
 	if params.ControlPlane == nil {
 		return nil, errors.New("failed to generate new scope from nil ControlPlane")
+	}
+
+	if params.Scheme == nil {
+		return nil, errors.New("failed to generate new scope from nil Scheme")
 	}
 
 	if params.Logger == nil {
@@ -76,10 +85,12 @@ func NewManagedControlPlaneScope(params ManagedControlPlaneScopeParams) (*Manage
 		AzureClients:     params.AzureClients,
 		Cluster:          params.Cluster,
 		ControlPlane:     params.ControlPlane,
+		ClusterDescriber: params.ControlPlane,
 		MachinePool:      params.MachinePool,
 		InfraMachinePool: params.InfraMachinePool,
 		PatchTarget:      params.PatchTarget,
 		patchHelper:      helper,
+		Scheme:           params.Scheme,
 	}, nil
 }
 
@@ -90,43 +101,13 @@ type ManagedControlPlaneScope struct {
 	patchHelper *patch.Helper
 
 	AzureClients
+	azure.ClusterDescriber
 	Cluster          *clusterv1.Cluster
 	MachinePool      *expv1.MachinePool
 	ControlPlane     *infrav1exp.AzureManagedControlPlane
 	InfraMachinePool *infrav1exp.AzureManagedMachinePool
 	PatchTarget      runtime.Object
-}
-
-func (s *ManagedControlPlaneScope) ResourceGroup() string {
-	if s.ControlPlane == nil {
-		return ""
-	}
-	return s.ControlPlane.Spec.ResourceGroup
-}
-
-func (s *ManagedControlPlaneScope) ClusterName() string {
-	return s.Cluster.Name
-}
-
-func (s *ManagedControlPlaneScope) Location() string {
-	if s.ControlPlane == nil {
-		return ""
-	}
-	return s.ControlPlane.Spec.Location
-}
-
-// AdditionalTags returns AdditionalTags from the ControlPlane spec.
-func (s *ManagedControlPlaneScope) AdditionalTags() infrav1.Tags {
-	tags := make(infrav1.Tags)
-	if s.ControlPlane.Spec.AdditionalTags != nil {
-		tags = s.ControlPlane.Spec.AdditionalTags.DeepCopy()
-	}
-	return tags
-}
-
-// SubscriptionID returns the Azure client Subscription ID.
-func (s *ManagedControlPlaneScope) SubscriptionID() string {
-	return s.ControlPlane.Spec.SubscriptionID
+	Scheme           *runtime.Scheme
 }
 
 // BaseURI returns the Azure ResourceManagerEndpoint.
@@ -142,4 +123,14 @@ func (s *ManagedControlPlaneScope) Authorizer() autorest.Authorizer {
 // PatchObject persists the cluster configuration and status.
 func (s *ManagedControlPlaneScope) PatchObject(ctx context.Context) error {
 	return s.patchHelper.Patch(ctx, s.PatchTarget)
+}
+
+// VNetSpecs returns the virtual network specs.
+func (s *ManagedControlPlaneScope) VNetSpecs() []azure.VNetSpec {
+	return []azure.VNetSpec{
+		{
+			ResourceGroup: s.Vnet().ResourceGroup,
+			Name:          s.Vnet().Name,
+		},
+	}
 }

@@ -206,6 +206,7 @@ func main() {
 			Log:              ctrl.Log.WithName("controllers").WithName("AzureMachine"),
 			Recorder:         mgr.GetEventRecorderFor("azuremachine-reconciler"),
 			ReconcileTimeout: reconcileTimeout,
+			Scheme:           mgr.GetScheme(),
 		}).SetupWithManager(mgr, controller.Options{MaxConcurrentReconciles: azureMachineConcurrency}); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "AzureMachine")
 			os.Exit(1)
@@ -264,6 +265,7 @@ func main() {
 					Log:              ctrl.Log.WithName("controllers").WithName("AzureManagedMachinePool"),
 					Recorder:         mgr.GetEventRecorderFor("azuremachine-reconciler"),
 					ReconcileTimeout: reconcileTimeout,
+					Scheme:           mgr.GetScheme(),
 				}).SetupWithManager(mgr, controller.Options{MaxConcurrentReconciles: azureMachineConcurrency}); err != nil {
 					setupLog.Error(err, "unable to create controller", "controller", "AzureManagedMachinePool")
 					os.Exit(1)
@@ -282,6 +284,7 @@ func main() {
 					Log:              ctrl.Log.WithName("controllers").WithName("AzureManagedControlPlane"),
 					Recorder:         mgr.GetEventRecorderFor("azuremanagedcontrolplane-reconciler"),
 					ReconcileTimeout: reconcileTimeout,
+					Scheme:           mgr.GetScheme(),
 				}).SetupWithManager(mgr, controller.Options{MaxConcurrentReconciles: azureClusterConcurrency}); err != nil {
 					setupLog.Error(err, "unable to create controller", "controller", "AzureManagedControlPlane")
 					os.Exit(1)

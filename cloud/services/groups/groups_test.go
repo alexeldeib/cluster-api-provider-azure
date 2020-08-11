@@ -44,7 +44,7 @@ func TestReconcileGroups(t *testing.T) {
 			expectedError: "",
 			expect: func(s *mock_groups.MockGroupScopeMockRecorder, m *mock_groups.MockClientMockRecorder) {
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
-				s.ResourceGroup().Return("my-rg")
+				s.NodeResourceGroup().Return("my-rg")
 				m.Get(context.TODO(), "my-rg").Return(resources.Group{}, nil)
 			},
 		},
@@ -53,7 +53,7 @@ func TestReconcileGroups(t *testing.T) {
 			expectedError: "",
 			expect: func(s *mock_groups.MockGroupScopeMockRecorder, m *mock_groups.MockClientMockRecorder) {
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Location().AnyTimes().Return("fake-location")
 				s.ClusterName().AnyTimes().Return("fake-cluster")
 				s.AdditionalTags().AnyTimes().Return(infrav1.Tags{})
@@ -66,7 +66,7 @@ func TestReconcileGroups(t *testing.T) {
 			expectedError: "failed to create resource group my-rg: #: Internal Server Error: StatusCode=500",
 			expect: func(s *mock_groups.MockGroupScopeMockRecorder, m *mock_groups.MockClientMockRecorder) {
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Location().AnyTimes().Return("fake-location")
 				s.ClusterName().AnyTimes().Return("fake-cluster")
 				s.AdditionalTags().AnyTimes().Return(infrav1.Tags{})
@@ -116,7 +116,7 @@ func TestDeleteGroups(t *testing.T) {
 			expectedError: "could not get resource group management state: #: Internal Server Error: StatusCode=500",
 			expect: func(s *mock_groups.MockGroupScopeMockRecorder, m *mock_groups.MockClientMockRecorder) {
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Get(context.TODO(), "my-rg").Return(resources.Group{}, autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 500}, "Internal Server Error"))
 			},
 		},
@@ -125,7 +125,7 @@ func TestDeleteGroups(t *testing.T) {
 			expectedError: "",
 			expect: func(s *mock_groups.MockGroupScopeMockRecorder, m *mock_groups.MockClientMockRecorder) {
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.ClusterName().AnyTimes().Return("fake-cluster")
 				m.Get(context.TODO(), "my-rg").Return(resources.Group{}, nil)
 			},
@@ -135,7 +135,7 @@ func TestDeleteGroups(t *testing.T) {
 			expectedError: "",
 			expect: func(s *mock_groups.MockGroupScopeMockRecorder, m *mock_groups.MockClientMockRecorder) {
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.ClusterName().AnyTimes().Return("fake-cluster")
 				gomock.InOrder(
 					m.Get(context.TODO(), "my-rg").Return(resources.Group{
@@ -154,7 +154,7 @@ func TestDeleteGroups(t *testing.T) {
 			expectedError: "failed to delete resource group my-rg: #: Internal Server Error: StatusCode=500",
 			expect: func(s *mock_groups.MockGroupScopeMockRecorder, m *mock_groups.MockClientMockRecorder) {
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.ClusterName().AnyTimes().Return("fake-cluster")
 				gomock.InOrder(
 					m.Get(context.TODO(), "my-rg").Return(resources.Group{
@@ -173,7 +173,7 @@ func TestDeleteGroups(t *testing.T) {
 			expectedError: "",
 			expect: func(s *mock_groups.MockGroupScopeMockRecorder, m *mock_groups.MockClientMockRecorder) {
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.ClusterName().AnyTimes().Return("fake-cluster")
 				gomock.InOrder(
 					m.Get(context.TODO(), "my-rg").Return(resources.Group{

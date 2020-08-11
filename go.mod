@@ -9,18 +9,26 @@ require (
 	github.com/Azure/go-autorest/autorest/to v0.4.0
 	github.com/Azure/go-autorest/autorest/validation v0.3.0 // indirect
 	github.com/blang/semver v3.5.1+incompatible
+	github.com/containerd/fifo v0.0.0-20200410184934-f15a3290365b // indirect
+	github.com/docker/docker v0.7.3-0.20190327010347-be7ac8be2ae0
+	github.com/docker/go-connections v0.4.0 // indirect
+	github.com/docker/go-metrics v0.0.1 // indirect
 	github.com/go-logr/logr v0.1.0
 	github.com/golang/mock v1.4.4
 	github.com/google/go-cmp v0.5.1
 	github.com/google/gofuzz v1.1.0
 	github.com/google/uuid v1.1.1
 	github.com/hashicorp/go-retryablehttp v0.6.6
+	github.com/morikuni/aec v1.0.0 // indirect
 	github.com/onsi/ginkgo v1.14.0
 	github.com/onsi/gomega v1.10.1
+	github.com/opencontainers/image-spec v1.0.1 // indirect
 	github.com/pkg/errors v0.9.1
+	github.com/sanity-io/litter v1.3.0
 	github.com/spf13/pflag v1.0.5
 	golang.org/x/crypto v0.0.0-20200728195943-123391ffb6de
 	golang.org/x/net v0.0.0-20200707034311-ab3426394381 // indirect
+	gopkg.in/yaml.v2 v2.3.0
 	k8s.io/api v0.17.8
 	k8s.io/apimachinery v0.17.8
 	k8s.io/client-go v0.17.8

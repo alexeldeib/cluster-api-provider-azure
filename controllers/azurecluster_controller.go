@@ -116,10 +116,10 @@ func (r *AzureClusterReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, ret
 
 	// Create the scope.
 	clusterScope, err := scope.NewClusterScope(scope.ClusterScopeParams{
-		Client:       r.Client,
-		Logger:       log,
-		Cluster:      cluster,
-		AzureCluster: azureCluster,
+		Client:           r.Client,
+		Logger:           log,
+		Cluster:          cluster,
+		ClusterDescriber: azureCluster,
 	})
 	if err != nil {
 		return reconcile.Result{}, errors.Errorf("failed to create scope: %+v", err)
@@ -143,16 +143,15 @@ func (r *AzureClusterReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, ret
 
 	// Handle deleted clusters
 	if !azureCluster.DeletionTimestamp.IsZero() {
-		return r.reconcileDelete(ctx, clusterScope)
+		return r.reconcileDelete(ctx, azureCluster, clusterScope)
 	}
 
 	// Handle non-deleted clusters
-	return r.reconcileNormal(ctx, clusterScope)
+	return r.reconcileNormal(ctx, azureCluster, clusterScope)
 }
 
-func (r *AzureClusterReconciler) reconcileNormal(ctx context.Context, clusterScope *scope.ClusterScope) (reconcile.Result, error) {
+func (r *AzureClusterReconciler) reconcileNormal(ctx context.Context, azureCluster *infrav1.AzureCluster, clusterScope *scope.ClusterScope) (reconcile.Result, error) {
 	clusterScope.Info("Reconciling AzureCluster")
-	azureCluster := clusterScope.AzureCluster
 
 	// If the AzureCluster doesn't have our finalizer, add it.
 	controllerutil.AddFinalizer(azureCluster, infrav1.ClusterFinalizer)
@@ -185,17 +184,15 @@ func (r *AzureClusterReconciler) reconcileNormal(ctx context.Context, clusterSco
 	return reconcile.Result{}, nil
 }
 
-func (r *AzureClusterReconciler) reconcileDelete(ctx context.Context, clusterScope *scope.ClusterScope) (reconcile.Result, error) {
+func (r *AzureClusterReconciler) reconcileDelete(ctx context.Context, azureCluster *infrav1.AzureCluster, clusterScope *scope.ClusterScope) (reconcile.Result, error) {
 	clusterScope.Info("Reconciling AzureCluster delete")
 
-	azureCluster := clusterScope.AzureCluster
-
 	if err := newAzureClusterReconciler(clusterScope).Delete(ctx); err != nil {
-		return reconcile.Result{}, errors.Wrapf(err, "error deleting AzureCluster %s/%s", azureCluster.Namespace, azureCluster.Name)
+		return reconcile.Result{}, errors.Wrapf(err, "error deleting AzureCluster %s/%s", clusterScope.GetNamespace(), clusterScope.GetName())
 	}
 
 	// Cluster is deleted so remove the finalizer.
-	controllerutil.RemoveFinalizer(clusterScope.AzureCluster, infrav1.ClusterFinalizer)
+	controllerutil.RemoveFinalizer(clusterScope, infrav1.ClusterFinalizer)
 
 	return reconcile.Result{}, nil
 }

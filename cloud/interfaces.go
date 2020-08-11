@@ -21,6 +21,9 @@ import (
 
 	"github.com/Azure/go-autorest/autorest"
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1alpha3"
+	expv1 "sigs.k8s.io/cluster-api-provider-azure/exp/api/v1alpha3"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 // Service is a generic interface used by components offering a type of service.
@@ -62,22 +65,46 @@ type Authorizer interface {
 	Authorizer() autorest.Authorizer
 }
 
-// SubscriptionAuthorizer provides an Authorizer as well as a specific subscription for use.
+// SubscriptionAuthroizer contains a subscription ID and a means to
+// authorize access to it.
 type SubscriptionAuthorizer interface {
 	Authorizer
 	SubscriptionID() string
 }
 
+// AuthorizedClusterDescriber describes a complete cluster and can
+// authorize requests to mutate/get the backing resources.
+type AuthorizedClusterDescriber interface {
+	Authorizer
+	ClusterDescriber
+}
+
 // ClusterDescriber is an interface which can get common Azure Cluster information.
 type ClusterDescriber interface {
-	SubscriptionAuthorizer
-	ResourceGroup() string
+	controllerutil.Object
+	NetworkDescriber
 	ClusterName() string
+	SubscriptionID() string
+	ControlPlaneResourceGroup() string
+	NodeResourceGroup() string
 	Location() string
+	SetFailureDomain(string, clusterv1.FailureDomainSpec)
 	AdditionalTags() infrav1.Tags
+}
+
+// NetworkDescriber describes the vnet and subnet configuration for a cluster
+// abstracted because it is implemented by managed and unmanaged cluster.
+type NetworkDescriber interface {
+	LoadBalancer() string
+	OutboundPool() string
+	Network() *infrav1.Network
+	Subnets() infrav1.Subnets
 	Vnet() *infrav1.VnetSpec
 	IsVnetManaged() bool
 	NodeSubnet() *infrav1.SubnetSpec
 	ControlPlaneSubnet() *infrav1.SubnetSpec
 	RouteTable() *infrav1.RouteTable
 }
+
+var _ ClusterDescriber = new(infrav1.AzureCluster)
+var _ ClusterDescriber = new(expv1.AzureManagedControlPlane)

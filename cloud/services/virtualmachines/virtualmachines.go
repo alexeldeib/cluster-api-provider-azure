@@ -35,7 +35,7 @@ import (
 
 // Get provides information about a virtual machine.
 func (s *Service) getExisting(ctx context.Context, name string) (*infrav1.VM, error) {
-	vm, err := s.Client.Get(ctx, s.Scope.ResourceGroup(), name)
+	vm, err := s.Client.Get(ctx, s.Scope.NodeResourceGroup(), name)
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +80,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			for i, nicName := range vmSpec.NICNames {
 				primary := i == 0
 				nicRefs[i] = compute.NetworkInterfaceReference{
-					ID: to.StringPtr(azure.NetworkInterfaceID(s.Scope.SubscriptionID(), s.Scope.ResourceGroup(), nicName)),
+					ID: to.StringPtr(azure.NetworkInterfaceID(s.Scope.SubscriptionID(), s.Scope.NodeResourceGroup(), nicName)),
 					NetworkInterfaceReferenceProperties: &compute.NetworkInterfaceReferenceProperties{
 						Primary: to.BoolPtr(primary),
 					},
@@ -172,8 +172,8 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				}
 			}
 
-			if err := s.Client.CreateOrUpdate(ctx, s.Scope.ResourceGroup(), vmSpec.Name, virtualMachine); err != nil {
-				return errors.Wrapf(err, "failed to create VM %s in resource group %s", vmSpec.Name, s.Scope.ResourceGroup())
+			if err := s.Client.CreateOrUpdate(ctx, s.Scope.NodeResourceGroup(), vmSpec.Name, virtualMachine); err != nil {
+				return errors.Wrapf(err, "failed to create VM %s in resource group %s", vmSpec.Name, s.Scope.NodeResourceGroup())
 			}
 
 			s.Scope.V(2).Info("successfully created VM", "vm", vmSpec.Name)
@@ -187,13 +187,13 @@ func (s *Service) Reconcile(ctx context.Context) error {
 func (s *Service) Delete(ctx context.Context) error {
 	for _, vmSpec := range s.Scope.VMSpecs() {
 		s.Scope.V(2).Info("deleting VM", "vm", vmSpec.Name)
-		err := s.Client.Delete(ctx, s.Scope.ResourceGroup(), vmSpec.Name)
+		err := s.Client.Delete(ctx, s.Scope.NodeResourceGroup(), vmSpec.Name)
 		if err != nil && azure.ResourceNotFound(err) {
 			// already deleted
 			continue
 		}
 		if err != nil {
-			return errors.Wrapf(err, "failed to delete VM %s in resource group %s", vmSpec.Name, s.Scope.ResourceGroup())
+			return errors.Wrapf(err, "failed to delete VM %s in resource group %s", vmSpec.Name, s.Scope.NodeResourceGroup())
 		}
 
 		s.Scope.V(2).Info("successfully deleted VM", "vm", vmSpec.Name)
@@ -219,7 +219,7 @@ func (s *Service) getAddresses(ctx context.Context, vm compute.VirtualMachine) (
 		nicName := getResourceNameByID(to.String(nicRef.ID))
 
 		// Fetch nic and append its addresses
-		nic, err := s.InterfacesClient.Get(ctx, s.Scope.ResourceGroup(), nicName)
+		nic, err := s.InterfacesClient.Get(ctx, s.Scope.NodeResourceGroup(), nicName)
 		if err != nil {
 			return addresses, err
 		}
@@ -257,7 +257,7 @@ func (s *Service) getAddresses(ctx context.Context, vm compute.VirtualMachine) (
 // getPublicIPAddress will fetch a public ip address resource by name and return a nodeaddresss representation
 func (s *Service) getPublicIPAddress(ctx context.Context, publicIPAddressName string) (corev1.NodeAddress, error) {
 	retAddress := corev1.NodeAddress{}
-	publicIP, err := s.PublicIPsClient.Get(ctx, s.Scope.ResourceGroup(), publicIPAddressName)
+	publicIP, err := s.PublicIPsClient.Get(ctx, s.Scope.NodeResourceGroup(), publicIPAddressName)
 	if err != nil {
 		return retAddress, err
 	}

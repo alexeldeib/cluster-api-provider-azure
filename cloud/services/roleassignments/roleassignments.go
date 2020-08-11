@@ -29,7 +29,7 @@ const azureBuiltInContributorID = "b24988ac-6180-42a0-ab88-20f7382dd24c"
 // Reconcile creates a role assignment.
 func (s *Service) Reconcile(ctx context.Context) error {
 	for _, roleSpec := range s.Scope.RoleAssignmentSpecs() {
-		resultVM, err := s.VirtualMachinesClient.Get(ctx, s.Scope.ResourceGroup(), roleSpec.MachineName)
+		resultVM, err := s.VirtualMachinesClient.Get(ctx, s.Scope.NodeResourceGroup(), roleSpec.MachineName)
 		if err != nil {
 			return errors.Wrapf(err, "cannot get VM to assign role to system assigned identity")
 		}

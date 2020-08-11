@@ -72,7 +72,7 @@ func TestGetExistingVM(t *testing.T) {
 			},
 			expectedError: "",
 			expect: func(s *mock_virtualmachines.MockVMScopeMockRecorder, m *mock_virtualmachines.MockClientMockRecorder, mnic *mock_networkinterfaces.MockClientMockRecorder, mpip *mock_publicips.MockClientMockRecorder) {
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				mpip.Get(context.TODO(), "my-rg", "my-publicIP-id").Return(network.PublicIPAddress{
 					PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
@@ -127,7 +127,7 @@ func TestGetExistingVM(t *testing.T) {
 			result:        &infrav1.VM{},
 			expectedError: "#: Not found: StatusCode=404",
 			expect: func(s *mock_virtualmachines.MockVMScopeMockRecorder, m *mock_virtualmachines.MockClientMockRecorder, mnic *mock_networkinterfaces.MockClientMockRecorder, mpip *mock_publicips.MockClientMockRecorder) {
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				m.Get(context.TODO(), "my-rg", "my-vm").Return(compute.VirtualMachine{}, autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not found"))
 			},
@@ -138,7 +138,7 @@ func TestGetExistingVM(t *testing.T) {
 			result:        &infrav1.VM{},
 			expectedError: "#: Internal Server Error: StatusCode=500",
 			expect: func(s *mock_virtualmachines.MockVMScopeMockRecorder, m *mock_virtualmachines.MockClientMockRecorder, mnic *mock_networkinterfaces.MockClientMockRecorder, mpip *mock_publicips.MockClientMockRecorder) {
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				m.Get(context.TODO(), "my-rg", "my-vm").Return(compute.VirtualMachine{}, autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 500}, "Internal Server Error"))
 			},
@@ -149,7 +149,7 @@ func TestGetExistingVM(t *testing.T) {
 			result:        &infrav1.VM{},
 			expectedError: "#: Internal Server Error: StatusCode=500",
 			expect: func(s *mock_virtualmachines.MockVMScopeMockRecorder, m *mock_virtualmachines.MockClientMockRecorder, mnic *mock_networkinterfaces.MockClientMockRecorder, mpip *mock_publicips.MockClientMockRecorder) {
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				mpip.Get(context.TODO(), "my-rg", "my-publicIP-id").Return(network.PublicIPAddress{}, autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 500}, "Internal Server Error"))
 				mnic.Get(context.TODO(), "my-rg", gomock.Any()).Return(network.Interface{
@@ -198,7 +198,7 @@ func TestGetExistingVM(t *testing.T) {
 			result:        &infrav1.VM{},
 			expectedError: "#: Not Found: StatusCode=404",
 			expect: func(s *mock_virtualmachines.MockVMScopeMockRecorder, m *mock_virtualmachines.MockClientMockRecorder, mnic *mock_networkinterfaces.MockClientMockRecorder, mpip *mock_publicips.MockClientMockRecorder) {
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				mpip.Get(context.TODO(), "my-rg", "my-publicIP-id").Return(network.PublicIPAddress{}, autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not Found"))
 				mnic.Get(context.TODO(), "my-rg", gomock.Any()).Return(network.Interface{
@@ -314,7 +314,7 @@ func TestReconcileVM(t *testing.T) {
 					},
 				})
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				s.AdditionalTags()
 				s.Location().Return("test-location")
@@ -422,7 +422,7 @@ func TestReconcileVM(t *testing.T) {
 					},
 				})
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				s.AdditionalTags()
 				s.Location().Return("test-location")
@@ -464,7 +464,7 @@ func TestReconcileVM(t *testing.T) {
 					},
 				})
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				s.AdditionalTags()
 				s.Location().Return("test-location")
@@ -506,7 +506,7 @@ func TestReconcileVM(t *testing.T) {
 					},
 				})
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				s.AdditionalTags()
 				s.Location().Return("test-location")
@@ -549,7 +549,7 @@ func TestReconcileVM(t *testing.T) {
 					},
 				})
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				s.AdditionalTags()
 				s.Location().Return("test-location")
@@ -629,7 +629,7 @@ func TestDeleteVM(t *testing.T) {
 						SpotVMOptions:          nil,
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-existing-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-existing-rg")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				m.Delete(context.TODO(), "my-existing-rg", "my-existing-vm")
 			},
@@ -653,7 +653,7 @@ func TestDeleteVM(t *testing.T) {
 						SpotVMOptions:          nil,
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				m.Delete(context.TODO(), "my-rg", "my-vm").
 					Return(autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not found"))
@@ -678,7 +678,7 @@ func TestDeleteVM(t *testing.T) {
 						SpotVMOptions:          nil,
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				m.Delete(context.TODO(), "my-rg", "my-vm").
 					Return(autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 500}, "Internal Server Error"))

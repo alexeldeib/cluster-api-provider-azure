@@ -45,7 +45,7 @@ func TestReconcileVM(t *testing.T) {
 			expect: func(s *mock_roleassignments.MockRoleAssignmentScopeMockRecorder, m *mock_roleassignments.MockClientMockRecorder, v *mock_virtualmachines.MockClientMockRecorder) {
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				s.SubscriptionID().AnyTimes().Return("12345")
-				s.ResourceGroup().Return("my-rg")
+				s.NodeResourceGroup().Return("my-rg")
 				s.RoleAssignmentSpecs().Return([]azure.RoleAssignmentSpec{
 					{
 						MachineName: "test-vm",
@@ -70,7 +70,7 @@ func TestReconcileVM(t *testing.T) {
 			expect: func(s *mock_roleassignments.MockRoleAssignmentScopeMockRecorder, m *mock_roleassignments.MockClientMockRecorder, v *mock_virtualmachines.MockClientMockRecorder) {
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				s.SubscriptionID().AnyTimes().Return("12345")
-				s.ResourceGroup().Return("my-rg")
+				s.NodeResourceGroup().Return("my-rg")
 				s.RoleAssignmentSpecs().Return([]azure.RoleAssignmentSpec{
 					{
 						MachineName: "test-vm",
@@ -85,7 +85,7 @@ func TestReconcileVM(t *testing.T) {
 			expect: func(s *mock_roleassignments.MockRoleAssignmentScopeMockRecorder, m *mock_roleassignments.MockClientMockRecorder, v *mock_virtualmachines.MockClientMockRecorder) {
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				s.SubscriptionID().AnyTimes().Return("12345")
-				s.ResourceGroup().Return("my-rg")
+				s.NodeResourceGroup().Return("my-rg")
 				s.RoleAssignmentSpecs().Return([]azure.RoleAssignmentSpec{
 					{
 						MachineName: "test-vm",

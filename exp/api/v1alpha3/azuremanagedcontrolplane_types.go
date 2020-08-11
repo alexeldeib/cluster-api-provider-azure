@@ -17,8 +17,11 @@ limitations under the License.
 package v1alpha3
 
 import (
+	"fmt"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1alpha3"
@@ -75,6 +78,11 @@ type AzureManagedControlPlaneStatus struct {
 	// In the AzureManagedControlPlane implementation, these are identical.
 	// +optional
 	Initialized bool `json:"initialized,omitempty"`
+
+	// VirtualNetwork is the name of the AKS-generated VNET. It's not predictable unless we pre-create it.
+	// Consider pre-creating?
+	// +optional
+	VirtualNetwork string `json:"virtualNetwork,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -98,6 +106,123 @@ type AzureManagedControlPlaneList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []AzureManagedControlPlane `json:"items"`
+}
+
+// ManagedResourceGroup returns the name of the resource group
+// containing raw VMs. This group will be created by AKS as part of the
+// cluster.
+func (c *AzureManagedControlPlane) ManagedNodeResourceGroup() string {
+	return fmt.Sprintf("MC_%s_%s_%s", c.Spec.ResourceGroup, c.Name, c.Spec.Location)
+}
+
+// SubscriptionID returns the cluster resource group.
+func (c *AzureManagedControlPlane) SubscriptionID() string {
+	return c.Spec.SubscriptionID
+}
+
+// ControlPlaneResourceGroup returns the control plane resource group.
+// For AKS, this is the unmanaged resource group containing the AKS resource.
+func (c *AzureManagedControlPlane) ControlPlaneResourceGroup() string {
+	return c.Spec.ResourceGroup
+}
+
+// ResourceGroup returns the cluster resource group.
+func (c *AzureManagedControlPlane) NodeResourceGroup() string {
+	return c.ManagedNodeResourceGroup()
+}
+
+// ClusterName returns the cluster name.
+func (c *AzureManagedControlPlane) ClusterName() string {
+	for _, ref := range c.OwnerReferences {
+		if ref.Kind != "Cluster" {
+			continue
+		}
+		gv, err := schema.ParseGroupVersion(ref.APIVersion)
+		if err != nil {
+			return ""
+		}
+		if gv.Group == clusterv1.GroupVersion.Group {
+			return ref.Name
+		}
+	}
+	return ""
+}
+
+// Location returns the cluster location.
+func (c *AzureManagedControlPlane) Location() string {
+	return c.Spec.Location
+}
+
+// SetFailureDomain is a no-op on managed control planes
+func (c *AzureManagedControlPlane) SetFailureDomain(id string, spec clusterv1.FailureDomainSpec) {}
+
+// AdditionalTags returns AdditionalTags from the scope's AzureManagedControlPlane.
+func (c *AzureManagedControlPlane) AdditionalTags() infrav1.Tags {
+	tags := make(infrav1.Tags)
+	if c.Spec.AdditionalTags != nil {
+		tags = c.Spec.AdditionalTags.DeepCopy()
+	}
+	return tags
+}
+
+// END
+
+// NetworkDescriber implementation
+
+// OutboundPool returns the node load balancer name.
+func (c *AzureManagedControlPlane) OutboundPool() string {
+	return "aksOutboundBackendPool" // hard-coded in aks
+}
+
+// LoadBalancer returns the node load balancer name.
+func (c *AzureManagedControlPlane) LoadBalancer() string {
+	return "kubernetes" // hard-coded in aks
+}
+
+// Network returns the cluster network object.
+func (c *AzureManagedControlPlane) Network() *infrav1.Network {
+	return nil
+}
+
+// Vnet returns the cluster Vnet.
+func (c *AzureManagedControlPlane) Vnet() *infrav1.VnetSpec {
+	return &infrav1.VnetSpec{
+		ResourceGroup: c.ManagedNodeResourceGroup(),
+		Name:          c.Status.VirtualNetwork,
+	}
+}
+
+// IsVnetManaged returns true if the vnet is managed.
+func (c *AzureManagedControlPlane) IsVnetManaged() bool {
+	return true
+}
+
+// Subnets returns the cluster subnets.
+func (c *AzureManagedControlPlane) Subnets() infrav1.Subnets {
+	return infrav1.Subnets{
+		{
+			Role: infrav1.SubnetNode,
+			Name: "aks-subnet",
+		},
+	}
+}
+
+// ControlPlaneSubnet returns the cluster control plane subnet.
+func (c *AzureManagedControlPlane) ControlPlaneSubnet() *infrav1.SubnetSpec {
+	return nil
+}
+
+// NodeSubnet returns the cluster node subnet.
+func (c *AzureManagedControlPlane) NodeSubnet() *infrav1.SubnetSpec {
+	return &infrav1.SubnetSpec{
+		Role: infrav1.SubnetNode,
+		Name: "aks-subnet",
+	}
+}
+
+// RouteTable returns the cluster node routetable.
+func (c *AzureManagedControlPlane) RouteTable() *infrav1.RouteTable {
+	return nil
 }
 
 func init() {

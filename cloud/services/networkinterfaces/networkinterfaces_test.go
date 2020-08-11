@@ -60,7 +60,7 @@ func TestReconcileNetworkInterface(t *testing.T) {
 					},
 				})
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Location().AnyTimes().Return("fake-location")
 				gomock.InOrder(
 					m.CreateOrUpdate(context.TODO(), "my-rg", "my-net-interface", gomock.AssignableToTypeOf(network.Interface{})).
@@ -87,7 +87,7 @@ func TestReconcileNetworkInterface(t *testing.T) {
 				})
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Location().AnyTimes().Return("fake-location")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				m.CreateOrUpdate(context.TODO(), "my-rg", "my-net-interface", gomockinternal.DiffEq(network.Interface{
@@ -127,7 +127,7 @@ func TestReconcileNetworkInterface(t *testing.T) {
 					},
 				})
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Location().AnyTimes().Return("fake-location")
 				s.V(gomock.AssignableToTypeOf(3)).AnyTimes().Return(klogr.New())
 				gomock.InOrder(
@@ -170,7 +170,7 @@ func TestReconcileNetworkInterface(t *testing.T) {
 					},
 				})
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Location().AnyTimes().Return("fake-location")
 				s.V(gomock.AssignableToTypeOf(3)).AnyTimes().Return(klogr.New())
 				m.CreateOrUpdate(context.TODO(), "my-rg", "my-net-interface", gomockinternal.DiffEq(network.Interface{
@@ -211,7 +211,7 @@ func TestReconcileNetworkInterface(t *testing.T) {
 					},
 				})
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Location().AnyTimes().Return("fake-location")
 				s.V(gomock.AssignableToTypeOf(3)).AnyTimes().Return(klogr.New())
 				m.CreateOrUpdate(context.TODO(), "my-rg", "my-public-net-interface", gomock.AssignableToTypeOf(network.Interface{}))
@@ -234,7 +234,7 @@ func TestReconcileNetworkInterface(t *testing.T) {
 					},
 				})
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Location().AnyTimes().Return("fake-location")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				m.CreateOrUpdate(context.TODO(), "my-rg", "my-net-interface", gomockinternal.DiffEq(network.Interface{
@@ -273,7 +273,7 @@ func TestReconcileNetworkInterface(t *testing.T) {
 					},
 				})
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				s.Location().AnyTimes().Return("fake-location")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
@@ -366,7 +366,7 @@ func TestDeleteNetworkInterface(t *testing.T) {
 					},
 				})
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Delete(context.TODO(), "my-rg", "my-net-interface")
 			},
 		},
@@ -382,7 +382,7 @@ func TestDeleteNetworkInterface(t *testing.T) {
 					},
 				})
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Delete(context.TODO(), "my-rg", "my-net-interface").
 					Return(autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not found"))
 			},
@@ -398,7 +398,7 @@ func TestDeleteNetworkInterface(t *testing.T) {
 						MachineName:  "azure-test1",
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				m.Delete(context.TODO(), "my-rg", "my-net-interface").
 					Return(autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 500}, "Internal Server Error"))

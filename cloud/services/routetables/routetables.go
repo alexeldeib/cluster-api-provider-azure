@@ -33,10 +33,10 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	}
 
 	for _, rtSpec := range s.Scope.RouteTableSpecs() {
-		existingRouteTable, err := s.Get(ctx, s.Scope.ResourceGroup(), rtSpec.Name)
+		existingRouteTable, err := s.Get(ctx, s.Scope.NodeResourceGroup(), rtSpec.Name)
 		if !azure.ResourceNotFound(err) {
 			if err != nil {
-				return errors.Wrapf(err, "failed to get route table %s in %s", rtSpec.Name, s.Scope.ResourceGroup())
+				return errors.Wrapf(err, "failed to get route table %s in %s", rtSpec.Name, s.Scope.NodeResourceGroup())
 			}
 
 			// route table already exists
@@ -54,7 +54,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		s.Scope.V(2).Info("creating route table", "route table", rtSpec.Name)
 		err = s.Client.CreateOrUpdate(
 			ctx,
-			s.Scope.ResourceGroup(),
+			s.Scope.NodeResourceGroup(),
 			rtSpec.Name,
 			network.RouteTable{
 				Location:                   to.StringPtr(s.Scope.Location()),
@@ -62,7 +62,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			},
 		)
 		if err != nil {
-			return errors.Wrapf(err, "failed to create route table %s in resource group %s", rtSpec.Name, s.Scope.ResourceGroup())
+			return errors.Wrapf(err, "failed to create route table %s in resource group %s", rtSpec.Name, s.Scope.NodeResourceGroup())
 		}
 
 		s.Scope.V(2).Info("successfully created route table", "route table", rtSpec.Name)
@@ -78,13 +78,13 @@ func (s *Service) Delete(ctx context.Context) error {
 	}
 	for _, rtSpec := range s.Scope.RouteTableSpecs() {
 		s.Scope.V(2).Info("deleting route table", "route table", rtSpec.Name)
-		err := s.Client.Delete(ctx, s.Scope.ResourceGroup(), rtSpec.Name)
+		err := s.Client.Delete(ctx, s.Scope.NodeResourceGroup(), rtSpec.Name)
 		if err != nil && azure.ResourceNotFound(err) {
 			// already deleted
 			continue
 		}
 		if err != nil {
-			return errors.Wrapf(err, "failed to delete route table %s in resource group %s", rtSpec.Name, s.Scope.ResourceGroup())
+			return errors.Wrapf(err, "failed to delete route table %s in resource group %s", rtSpec.Name, s.Scope.NodeResourceGroup())
 		}
 
 		s.Scope.V(2).Info("successfully deleted route table", "route table", rtSpec.Name)

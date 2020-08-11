@@ -83,7 +83,7 @@ func TestReconcileRouteTables(t *testing.T) {
 					Name: "my-routetable",
 				}})
 				s.RouteTable().AnyTimes().Return(&infrav1.RouteTable{Name: "my-routetable"})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Get(context.TODO(), "my-rg", "my-routetable").Return(network.RouteTable{}, autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not found"))
 				s.Location().Return("westus")
 				m.CreateOrUpdate(context.TODO(), "my-rg", "my-routetable", gomock.AssignableToTypeOf(network.RouteTable{}))
@@ -107,7 +107,7 @@ func TestReconcileRouteTables(t *testing.T) {
 					Name: "my-routetable",
 				}})
 				s.RouteTable().AnyTimes().Return(&infrav1.RouteTable{Name: "my-routetable"})
-				s.ResourceGroup().Return("my-rg")
+				s.NodeResourceGroup().Return("my-rg")
 				m.Get(context.TODO(), "my-rg", "my-routetable").Return(network.RouteTable{
 					Name: to.StringPtr("my-routetable"),
 					ID:   to.StringPtr("1"),
@@ -135,7 +135,7 @@ func TestReconcileRouteTables(t *testing.T) {
 					Name: "my-routetable",
 				}})
 				s.RouteTable().AnyTimes().Return(&infrav1.RouteTable{Name: "my-routetable"})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Get(context.TODO(), "my-rg", "my-routetable").Return(network.RouteTable{}, autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 500}, "Internal Server Error"))
 				m.CreateOrUpdate(context.TODO(), gomock.Any(), gomock.Any(), gomock.AssignableToTypeOf(network.RouteTable{})).Times(0)
 			},
@@ -158,7 +158,7 @@ func TestReconcileRouteTables(t *testing.T) {
 					Name: "my-routetable",
 				}})
 				s.RouteTable().AnyTimes().Return(&infrav1.RouteTable{Name: "my-routetable"})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Get(context.TODO(), "my-rg", "my-routetable").Return(network.RouteTable{}, autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not found"))
 				s.Location().Return("westus")
 				m.CreateOrUpdate(context.TODO(), "my-rg", "my-routetable", gomock.AssignableToTypeOf(network.RouteTable{})).Return(autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 500}, "Internal Server Error"))
@@ -236,7 +236,7 @@ func TestDeleteRouteTable(t *testing.T) {
 					Name: "my-routetable",
 				}})
 				s.RouteTable().AnyTimes().Return(&infrav1.RouteTable{Name: "my-routetable"})
-				s.ResourceGroup().Return("my-rg")
+				s.NodeResourceGroup().Return("my-rg")
 				m.Delete(context.TODO(), "my-rg", "my-routetable")
 			},
 		},
@@ -258,7 +258,7 @@ func TestDeleteRouteTable(t *testing.T) {
 					Name: "my-routetable",
 				}})
 				s.RouteTable().AnyTimes().Return(&infrav1.RouteTable{Name: "my-routetable"})
-				s.ResourceGroup().Return("my-rg")
+				s.NodeResourceGroup().Return("my-rg")
 				m.Delete(context.TODO(), "my-rg", "my-routetable").Return(autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not Found"))
 			},
 		},
@@ -280,7 +280,7 @@ func TestDeleteRouteTable(t *testing.T) {
 					Name: "my-routetable",
 				}})
 				s.RouteTable().AnyTimes().Return(&infrav1.RouteTable{Name: "my-routetable"})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Delete(context.TODO(), "my-rg", "my-routetable").Return(autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 500}, "Internal Server Error"))
 			},
 		},

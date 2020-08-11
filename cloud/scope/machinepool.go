@@ -19,6 +19,7 @@ package scope
 import (
 	"context"
 	"encoding/base64"
+
 	"github.com/Azure/go-autorest/autorest/to"
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
@@ -45,7 +46,7 @@ type (
 		Logger           logr.Logger
 		MachinePool      *capiv1exp.MachinePool
 		AzureMachinePool *infrav1exp.AzureMachinePool
-		azure.ClusterDescriber
+		ClusterDescriber azure.AuthorizedClusterDescriber
 	}
 
 	// MachinePoolScope defines a scope defined around a machine pool and its cluster.
@@ -55,7 +56,7 @@ type (
 		patchHelper      *patch.Helper
 		MachinePool      *capiv1exp.MachinePool
 		AzureMachinePool *infrav1exp.AzureMachinePool
-		azure.ClusterDescriber
+		azure.AuthorizedClusterDescriber
 	}
 )
 
@@ -81,12 +82,12 @@ func NewMachinePoolScope(params MachinePoolScopeParams) (*MachinePoolScope, erro
 		return nil, errors.Wrap(err, "failed to init patch helper")
 	}
 	return &MachinePoolScope{
-		client:           params.Client,
-		MachinePool:      params.MachinePool,
-		AzureMachinePool: params.AzureMachinePool,
-		Logger:           params.Logger,
-		patchHelper:      helper,
-		ClusterDescriber: params.ClusterDescriber,
+		client:                     params.Client,
+		MachinePool:                params.MachinePool,
+		AzureMachinePool:           params.AzureMachinePool,
+		Logger:                     params.Logger,
+		patchHelper:                helper,
+		AuthorizedClusterDescriber: params.ClusterDescriber,
 	}, nil
 }
 
@@ -123,7 +124,7 @@ func (m *MachinePoolScope) SetFailureReason(v capierrors.MachineStatusError) {
 // the value from AzureMachinePool takes precedence.
 func (m *MachinePoolScope) AdditionalTags() infrav1.Tags {
 	tags := make(infrav1.Tags)
-	tags.Merge(m.ClusterDescriber.AdditionalTags())
+	tags.Merge(m.AdditionalTags())
 	tags.Merge(m.AzureMachinePool.Spec.AdditionalTags)
 	return tags
 }

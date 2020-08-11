@@ -44,13 +44,13 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			if nicSpec.PublicLBAddressPoolName != "" {
 				backendAddressPools = append(backendAddressPools,
 					network.BackendAddressPool{
-						ID: to.StringPtr(azure.AddressPoolID(s.Scope.SubscriptionID(), s.Scope.ResourceGroup(), nicSpec.PublicLBName, nicSpec.PublicLBAddressPoolName)),
+						ID: to.StringPtr(azure.AddressPoolID(s.Scope.SubscriptionID(), s.Scope.NodeResourceGroup(), nicSpec.PublicLBName, nicSpec.PublicLBAddressPoolName)),
 					})
 			}
 			if nicSpec.PublicLBNATRuleName != "" {
 				nicConfig.LoadBalancerInboundNatRules = &[]network.InboundNatRule{
 					{
-						ID: to.StringPtr(azure.NATRuleID(s.Scope.SubscriptionID(), s.Scope.ResourceGroup(), nicSpec.PublicLBName, nicSpec.PublicLBNATRuleName)),
+						ID: to.StringPtr(azure.NATRuleID(s.Scope.SubscriptionID(), s.Scope.NodeResourceGroup(), nicSpec.PublicLBName, nicSpec.PublicLBNATRuleName)),
 					},
 				}
 			}
@@ -59,14 +59,14 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			// only control planes have an attached internal LB
 			backendAddressPools = append(backendAddressPools,
 				network.BackendAddressPool{
-					ID: to.StringPtr(azure.AddressPoolID(s.Scope.SubscriptionID(), s.Scope.ResourceGroup(), nicSpec.InternalLBName, nicSpec.InternalLBAddressPoolName)),
+					ID: to.StringPtr(azure.AddressPoolID(s.Scope.SubscriptionID(), s.Scope.NodeResourceGroup(), nicSpec.InternalLBName, nicSpec.InternalLBAddressPoolName)),
 				})
 		}
 		nicConfig.LoadBalancerBackendAddressPools = &backendAddressPools
 
 		if nicSpec.PublicIPName != "" {
 			nicConfig.PublicIPAddress = &network.PublicIPAddress{
-				ID: to.StringPtr(azure.PublicIPID(s.Scope.SubscriptionID(), s.Scope.ResourceGroup(), nicSpec.PublicIPName)),
+				ID: to.StringPtr(azure.PublicIPID(s.Scope.SubscriptionID(), s.Scope.NodeResourceGroup(), nicSpec.PublicIPName)),
 			}
 		}
 
@@ -82,7 +82,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		}
 
 		err := s.Client.CreateOrUpdate(ctx,
-			s.Scope.ResourceGroup(),
+			s.Scope.NodeResourceGroup(),
 			nicSpec.Name,
 			network.Interface{
 				Location: to.StringPtr(s.Scope.Location()),
@@ -98,7 +98,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			})
 
 		if err != nil {
-			return errors.Wrapf(err, "failed to create network interface %s in resource group %s", nicSpec.Name, s.Scope.ResourceGroup())
+			return errors.Wrapf(err, "failed to create network interface %s in resource group %s", nicSpec.Name, s.Scope.NodeResourceGroup())
 		}
 		s.Scope.V(2).Info("successfully created network interface", "network interface", nicSpec.Name)
 	}
@@ -109,9 +109,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 func (s *Service) Delete(ctx context.Context) error {
 	for _, nicSpec := range s.Scope.NICSpecs() {
 		s.Scope.V(2).Info("deleting network interface %s", "network interface", nicSpec.Name)
-		err := s.Client.Delete(ctx, s.Scope.ResourceGroup(), nicSpec.Name)
+		err := s.Client.Delete(ctx, s.Scope.NodeResourceGroup(), nicSpec.Name)
 		if err != nil && !azure.ResourceNotFound(err) {
-			return errors.Wrapf(err, "failed to delete network interface %s in resource group %s", nicSpec.Name, s.Scope.ResourceGroup())
+			return errors.Wrapf(err, "failed to delete network interface %s in resource group %s", nicSpec.Name, s.Scope.NodeResourceGroup())
 		}
 		s.Scope.V(2).Info("successfully deleted NIC", "network interface", nicSpec.Name)
 	}

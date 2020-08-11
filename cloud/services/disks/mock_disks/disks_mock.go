@@ -244,18 +244,18 @@ func (mr *MockDiskScopeMockRecorder) SubscriptionID() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SubscriptionID", reflect.TypeOf((*MockDiskScope)(nil).SubscriptionID))
 }
 
-// ResourceGroup mocks base method.
-func (m *MockDiskScope) ResourceGroup() string {
+// NodeResourceGroup mocks base method.
+func (m *MockDiskScope) NodeResourceGroup() string {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "ResourceGroup")
+	ret := m.ctrl.Call(m, "NodeResourceGroup")
 	ret0, _ := ret[0].(string)
 	return ret0
 }
 
-// ResourceGroup indicates an expected call of ResourceGroup.
-func (mr *MockDiskScopeMockRecorder) ResourceGroup() *gomock.Call {
+// NodeResourceGroup indicates an expected call of NodeResourceGroup.
+func (mr *MockDiskScopeMockRecorder) NodeResourceGroup() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ResourceGroup", reflect.TypeOf((*MockDiskScope)(nil).ResourceGroup))
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "NodeResourceGroup", reflect.TypeOf((*MockDiskScope)(nil).NodeResourceGroup))
 }
 
 // ClusterName mocks base method.
@@ -298,76 +298,6 @@ func (m *MockDiskScope) AdditionalTags() v1alpha3.Tags {
 func (mr *MockDiskScopeMockRecorder) AdditionalTags() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AdditionalTags", reflect.TypeOf((*MockDiskScope)(nil).AdditionalTags))
-}
-
-// Vnet mocks base method.
-func (m *MockDiskScope) Vnet() *v1alpha3.VnetSpec {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Vnet")
-	ret0, _ := ret[0].(*v1alpha3.VnetSpec)
-	return ret0
-}
-
-// Vnet indicates an expected call of Vnet.
-func (mr *MockDiskScopeMockRecorder) Vnet() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Vnet", reflect.TypeOf((*MockDiskScope)(nil).Vnet))
-}
-
-// IsVnetManaged mocks base method.
-func (m *MockDiskScope) IsVnetManaged() bool {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "IsVnetManaged")
-	ret0, _ := ret[0].(bool)
-	return ret0
-}
-
-// IsVnetManaged indicates an expected call of IsVnetManaged.
-func (mr *MockDiskScopeMockRecorder) IsVnetManaged() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IsVnetManaged", reflect.TypeOf((*MockDiskScope)(nil).IsVnetManaged))
-}
-
-// NodeSubnet mocks base method.
-func (m *MockDiskScope) NodeSubnet() *v1alpha3.SubnetSpec {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "NodeSubnet")
-	ret0, _ := ret[0].(*v1alpha3.SubnetSpec)
-	return ret0
-}
-
-// NodeSubnet indicates an expected call of NodeSubnet.
-func (mr *MockDiskScopeMockRecorder) NodeSubnet() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "NodeSubnet", reflect.TypeOf((*MockDiskScope)(nil).NodeSubnet))
-}
-
-// ControlPlaneSubnet mocks base method.
-func (m *MockDiskScope) ControlPlaneSubnet() *v1alpha3.SubnetSpec {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "ControlPlaneSubnet")
-	ret0, _ := ret[0].(*v1alpha3.SubnetSpec)
-	return ret0
-}
-
-// ControlPlaneSubnet indicates an expected call of ControlPlaneSubnet.
-func (mr *MockDiskScopeMockRecorder) ControlPlaneSubnet() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ControlPlaneSubnet", reflect.TypeOf((*MockDiskScope)(nil).ControlPlaneSubnet))
-}
-
-// RouteTable mocks base method.
-func (m *MockDiskScope) RouteTable() *v1alpha3.RouteTable {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "RouteTable")
-	ret0, _ := ret[0].(*v1alpha3.RouteTable)
-	return ret0
-}
-
-// RouteTable indicates an expected call of RouteTable.
-func (mr *MockDiskScopeMockRecorder) RouteTable() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RouteTable", reflect.TypeOf((*MockDiskScope)(nil).RouteTable))
 }
 
 // DiskSpecs mocks base method.

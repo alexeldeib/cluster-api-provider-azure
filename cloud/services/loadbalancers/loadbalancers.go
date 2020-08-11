@@ -43,14 +43,14 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		var frontIPConfig network.FrontendIPConfigurationPropertiesFormat
 		if lbSpec.Role == infrav1.InternalRole {
 			var privateIP string
-			internalLB, err := s.Client.Get(ctx, s.Scope.ResourceGroup(), lbSpec.Name)
+			internalLB, err := s.Client.Get(ctx, s.Scope.NodeResourceGroup(), lbSpec.Name)
 			if err == nil {
 				ipConfigs := internalLB.LoadBalancerPropertiesFormat.FrontendIPConfigurations
 				if ipConfigs != nil && len(*ipConfigs) > 0 {
 					privateIP = to.String((*ipConfigs)[0].FrontendIPConfigurationPropertiesFormat.PrivateIPAddress)
 				}
 			} else if azure.ResourceNotFound(err) {
-				s.Scope.V(2).Info("internalLB not found in RG", "internal lb", lbSpec.Name, "resource group", s.Scope.ResourceGroup())
+				s.Scope.V(2).Info("internalLB not found in RG", "internal lb", lbSpec.Name, "resource group", s.Scope.NodeResourceGroup())
 				privateIP, err = s.getAvailablePrivateIP(ctx, s.Scope.Vnet().ResourceGroup, s.Scope.Vnet().Name, lbSpec.SubnetCidr, lbSpec.PrivateIPAddress)
 				if err != nil {
 					return err
@@ -70,7 +70,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			frontIPConfig = network.FrontendIPConfigurationPropertiesFormat{
 				PrivateIPAllocationMethod: network.Dynamic,
 				PublicIPAddress: &network.PublicIPAddress{
-					ID: to.StringPtr(azure.PublicIPID(s.Scope.SubscriptionID(), s.Scope.ResourceGroup(), lbSpec.PublicIPName)),
+					ID: to.StringPtr(azure.PublicIPID(s.Scope.SubscriptionID(), s.Scope.NodeResourceGroup(), lbSpec.PublicIPName)),
 				},
 			}
 		}
@@ -104,11 +104,11 @@ func (s *Service) Reconcile(ctx context.Context) error {
 							IdleTimeoutInMinutes: to.Int32Ptr(4),
 							FrontendIPConfigurations: &[]network.SubResource{
 								{
-									ID: to.StringPtr(azure.FrontendIPConfigID(s.Scope.SubscriptionID(), s.Scope.ResourceGroup(), lbSpec.Name, frontEndIPConfigName)),
+									ID: to.StringPtr(azure.FrontendIPConfigID(s.Scope.SubscriptionID(), s.Scope.NodeResourceGroup(), lbSpec.Name, frontEndIPConfigName)),
 								},
 							},
 							BackendAddressPool: &network.SubResource{
-								ID: to.StringPtr(azure.AddressPoolID(s.Scope.SubscriptionID(), s.Scope.ResourceGroup(), lbSpec.Name, backEndAddressPoolName)),
+								ID: to.StringPtr(azure.AddressPoolID(s.Scope.SubscriptionID(), s.Scope.NodeResourceGroup(), lbSpec.Name, backEndAddressPoolName)),
 							},
 						},
 					},
@@ -140,13 +140,13 @@ func (s *Service) Reconcile(ctx context.Context) error {
 					EnableFloatingIP:     to.BoolPtr(false),
 					LoadDistribution:     network.LoadDistributionDefault,
 					FrontendIPConfiguration: &network.SubResource{
-						ID: to.StringPtr(azure.FrontendIPConfigID(s.Scope.SubscriptionID(), s.Scope.ResourceGroup(), lbSpec.Name, frontEndIPConfigName)),
+						ID: to.StringPtr(azure.FrontendIPConfigID(s.Scope.SubscriptionID(), s.Scope.NodeResourceGroup(), lbSpec.Name, frontEndIPConfigName)),
 					},
 					BackendAddressPool: &network.SubResource{
-						ID: to.StringPtr(azure.AddressPoolID(s.Scope.SubscriptionID(), s.Scope.ResourceGroup(), lbSpec.Name, backEndAddressPoolName)),
+						ID: to.StringPtr(azure.AddressPoolID(s.Scope.SubscriptionID(), s.Scope.NodeResourceGroup(), lbSpec.Name, backEndAddressPoolName)),
 					},
 					Probe: &network.SubResource{
-						ID: to.StringPtr(azure.ProbeID(s.Scope.SubscriptionID(), s.Scope.ResourceGroup(), lbSpec.Name, probeName)),
+						ID: to.StringPtr(azure.ProbeID(s.Scope.SubscriptionID(), s.Scope.NodeResourceGroup(), lbSpec.Name, probeName)),
 					},
 				},
 			}
@@ -161,7 +161,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			lb.LoadBalancerPropertiesFormat.LoadBalancingRules = &[]network.LoadBalancingRule{lbRule}
 		}
 
-		err := s.Client.CreateOrUpdate(ctx, s.Scope.ResourceGroup(), lbSpec.Name, lb)
+		err := s.Client.CreateOrUpdate(ctx, s.Scope.NodeResourceGroup(), lbSpec.Name, lb)
 
 		if err != nil {
 			return errors.Wrapf(err, "failed to create load balancer %s", lbSpec.Name)
@@ -176,13 +176,13 @@ func (s *Service) Reconcile(ctx context.Context) error {
 func (s *Service) Delete(ctx context.Context) error {
 	for _, lbSpec := range s.Scope.LBSpecs() {
 		klog.V(2).Infof("deleting load balancer %s", lbSpec.Name)
-		err := s.Client.Delete(ctx, s.Scope.ResourceGroup(), lbSpec.Name)
+		err := s.Client.Delete(ctx, s.Scope.NodeResourceGroup(), lbSpec.Name)
 		if err != nil && azure.ResourceNotFound(err) {
 			// already deleted
 			continue
 		}
 		if err != nil {
-			return errors.Wrapf(err, "failed to delete load balancer %s in resource group %s", lbSpec.Name, s.Scope.ResourceGroup())
+			return errors.Wrapf(err, "failed to delete load balancer %s in resource group %s", lbSpec.Name, s.Scope.NodeResourceGroup())
 		}
 
 		klog.V(2).Infof("deleted public load balancer %s", lbSpec.Name)

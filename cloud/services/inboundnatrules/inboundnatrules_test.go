@@ -53,7 +53,7 @@ func TestReconcileInboundNATRule(t *testing.T) {
 						LoadBalancerName: "my-lb",
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Location().AnyTimes().Return("fake-location")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				gomock.InOrder(
@@ -95,7 +95,7 @@ func TestReconcileInboundNATRule(t *testing.T) {
 						LoadBalancerName: "my-public-lb",
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Location().AnyTimes().Return("fake-location")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				gomock.InOrder(
@@ -115,7 +115,7 @@ func TestReconcileInboundNATRule(t *testing.T) {
 						LoadBalancerName: "my-public-lb",
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Location().AnyTimes().Return("fake-location")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				gomock.InOrder(
@@ -173,7 +173,7 @@ func TestReconcileInboundNATRule(t *testing.T) {
 						LoadBalancerName: "my-public-lb",
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Location().AnyTimes().Return("fake-location")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				gomock.InOrder(
@@ -256,7 +256,7 @@ func TestDeleteNetworkInterface(t *testing.T) {
 					},
 				})
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Delete(context.TODO(), "my-rg", "my-public-lb", "azure-md-0")
 			},
 		},
@@ -271,7 +271,7 @@ func TestDeleteNetworkInterface(t *testing.T) {
 						LoadBalancerName: "my-public-lb",
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				m.Delete(context.TODO(), "my-rg", "my-public-lb", "azure-md-1").
 					Return(autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not found"))
@@ -289,7 +289,7 @@ func TestDeleteNetworkInterface(t *testing.T) {
 					},
 				})
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Delete(context.TODO(), "my-rg", "my-public-lb", "azure-md-2").
 					Return(autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 500}, "Internal Server Error"))
 			},

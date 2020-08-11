@@ -23,7 +23,7 @@ import (
 
 // SubnetScope defines the scope interface for a network interfaces service.
 type SubnetScope interface {
-	azure.ClusterDescriber
+	azure.AuthorizedClusterDescriber
 	logr.Logger
 	SubnetSpecs() []azure.SubnetSpec
 }

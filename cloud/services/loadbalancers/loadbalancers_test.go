@@ -56,7 +56,7 @@ func TestReconcileLoadBalancer(t *testing.T) {
 					},
 				})
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Location().AnyTimes().Return("testlocation")
 				s.ClusterName().AnyTimes().Return("my-cluster")
 				s.AdditionalTags().AnyTimes().Return(infrav1.Tags{})
@@ -77,7 +77,7 @@ func TestReconcileLoadBalancer(t *testing.T) {
 					},
 				})
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Location().AnyTimes().Return("testlocation")
 				s.ClusterName().AnyTimes().Return("my-cluster")
 				s.AdditionalTags().AnyTimes().Return(infrav1.Tags{})
@@ -171,7 +171,7 @@ func TestReconcileLoadBalancer(t *testing.T) {
 					},
 				})
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Location().AnyTimes().Return("testlocation")
 				s.ClusterName().AnyTimes().Return("cluster-name")
 				s.AdditionalTags().AnyTimes().Return(infrav1.Tags{})
@@ -232,7 +232,7 @@ func TestReconcileLoadBalancer(t *testing.T) {
 					},
 				})
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Vnet().AnyTimes().Return(&infrav1.VnetSpec{
 					ResourceGroup: "my-rg",
 					Name:          "my-vnet",
@@ -260,7 +260,7 @@ func TestReconcileLoadBalancer(t *testing.T) {
 					},
 				})
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Vnet().AnyTimes().Return(&infrav1.VnetSpec{
 					ResourceGroup: "my-rg",
 					Name:          "my-vnet",
@@ -287,7 +287,7 @@ func TestReconcileLoadBalancer(t *testing.T) {
 					},
 				})
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Vnet().AnyTimes().Return(&infrav1.VnetSpec{
 					ResourceGroup: "my-rg",
 					Name:          "my-vnet",
@@ -381,7 +381,7 @@ func TestReconcileLoadBalancer(t *testing.T) {
 					},
 				})
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Vnet().AnyTimes().Return(&infrav1.VnetSpec{
 					ResourceGroup: "my-rg",
 					Name:          "my-vnet",
@@ -420,7 +420,7 @@ func TestReconcileLoadBalancer(t *testing.T) {
 					},
 				})
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Vnet().AnyTimes().Return(&infrav1.VnetSpec{
 					ResourceGroup: "my-rg",
 					Name:          "my-vnet",
@@ -488,7 +488,7 @@ func TestDeleteLoadBalancer(t *testing.T) {
 						Name: "my-publiclb",
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Delete(context.TODO(), "my-rg", "my-internallb")
 				m.Delete(context.TODO(), "my-rg", "my-publiclb")
 			},
@@ -503,7 +503,7 @@ func TestDeleteLoadBalancer(t *testing.T) {
 						Name: "my-publiclb",
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Delete(context.TODO(), "my-rg", "my-publiclb").
 					Return(autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not found"))
 			},
@@ -518,7 +518,7 @@ func TestDeleteLoadBalancer(t *testing.T) {
 						Name: "my-publiclb",
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Delete(context.TODO(), "my-rg", "my-publiclb").
 					Return(autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 500}, "Internal Server Error"))
 			},

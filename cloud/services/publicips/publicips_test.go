@@ -63,7 +63,7 @@ func TestReconcilePublicIP(t *testing.T) {
 						Name: "my-publicip-3",
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Location().AnyTimes().Return("testlocation")
 				m.CreateOrUpdate(context.TODO(), "my-rg", "my-publicip", gomock.AssignableToTypeOf(network.PublicIPAddress{}))
 				m.CreateOrUpdate(context.TODO(), "my-rg", "my-publicip-2", gomock.AssignableToTypeOf(network.PublicIPAddress{}))
@@ -81,7 +81,7 @@ func TestReconcilePublicIP(t *testing.T) {
 						DNSName: "fakedns",
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Location().AnyTimes().Return("testlocation")
 				m.CreateOrUpdate(context.TODO(), "my-rg", "my-publicip", gomock.AssignableToTypeOf(network.PublicIPAddress{})).Return(autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 500}, "Internal Server Error"))
 			},
@@ -136,7 +136,7 @@ func TestDeletePublicIP(t *testing.T) {
 						Name: "my-publicip-2",
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Delete(context.TODO(), "my-rg", "my-publicip")
 				m.Delete(context.TODO(), "my-rg", "my-publicip-2")
 			},
@@ -151,7 +151,7 @@ func TestDeletePublicIP(t *testing.T) {
 						Name: "my-publicip",
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Delete(context.TODO(), "my-rg", "my-publicip").
 					Return(autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not found"))
 			},
@@ -166,7 +166,7 @@ func TestDeletePublicIP(t *testing.T) {
 						Name: "my-publicip",
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Delete(context.TODO(), "my-rg", "my-publicip").
 					Return(autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 500}, "Internal Server Error"))
 			},

@@ -18,13 +18,18 @@ package disks
 
 import (
 	"github.com/go-logr/logr"
+	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1alpha3"
 	azure "sigs.k8s.io/cluster-api-provider-azure/cloud"
 )
 
 // DiskScope defines the scope interface for a disk service.
 type DiskScope interface {
 	logr.Logger
-	azure.ClusterDescriber
+	azure.SubscriptionAuthorizer
+	NodeResourceGroup() string
+	ClusterName() string
+	Location() string
+	AdditionalTags() infrav1.Tags
 	DiskSpecs() []azure.DiskSpec
 }
 

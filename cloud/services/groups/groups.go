@@ -29,28 +29,28 @@ import (
 
 // Reconcile gets/creates/updates a resource group.
 func (s *Service) Reconcile(ctx context.Context) error {
-	if _, err := s.Client.Get(ctx, s.Scope.ResourceGroup()); err == nil {
+	if _, err := s.Client.Get(ctx, s.Scope.ControlPlaneResourceGroup()); err == nil {
 		// resource group already exists, skip creation
 		return nil
 	}
-	s.Scope.V(2).Info("creating resource group", "resource group", s.Scope.ResourceGroup())
+	s.Scope.V(2).Info("creating resource group", "resource group", s.Scope.ControlPlaneResourceGroup())
 	group := resources.Group{
 		Location: to.StringPtr(s.Scope.Location()),
 		Tags: converters.TagsToMap(infrav1.Build(infrav1.BuildParams{
 			ClusterName: s.Scope.ClusterName(),
 			Lifecycle:   infrav1.ResourceLifecycleOwned,
-			Name:        to.StringPtr(s.Scope.ResourceGroup()),
+			Name:        to.StringPtr(s.Scope.ControlPlaneResourceGroup()),
 			Role:        to.StringPtr(infrav1.CommonRole),
 			Additional:  s.Scope.AdditionalTags(),
 		})),
 	}
 
-	_, err := s.Client.CreateOrUpdate(ctx, s.Scope.ResourceGroup(), group)
+	_, err := s.Client.CreateOrUpdate(ctx, s.Scope.ControlPlaneResourceGroup(), group)
 	if err != nil {
-		return errors.Wrapf(err, "failed to create resource group %s", s.Scope.ResourceGroup())
+		return errors.Wrapf(err, "failed to create resource group %s", s.Scope.ControlPlaneResourceGroup())
 	}
 
-	s.Scope.V(2).Info("successfully created resource group", "resource group", s.Scope.ResourceGroup())
+	s.Scope.V(2).Info("successfully created resource group", "resource group", s.Scope.ControlPlaneResourceGroup())
 	return nil
 }
 
@@ -66,22 +66,22 @@ func (s *Service) Delete(ctx context.Context) error {
 		return nil
 	}
 
-	s.Scope.V(2).Info("deleting resource group", "resource group", s.Scope.ResourceGroup())
-	err = s.Client.Delete(ctx, s.Scope.ResourceGroup())
+	s.Scope.V(2).Info("deleting resource group", "resource group", s.Scope.ControlPlaneResourceGroup())
+	err = s.Client.Delete(ctx, s.Scope.ControlPlaneResourceGroup())
 	if err != nil && azure.ResourceNotFound(err) {
 		// already deleted
 		return nil
 	}
 	if err != nil {
-		return errors.Wrapf(err, "failed to delete resource group %s", s.Scope.ResourceGroup())
+		return errors.Wrapf(err, "failed to delete resource group %s", s.Scope.ControlPlaneResourceGroup())
 	}
 
-	s.Scope.V(2).Info("successfully deleted resource group", "resource group", s.Scope.ResourceGroup())
+	s.Scope.V(2).Info("successfully deleted resource group", "resource group", s.Scope.ControlPlaneResourceGroup())
 	return nil
 }
 
 func (s *Service) isGroupManaged(ctx context.Context) (bool, error) {
-	group, err := s.Client.Get(ctx, s.Scope.ResourceGroup())
+	group, err := s.Client.Get(ctx, s.Scope.ControlPlaneResourceGroup())
 	if err != nil {
 		return false, err
 	}

@@ -146,7 +146,7 @@ func referSameObject(a, b metav1.OwnerReference) bool {
 }
 
 // GetCloudProviderSecret returns the required azure json secret for the provided parameters.
-func GetCloudProviderSecret(d azure.ClusterDescriber, namespace, name string, identityType infrav1.VMIdentity, userIdentityID string) (*corev1.Secret, error) {
+func GetCloudProviderSecret(d azure.AuthorizedClusterDescriber, namespace, name string, identityType infrav1.VMIdentity, userIdentityID string) (*corev1.Secret, error) {
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: namespace,
@@ -188,11 +188,11 @@ func GetCloudProviderSecret(d azure.ClusterDescriber, namespace, name string, id
 	return secret, nil
 }
 
-func servicePrincipalCloudProviderConfig(d azure.ClusterDescriber) ([]byte, error) {
+func servicePrincipalCloudProviderConfig(d azure.AuthorizedClusterDescriber) ([]byte, error) {
 	return json.MarshalIndent(newCloudProviderConfig(d), "", "    ")
 }
 
-func systemAssignedIdentityCloudProviderConfig(d azure.ClusterDescriber) ([]byte, error) {
+func systemAssignedIdentityCloudProviderConfig(d azure.AuthorizedClusterDescriber) ([]byte, error) {
 	config := newCloudProviderConfig(d)
 	config.AadClientID = ""
 	config.AadClientSecret = ""
@@ -200,7 +200,7 @@ func systemAssignedIdentityCloudProviderConfig(d azure.ClusterDescriber) ([]byte
 	return json.MarshalIndent(config, "", "    ")
 }
 
-func userAssignedIdentityCloudProviderConfig(d azure.ClusterDescriber, identityID string) ([]byte, error) {
+func userAssignedIdentityCloudProviderConfig(d azure.AuthorizedClusterDescriber, identityID string) ([]byte, error) {
 	config := newCloudProviderConfig(d)
 	config.AadClientID = ""
 	config.AadClientSecret = ""
@@ -209,16 +209,16 @@ func userAssignedIdentityCloudProviderConfig(d azure.ClusterDescriber, identityI
 	return json.MarshalIndent(config, "", "    ")
 }
 
-func newCloudProviderConfig(d azure.ClusterDescriber) *CloudProviderConfig {
+func newCloudProviderConfig(d azure.AuthorizedClusterDescriber) *CloudProviderConfig {
 	return &CloudProviderConfig{
 		Cloud:                        d.CloudEnvironment(),
 		AadClientID:                  d.ClientID(),
 		AadClientSecret:              d.ClientSecret(),
 		TenantID:                     d.TenantID(),
 		SubscriptionID:               d.SubscriptionID(),
-		ResourceGroup:                d.ResourceGroup(),
+		ResourceGroup:                d.NodeResourceGroup(),
 		SecurityGroupName:            d.NodeSubnet().SecurityGroup.Name,
-		SecurityGroupResourceGroup:   d.ResourceGroup(),
+		SecurityGroupResourceGroup:   d.NodeResourceGroup(),
 		Location:                     d.Location(),
 		VMType:                       "vmss",
 		VnetName:                     d.Vnet().Name,

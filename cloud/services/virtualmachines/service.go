@@ -18,6 +18,7 @@ package virtualmachines
 
 import (
 	"context"
+
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1alpha3"
@@ -29,7 +30,7 @@ import (
 
 // VMScope defines the scope interface for a virtual machines service.
 type VMScope interface {
-	azure.ClusterDescriber
+	azure.AuthorizedClusterDescriber
 	logr.Logger
 	VMSpecs() []azure.VMSpec
 	GetBootstrapData(ctx context.Context) (string, error)

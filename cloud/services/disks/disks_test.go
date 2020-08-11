@@ -50,7 +50,7 @@ func TestDeleteDisk(t *testing.T) {
 						Name: "honk-disk",
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Delete(context.TODO(), "my-rg", "my-disk-1")
 				m.Delete(context.TODO(), "my-rg", "honk-disk")
 			},
@@ -65,7 +65,7 @@ func TestDeleteDisk(t *testing.T) {
 						Name: "my-disk-1",
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Delete(context.TODO(), "my-rg", "my-disk-1").Return(autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not Found"))
 			},
 		},
@@ -79,7 +79,7 @@ func TestDeleteDisk(t *testing.T) {
 						Name: "my-disk-1",
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Delete(context.TODO(), "my-rg", "my-disk-1").Return(autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 500}, "Internal Server Error"))
 			},
 		},

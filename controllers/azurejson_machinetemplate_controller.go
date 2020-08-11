@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -25,7 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/annotations"
@@ -35,7 +36,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1alpha3"
+	azure "sigs.k8s.io/cluster-api-provider-azure/cloud"
 	"sigs.k8s.io/cluster-api-provider-azure/cloud/scope"
+	expv1 "sigs.k8s.io/cluster-api-provider-azure/exp/api/v1alpha3"
 	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
 )
 
@@ -91,36 +94,66 @@ func (r *AzureJSONTemplateReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result
 		return ctrl.Result{}, nil
 	}
 
-	_, kind := infrav1.GroupVersion.WithKind("AzureCluster").ToAPIVersionAndKind()
+	infraRefKind := cluster.Spec.InfrastructureRef.Kind
+	infraRefGV, err := schema.ParseGroupVersion(cluster.Spec.InfrastructureRef.APIVersion)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "failed to parse gv from infra ref apiversion")
+	}
 
 	// only look at azure clusters
-	if cluster.Spec.InfrastructureRef.Kind != kind {
-		log.WithValues("kind", cluster.Spec.InfrastructureRef.Kind).Info("infra ref was not an AzureCluster")
+	if infraRefKind != "AzureCluster" && infraRefKind != "AzureManagedCluster" {
+		log.WithValues("kind", infraRefKind).Info("infra ref was not an AzureCluster or AzureManagedCluster")
 		return ctrl.Result{}, nil
 	}
 
-	// fetch the corresponding azure cluster
-	azureCluster := &infrav1.AzureCluster{}
-	azureClusterName := types.NamespacedName{
-		Namespace: req.Namespace,
-		Name:      cluster.Spec.InfrastructureRef.Name,
+	var isManaged bool
+	clusterDescriberRef := cluster.Spec.InfrastructureRef
+	if infraRefGV.Group == expv1.GroupVersion.Group && infraRefKind == "AzureManagedCluster" {
+		isManaged = true
 	}
 
-	err = r.Get(ctx, azureClusterName, azureCluster)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			log.Info("object was not found")
-			return reconcile.Result{}, nil
-		}
-		return reconcile.Result{}, err
+	var clusterDescriber azure.ClusterDescriber
+	if isManaged {
+		clusterDescriber = new(expv1.AzureManagedControlPlane)
+	} else {
+		clusterDescriber = new(infrav1.AzureCluster)
 	}
+
+	clusterDescriberName := client.ObjectKey{
+		Namespace: azureMachineTemplate.Namespace,
+		Name:      clusterDescriberRef.Name,
+	}
+	if err := r.Client.Get(ctx, clusterDescriberName, clusterDescriber); err != nil {
+		msg := fmt.Sprintf("%s unavailable", clusterDescriberRef.Kind)
+		r.Recorder.Eventf(azureMachineTemplate, corev1.EventTypeNormal, msg, msg)
+		log.Info(msg)
+		return reconcile.Result{}, nil
+	}
+
+	log = log.WithValues(clusterDescriberRef.Kind, clusterDescriber.GetName())
+
+	// fetch the corresponding azure cluster
+	// azureCluster := &infrav1.AzureCluster{}
+	// azureClusterName := types.NamespacedName{
+	// 	Namespace: req.Namespace,
+	// 	Name:      cluster.Spec.InfrastructureRef.Name,
+	// }
+
+	// err = r.Get(ctx, azureClusterName, azureCluster)
+	// if err != nil {
+	// 	if apierrors.IsNotFound(err) {
+	// 		log.Info("object was not found")
+	// 		return reconcile.Result{}, nil
+	// 	}
+	// 	return reconcile.Result{}, err
+	// }
 
 	// Create the scope.
 	clusterScope, err := scope.NewClusterScope(scope.ClusterScopeParams{
-		Client:       r.Client,
-		Logger:       log,
-		Cluster:      cluster,
-		AzureCluster: azureCluster,
+		Client:           r.Client,
+		Logger:           log,
+		Cluster:          cluster,
+		ClusterDescriber: clusterDescriber,
 	})
 	if err != nil {
 		return reconcile.Result{}, errors.Errorf("failed to create scope: %+v", err)

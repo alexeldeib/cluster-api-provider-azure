@@ -38,10 +38,10 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		securityRules := make([]network.SecurityRule, 0)
 		var etag *string
 
-		existingNSG, err := s.Client.Get(ctx, s.Scope.ResourceGroup(), nsgSpec.Name)
+		existingNSG, err := s.Client.Get(ctx, s.Scope.NodeResourceGroup(), nsgSpec.Name)
 		switch {
 		case err != nil && !azure.ResourceNotFound(err):
-			return errors.Wrapf(err, "failed to get NSG %s in %s", nsgSpec.Name, s.Scope.ResourceGroup())
+			return errors.Wrapf(err, "failed to get NSG %s in %s", nsgSpec.Name, s.Scope.NodeResourceGroup())
 		case err == nil:
 			// security group already exists
 			// We append the existing NSG etag to the header to ensure we only apply the updates if the NSG has not been modified.
@@ -74,9 +74,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			},
 			Etag: etag,
 		}
-		err = s.Client.CreateOrUpdate(ctx, s.Scope.ResourceGroup(), nsgSpec.Name, sg)
+		err = s.Client.CreateOrUpdate(ctx, s.Scope.NodeResourceGroup(), nsgSpec.Name, sg)
 		if err != nil {
-			return errors.Wrapf(err, "failed to create or update security group %s in resource group %s", nsgSpec.Name, s.Scope.ResourceGroup())
+			return errors.Wrapf(err, "failed to create or update security group %s in resource group %s", nsgSpec.Name, s.Scope.NodeResourceGroup())
 		}
 
 		s.Scope.V(2).Info("successfully created or updated security group", "security group", nsgSpec.Name)
@@ -111,13 +111,13 @@ func ruleExists(rules []network.SecurityRule, rule network.SecurityRule) bool {
 func (s *Service) Delete(ctx context.Context) error {
 	for _, nsgSpec := range s.Scope.NSGSpecs() {
 		s.Scope.V(2).Info("deleting security group", "security group", nsgSpec.Name)
-		err := s.Client.Delete(ctx, s.Scope.ResourceGroup(), nsgSpec.Name)
+		err := s.Client.Delete(ctx, s.Scope.NodeResourceGroup(), nsgSpec.Name)
 		if err != nil && azure.ResourceNotFound(err) {
 			// already deleted
 			continue
 		}
 		if err != nil {
-			return errors.Wrapf(err, "failed to delete security group %s in resource group %s", nsgSpec.Name, s.Scope.ResourceGroup())
+			return errors.Wrapf(err, "failed to delete security group %s in resource group %s", nsgSpec.Name, s.Scope.NodeResourceGroup())
 		}
 
 		s.Scope.V(2).Info("successfully deleted security group", "security group", nsgSpec.Name)

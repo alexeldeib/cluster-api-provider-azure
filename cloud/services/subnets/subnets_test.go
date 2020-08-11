@@ -60,7 +60,7 @@ func TestReconcileSubnets(t *testing.T) {
 				s.Vnet().AnyTimes().Return(&infrav1.VnetSpec{Name: "my-vnet"})
 				s.ClusterName().AnyTimes().Return("fake-cluster")
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.IsVnetManaged().Return(true)
 				m.Get(context.TODO(), "", "my-vnet", "my-subnet").
 					Return(network.Subnet{}, autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not found"))
@@ -92,7 +92,7 @@ func TestReconcileSubnets(t *testing.T) {
 				s.Vnet().AnyTimes().Return(&infrav1.VnetSpec{Name: "my-vnet"})
 				s.ClusterName().AnyTimes().Return("fake-cluster")
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.IsVnetManaged().Return(true)
 				m.Get(context.TODO(), "", "my-vnet", "my-subnet").
 					Return(network.Subnet{}, autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not found"))
@@ -118,7 +118,7 @@ func TestReconcileSubnets(t *testing.T) {
 				s.Vnet().AnyTimes().Return(&infrav1.VnetSpec{Name: "my-vnet"})
 				s.ClusterName().AnyTimes().Return("fake-cluster")
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Get(context.TODO(), "", "my-vnet", "my-subnet").
 					Return(network.Subnet{}, autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 500}, "Internal Server Error"))
 			},
@@ -146,7 +146,7 @@ func TestReconcileSubnets(t *testing.T) {
 				}})
 				s.ClusterName().AnyTimes().Return("fake-cluster")
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("custom-vnet-rg")
+				s.NodeResourceGroup().AnyTimes().Return("custom-vnet-rg")
 				s.IsVnetManaged().Return(false)
 				m.Get(context.TODO(), "custom-vnet-rg", "custom-vnet", "my-subnet").
 					Return(network.Subnet{}, autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not found"))
@@ -188,7 +188,7 @@ func TestReconcileSubnets(t *testing.T) {
 				})
 				s.ClusterName().AnyTimes().Return("fake-cluster")
 				s.SubscriptionID().AnyTimes().Return("123")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Get(context.TODO(), "", "my-vnet", "my-subnet").
 					Return(network.Subnet{
 						ID:   to.StringPtr("subnet-id"),
@@ -287,7 +287,7 @@ func TestDeleteSubnets(t *testing.T) {
 				})
 				s.Vnet().AnyTimes().Return(&infrav1.VnetSpec{Name: "my-vnet"})
 				s.ClusterName().AnyTimes().Return("fake-cluster")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Delete(context.TODO(), "", "my-vnet", "my-subnet")
 				m.Delete(context.TODO(), "", "my-vnet", "my-subnet-1")
 			},
@@ -310,7 +310,7 @@ func TestDeleteSubnets(t *testing.T) {
 				})
 				s.Vnet().AnyTimes().Return(&infrav1.VnetSpec{Name: "my-vnet"})
 				s.ClusterName().AnyTimes().Return("fake-cluster")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Delete(context.TODO(), "", "my-vnet", "my-subnet").
 					Return(autorest.NewErrorWithResponse("", "my-vnet", &http.Response{StatusCode: 404}, "Not found"))
 			},
@@ -342,7 +342,7 @@ func TestDeleteSubnets(t *testing.T) {
 				})
 				s.Vnet().AnyTimes().Return(&infrav1.VnetSpec{Name: "my-vnet"})
 				s.ClusterName().AnyTimes().Return("fake-cluster")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Delete(context.TODO(), "", "my-vnet", "my-subnet").
 					Return(autorest.NewErrorWithResponse("", "my-vnet", &http.Response{StatusCode: 404}, "Not found"))
 				m.Delete(context.TODO(), "", "my-vnet", "my-subnet-1")
@@ -366,7 +366,7 @@ func TestDeleteSubnets(t *testing.T) {
 				})
 				s.Vnet().AnyTimes().Return(&infrav1.VnetSpec{ResourceGroup: "custom-vnet-rg", Name: "custom-vnet", ID: "id1"})
 				s.ClusterName().AnyTimes().Return("fake-cluster")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 			},
 		},
 		{
@@ -387,7 +387,7 @@ func TestDeleteSubnets(t *testing.T) {
 				})
 				s.Vnet().AnyTimes().Return(&infrav1.VnetSpec{Name: "my-vnet", ResourceGroup: "my-rg"})
 				s.ClusterName().AnyTimes().Return("fake-cluster")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				m.Delete(context.TODO(), "my-rg", "my-vnet", "my-subnet").Return(autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 500}, "Internal Server Error"))
 			},
 		},

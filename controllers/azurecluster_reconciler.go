@@ -140,7 +140,7 @@ func (r *azureClusterReconciler) Delete(ctx context.Context) error {
 func (r *azureClusterReconciler) createOrUpdateNetworkAPIServerIP() error {
 	if r.scope.Network().APIServerIP.Name == "" {
 		h := fnv.New32a()
-		if _, err := h.Write([]byte(fmt.Sprintf("%s/%s/%s", r.scope.SubscriptionID(), r.scope.ResourceGroup(), r.scope.ClusterName()))); err != nil {
+		if _, err := h.Write([]byte(fmt.Sprintf("%s/%s/%s", r.scope.SubscriptionID(), r.scope.NodeResourceGroup(), r.scope.ClusterName()))); err != nil {
 			return errors.Wrapf(err, "failed to write hash sum for api server ip")
 		}
 		r.scope.Network().APIServerIP.Name = azure.GeneratePublicIPName(r.scope.ClusterName(), fmt.Sprintf("%x", h.Sum32()))

@@ -32,7 +32,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		s.Scope.V(2).Info("creating public IP", "public ip", ip.Name)
 		err := s.Client.CreateOrUpdate(
 			ctx,
-			s.Scope.ResourceGroup(),
+			s.Scope.NodeResourceGroup(),
 			ip.Name,
 			network.PublicIPAddress{
 				Sku:      &network.PublicIPAddressSku{Name: network.PublicIPAddressSkuNameStandard},
@@ -63,13 +63,13 @@ func (s *Service) Reconcile(ctx context.Context) error {
 func (s *Service) Delete(ctx context.Context) error {
 	for _, ip := range s.Scope.PublicIPSpecs() {
 		s.Scope.V(2).Info("deleting public IP", "public ip", ip.Name)
-		err := s.Client.Delete(ctx, s.Scope.ResourceGroup(), ip.Name)
+		err := s.Client.Delete(ctx, s.Scope.NodeResourceGroup(), ip.Name)
 		if err != nil && azure.ResourceNotFound(err) {
 			// already deleted
 			return nil
 		}
 		if err != nil {
-			return errors.Wrapf(err, "failed to delete public IP %s in resource group %s", ip.Name, s.Scope.ResourceGroup())
+			return errors.Wrapf(err, "failed to delete public IP %s in resource group %s", ip.Name, s.Scope.NodeResourceGroup())
 		}
 
 		s.Scope.V(2).Info("deleted public IP", "public ip", ip.Name)

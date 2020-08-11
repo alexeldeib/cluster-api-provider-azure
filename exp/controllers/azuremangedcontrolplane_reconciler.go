@@ -26,7 +26,12 @@ import (
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
+	"sigs.k8s.io/cluster-api/controllers/remote"
 	"sigs.k8s.io/cluster-api/util/secret"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -35,6 +40,7 @@ import (
 	"sigs.k8s.io/cluster-api-provider-azure/cloud/scope"
 	"sigs.k8s.io/cluster-api-provider-azure/cloud/services/groups"
 	"sigs.k8s.io/cluster-api-provider-azure/cloud/services/managedclusters"
+	"sigs.k8s.io/cluster-api-provider-azure/cloud/services/virtualnetworks"
 	infrav1exp "sigs.k8s.io/cluster-api-provider-azure/exp/api/v1alpha3"
 )
 
@@ -43,6 +49,8 @@ type azureManagedControlPlaneReconciler struct {
 	kubeclient         client.Client
 	managedClustersSvc *managedclusters.Service
 	groupsSvc          azure.Service
+	vnetSvc            *virtualnetworks.Service
+	scheme             *runtime.Scheme
 }
 
 // newAzureManagedControlPlaneReconciler populates all the services based on input scope
@@ -51,6 +59,8 @@ func newAzureManagedControlPlaneReconciler(scope *scope.ManagedControlPlaneScope
 		kubeclient:         scope.Client,
 		managedClustersSvc: managedclusters.NewService(scope),
 		groupsSvc:          groups.NewService(scope),
+		vnetSvc:            virtualnetworks.NewService(scope),
+		scheme:             scope.Scheme,
 	}
 }
 
@@ -92,6 +102,11 @@ func (r *azureManagedControlPlaneReconciler) Reconcile(ctx context.Context, scop
 		return errors.Wrapf(err, "failed to reconcile kubeconfig secret")
 	}
 
+	scope.V(2).Info("Reconciling network")
+	if err := r.reconcileNetwork(ctx, scope, managedClusterSpec); err != nil {
+		return errors.Wrapf(err, "failed to reconcile network")
+	}
+
 	return nil
 }
 
@@ -117,6 +132,31 @@ func (r *azureManagedControlPlaneReconciler) Delete(ctx context.Context, scope *
 	if err := r.groupsSvc.Delete(ctx); err != nil {
 		return errors.Wrapf(err, "failed to delete managed cluster resource group")
 	}
+
+	return nil
+}
+
+func (r *azureManagedControlPlaneReconciler) reconcileNetwork(ctx context.Context, scope *scope.ManagedControlPlaneScope, managedClusterSpec *managedclusters.Spec) error {
+	vnets, err := r.vnetSvc.List(ctx, scope.ControlPlane.ManagedNodeResourceGroup())
+	if err != nil {
+		return errors.Wrapf(err, "failed to list vnets")
+	}
+
+	if len(vnets) < 1 {
+		return fmt.Errorf("failed to find vnet in managed resource group '%s' for aks cluster", scope.ControlPlane.ManagedNodeResourceGroup())
+	}
+
+	if vnets[0].Name == nil {
+		return errors.New("expected vnet returned by Azure to have a name, but was nil")
+	}
+
+	old := scope.ControlPlane.DeepCopyObject()
+
+	if err := r.kubeclient.Status().Patch(ctx, old, client.MergeFrom(scope.ControlPlane)); err != nil {
+		return errors.Wrapf(err, "failed to set control plane endpoint")
+	}
+
+	scope.ControlPlane.Status.VirtualNetwork = *vnets[0].Name
 
 	return nil
 }
@@ -225,6 +265,48 @@ func (r *azureManagedControlPlaneReconciler) reconcileKubeconfig(ctx context.Con
 	}); err != nil {
 		return errors.Wrapf(err, "failed to kubeconfig secret for cluster")
 	}
+
+	kubeconfigFile, err := clientcmd.Load(data)
+	if err != nil {
+		return errors.Wrap(err, "failed to turn aks credentials into kubeconfig file struct")
+	}
+
+	cluster := kubeconfigFile.Contexts[kubeconfigFile.CurrentContext].Cluster
+	caData := kubeconfigFile.Clusters[cluster].CertificateAuthorityData
+	caSecret := makeClusterCA(scope.Cluster, scope.ControlPlane)
+	if _, err := controllerutil.CreateOrUpdate(ctx, r.kubeclient, caSecret, func() error {
+		caSecret.Data = map[string][]byte{
+			secret.TLSCrtDataName: caData,
+			secret.TLSKeyDataName: []byte("foo"),
+		}
+		return nil
+	}); err != nil {
+		return errors.Wrapf(err, "failed to reconcile certificate authority data secret for cluster")
+	}
+
+	remoteclient, err := remote.NewClusterClient(ctx, r.kubeclient, types.NamespacedName{
+		Namespace: scope.Cluster.Namespace,
+		Name:      scope.Cluster.Name,
+	}, r.scheme)
+	if err != nil {
+		return errors.Wrap(err, "failed to create remote cluster kubeclient")
+	}
+
+	clusterInfo, err := makeClusterInfo(scope.ControlPlane, caData)
+	if err != nil {
+		return errors.Wrap(err, "failed to construct cluster-info")
+	}
+
+	// preserve before fetch into existing object
+	clusterInfoData := clusterInfo.Data
+
+	if _, err := controllerutil.CreateOrUpdate(ctx, remoteclient, clusterInfo, func() error {
+		clusterInfo.Data = clusterInfoData
+		return nil
+	}); err != nil {
+		return errors.Wrapf(err, "failed to reconcile certificate authority data secret for cluster")
+	}
+
 	return nil
 }
 
@@ -238,4 +320,43 @@ func makeKubeconfig(cluster *clusterv1.Cluster, controlPlane *infrav1exp.AzureMa
 			},
 		},
 	}
+}
+
+func makeClusterCA(cluster *clusterv1.Cluster, controlPlane *infrav1exp.AzureManagedControlPlane) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secret.Name(cluster.Name, secret.ClusterCA),
+			Namespace: cluster.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(controlPlane, infrav1exp.GroupVersion.WithKind("AzureManagedControlPlane")),
+			},
+		},
+	}
+}
+
+func makeClusterInfo(controlPlane *infrav1exp.AzureManagedControlPlane, caData []byte) (*corev1.ConfigMap, error) {
+	discoveryFile := clientcmdapi.NewConfig()
+	discoveryFile.Clusters[""] = &clientcmdapi.Cluster{
+		CertificateAuthorityData: caData,
+		Server: fmt.Sprintf(
+			"%s:%d",
+			controlPlane.Spec.ControlPlaneEndpoint.Host,
+			controlPlane.Spec.ControlPlaneEndpoint.Port,
+		),
+	}
+
+	data, err := clientcmd.Write(*discoveryFile)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to serialize cluster-info to yaml")
+	}
+
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cluster-info",
+			Namespace: "kube-public",
+		},
+		Data: map[string]string{
+			"kubeconfig": string(data),
+		},
+	}, nil
 }

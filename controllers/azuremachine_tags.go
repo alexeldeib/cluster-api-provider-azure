@@ -46,7 +46,7 @@ func (r *AzureMachineReconciler) reconcileTags(ctx context.Context, scope *scope
 	if changed {
 		scope.Info("Updating tags on AzureMachine")
 		svc := virtualmachines.NewService(scope, skuCache)
-		vm, err := svc.Client.Get(ctx, scope.ResourceGroup(), scope.Name())
+		vm, err := svc.Client.Get(ctx, scope.NodeResourceGroup(), scope.Name())
 		if err != nil {
 			return errors.Wrapf(err, "failed to query AzureMachine VM")
 		}
@@ -60,7 +60,7 @@ func (r *AzureMachineReconciler) reconcileTags(ctx context.Context, scope *scope
 		}
 
 		vm.Tags = tags
-		if err := svc.Client.CreateOrUpdate(ctx, scope.ResourceGroup(), scope.Name(), vm); err != nil {
+		if err := svc.Client.CreateOrUpdate(ctx, scope.NodeResourceGroup(), scope.Name(), vm); err != nil {
 			return errors.Wrapf(err, "cannot update VM tags")
 		}
 

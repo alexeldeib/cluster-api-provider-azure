@@ -17,15 +17,19 @@ limitations under the License.
 package publicips
 
 import (
-	azure "sigs.k8s.io/cluster-api-provider-azure/cloud"
-
 	"github.com/go-logr/logr"
+	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1alpha3"
+	azure "sigs.k8s.io/cluster-api-provider-azure/cloud"
 )
 
 // PublicIPScope defines the scope interface for a public IP service.
 type PublicIPScope interface {
 	logr.Logger
-	azure.ClusterDescriber
+	azure.SubscriptionAuthorizer
+	NodeResourceGroup() string
+	ClusterName() string
+	Location() string
+	AdditionalTags() infrav1.Tags
 	PublicIPSpecs() []azure.PublicIPSpec
 }
 

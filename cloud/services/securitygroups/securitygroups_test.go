@@ -79,7 +79,7 @@ func TestReconcileSecurityGroups(t *testing.T) {
 					},
 				})
 				s.IsVnetManaged().Return(true)
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Location().AnyTimes().Return("test-location")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				m.Get(context.TODO(), "my-rg", "nsg-one").Return(network.SecurityGroup{}, autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not found"))
@@ -153,7 +153,7 @@ func TestReconcileSecurityGroups(t *testing.T) {
 					},
 				})
 				s.IsVnetManaged().AnyTimes().Return(true)
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.Location().AnyTimes().Return("test-location")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				m.Get(context.TODO(), "my-rg", "nsg-one").Return(network.SecurityGroup{
@@ -286,7 +286,7 @@ func TestDeleteSecurityGroups(t *testing.T) {
 						IngressRules: infrav1.IngressRules{},
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				m.Delete(context.TODO(), "my-rg", "nsg-one")
 				m.Delete(context.TODO(), "my-rg", "nsg-two")
@@ -305,7 +305,7 @@ func TestDeleteSecurityGroups(t *testing.T) {
 						IngressRules: infrav1.IngressRules{},
 					},
 				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+				s.NodeResourceGroup().AnyTimes().Return("my-rg")
 				s.V(gomock.AssignableToTypeOf(2)).AnyTimes().Return(klogr.New())
 				m.Delete(context.TODO(), "my-rg", "nsg-one").
 					Return(autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not found"))
