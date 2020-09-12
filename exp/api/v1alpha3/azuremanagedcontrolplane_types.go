@@ -17,6 +17,8 @@ limitations under the License.
 package v1alpha3
 
 import (
+	"fmt"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
@@ -86,6 +88,14 @@ type AzureManagedControlPlaneStatus struct {
 	// In the AzureManagedControlPlane implementation, these are identical.
 	// +optional
 	Initialized bool `json:"initialized,omitempty"`
+
+	// VirtualNetwork is the name of the AKS-generated VNET. It's not predictable unless we pre-create it.
+	// Consider pre-creating?
+	VirtualNetwork string `json:"virtualNetwork,omitempty"`
+}
+
+func (c *AzureManagedControlPlane) ManagedResourceGroup() string {
+	return fmt.Sprintf("MC_%s_%s_%s", c.Spec.ResourceGroup, c.Name, c.Spec.Location)
 }
 
 // +kubebuilder:object:root=true

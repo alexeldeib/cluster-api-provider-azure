@@ -143,3 +143,45 @@ func (s *ManagedControlPlaneScope) Authorizer() autorest.Authorizer {
 func (s *ManagedControlPlaneScope) PatchObject(ctx context.Context) error {
 	return s.patchHelper.Patch(ctx, s.PatchTarget)
 }
+
+// ControlPlaneSubnet is empty for managed clusters.
+func (s *ManagedControlPlaneScope) ControlPlaneSubnet() *infrav1.SubnetSpec {
+	return nil
+}
+
+// NodeSubnet is the name of the subnet nodes should join, defaults to aks-subnet.
+func (s *ManagedControlPlaneScope) NodeSubnet() *infrav1.SubnetSpec {
+	return &infrav1.SubnetSpec{
+		Role: infrav1.SubnetNode,
+		Name: "aks-subnet",
+	}
+}
+
+// IsVnetManaged returns true if the vnet is managed.
+func (s *ManagedControlPlaneScope) IsVnetManaged() bool {
+	return true
+}
+
+// RouteTable returns the cluster node routetable.
+func (s *ManagedControlPlaneScope) RouteTable() *infrav1.RouteTable {
+	return nil
+}
+
+// Vnet returns the cluster Vnet.
+func (s *ManagedControlPlaneScope) Vnet() *infrav1.VnetSpec {
+	return &infrav1.VnetSpec{
+		ResourceGroup: s.ControlPlane.ManagedResourceGroup(),
+		Name:          s.ControlPlane.Status.VirtualNetwork,
+	}
+}
+
+// VNetSpecs returns the virtual network specs.
+func (s *ManagedControlPlaneScope) VNetSpecs() []azure.VNetSpec {
+	return []azure.VNetSpec{
+		{
+			ResourceGroup: s.Vnet().ResourceGroup,
+			Name:          s.Vnet().Name,
+			CIDR:          s.Vnet().CidrBlock,
+		},
+	}
+}

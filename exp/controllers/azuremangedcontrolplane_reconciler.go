@@ -43,6 +43,7 @@ import (
 type azureManagedControlPlaneReconciler struct {
 	kubeclient         client.Client
 	managedClustersSvc *managedclusters.Service
+	vnetSvc            *virtualnetworks.Service
 	groupsSvc          azure.Service
 }
 
@@ -52,6 +53,7 @@ func newAzureManagedControlPlaneReconciler(scope *scope.ManagedControlPlaneScope
 		kubeclient:         scope.Client,
 		managedClustersSvc: managedclusters.NewService(scope),
 		groupsSvc:          groups.NewService(scope),
+		vnetSvc:            virtualnetworks.NewService(scope),
 	}
 }
 
@@ -102,6 +104,11 @@ func (r *azureManagedControlPlaneReconciler) Reconcile(ctx context.Context, scop
 		return errors.Wrapf(err, "failed to reconcile kubeconfig secret")
 	}
 
+	scope.Logger.V(2).Info("Reconciling network status")
+	if err := r.reconcileNetwork(ctx, scope, managedClusterSpec); err != nil {
+		return errors.Wrapf(err, "failed to reconcile network status")
+	}
+
 	return nil
 }
 
@@ -135,6 +142,31 @@ func (r *azureManagedControlPlaneReconciler) Delete(ctx context.Context, scope *
 	scope.V(2).Info("Deleting managed cluster resource group")
 	if err := r.groupsSvc.Delete(ctx); err != nil {
 		return errors.Wrapf(err, "failed to delete managed cluster resource group")
+	}
+
+	return nil
+}
+
+func (r *azureManagedControlPlaneReconciler) reconcileNetwork(ctx context.Context, scope *scope.ManagedControlPlaneScope, managedClusterSpec *managedclusters.Spec) error {
+	vnets, err := r.vnetSvc.List(ctx, scope.ControlPlane.ManagedResourceGroup())
+	if err != nil {
+		return errors.Wrapf(err, "failed to list vnets")
+	}
+
+	if len(vnets) < 1 {
+		return fmt.Errorf("failed to find vnet in managed resource group '%s' for aks cluster", scope.ControlPlane.ManagedResourceGroup())
+	}
+
+	if vnets[0].Name == nil {
+		return errors.New("expected vnet returned by Azure to have a name, but was nil")
+	}
+
+	old := scope.ControlPlane.DeepCopyObject()
+
+	scope.ControlPlane.Status.VirtualNetwork = *vnets[0].Name
+
+	if err := r.kubeclient.Status().Patch(ctx, scope.ControlPlane, client.MergeFrom(old)); err != nil {
+		return errors.Wrapf(err, "failed to set control plane endpoint")
 	}
 
 	return nil
