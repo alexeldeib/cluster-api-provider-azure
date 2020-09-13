@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -26,6 +27,7 @@ import (
 	"github.com/pkg/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/record"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
 	capierrors "sigs.k8s.io/cluster-api/errors"
@@ -42,6 +44,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1alpha3"
+	azure "sigs.k8s.io/cluster-api-provider-azure/cloud"
 	"sigs.k8s.io/cluster-api-provider-azure/cloud/scope"
 	infracontroller "sigs.k8s.io/cluster-api-provider-azure/controllers"
 	infrav1exp "sigs.k8s.io/cluster-api-provider-azure/exp/api/v1alpha3"
@@ -161,24 +164,64 @@ func (r *AzureMachinePoolReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result,
 		return ctrl.Result{}, nil
 	}
 
-	azureClusterName := client.ObjectKey{
-		Namespace: azMachinePool.Namespace,
-		Name:      cluster.Spec.InfrastructureRef.Name,
-	}
-	azureCluster := &infrav1.AzureCluster{}
-	if err := r.Client.Get(ctx, azureClusterName, azureCluster); err != nil {
-		logger.Info("AzureCluster is not available yet")
-		return reconcile.Result{}, nil
+	// TODO(ace): refactor next 50-100 lines
+	controlPlaneRefKind := cluster.Spec.ControlPlaneRef.Kind
+	controlPlaneRefGV, err := schema.ParseGroupVersion(cluster.Spec.ControlPlaneRef.APIVersion)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "failed to parse gv from control plane apiversion")
 	}
 
-	logger = logger.WithValues("AzureCluster", azureCluster.Name)
+	infraRefKind := cluster.Spec.InfrastructureRef.Kind
+	infraRefGV, err := schema.ParseGroupVersion(cluster.Spec.InfrastructureRef.APIVersion)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "failed to parse gv from infra ref apiversion")
+	}
+
+	// AzureManagedControlPlane only works with AzureManagedCluster
+	var isManaged bool
+	clusterDescriberRef := cluster.Spec.InfrastructureRef
+	if controlPlaneRefGV.Group == infrav1exp.GroupVersion.Group && controlPlaneRefKind == "AzureManagedControlPlane" {
+		isManaged = true
+		clusterDescriberRef = cluster.Spec.ControlPlaneRef
+		if infraRefGV.Group != infrav1exp.GroupVersion.Group || infraRefKind != "AzureManagedCluster" {
+			logger.Info(fmt.Sprintf(
+				"AzureManagedControlPlane only works with AzureManagedCluster, but infraRef on Cluster is of Group: '%s', Kind: '%s'",
+				infraRefGV.Group,
+				infraRefKind,
+			))
+			// do not attempt requeue, this is a terminal error until user action
+			return ctrl.Result{}, nil
+		}
+	}
+
+	var clusterDescriber azure.ClusterDescriber
+	if isManaged {
+		clusterDescriber = new(infrav1exp.AzureManagedControlPlane)
+
+	} else {
+		clusterDescriber = new(infrav1.AzureCluster)
+	}
+
+	clusterDescriberName := client.ObjectKey{
+		Namespace: clusterDescriberRef.Namespace,
+		Name:      clusterDescriberRef.Name,
+	}
+	if err := r.Client.Get(ctx, clusterDescriberName, clusterDescriber); err != nil {
+		msg := fmt.Sprintf("%s unavailable", clusterDescriberRef.Kind)
+		r.Recorder.Eventf(azMachinePool, corev1.EventTypeNormal, msg, msg)
+		logger.Info(msg)
+		return reconcile.Result{}, nil
+	}
+	// TODO(ace): refactor ends here
+
+	logger = logger.WithValues(clusterDescriberRef.Kind, clusterDescriber.GetName())
 
 	// Create the cluster scope
 	clusterScope, err := scope.NewClusterScope(scope.ClusterScopeParams{
 		Client:           r.Client,
 		Logger:           logger,
 		Cluster:          cluster,
-		ClusterDescriber: azureCluster,
+		ClusterDescriber: clusterDescriber,
 	})
 	if err != nil {
 		return reconcile.Result{}, err

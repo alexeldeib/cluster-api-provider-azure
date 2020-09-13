@@ -118,3 +118,119 @@ spec:
           name: '{{ ds.meta_data["local_hostname"] }}'
       verbosity: 6
       useExperimentalRetryJoin: true
+---
+apiVersion: exp.cluster.x-k8s.io/v1alpha3
+kind: MachinePool
+metadata:
+  name: ${CLUSTER_NAME}-mp-0
+  namespace: default
+spec:
+  clusterName: ${CLUSTER_NAME}
+  replicas: ${WORKER_MACHINE_COUNT}
+  template:
+    spec:
+      bootstrap:
+        configRef:
+          apiVersion: bootstrap.cluster.x-k8s.io/v1alpha3
+          kind: KubeadmConfig
+          name: ${CLUSTER_NAME}-mp-0
+      clusterName: ${CLUSTER_NAME}
+      infrastructureRef:
+        apiVersion: exp.infrastructure.cluster.x-k8s.io/v1alpha3
+        kind: AzureMachinePool
+        name: ${CLUSTER_NAME}-mp-0
+      version: ${KUBERNETES_VERSION}
+---
+apiVersion: exp.infrastructure.cluster.x-k8s.io/v1alpha3
+kind: AzureMachinePool
+metadata:
+  name: ${CLUSTER_NAME}-mp-0
+  namespace: default
+spec:
+  location: ${AZURE_LOCATION}
+  template:
+    osDisk:
+      diskSizeGB: 30
+      managedDisk:
+        storageAccountType: Premium_LRS
+      osType: Linux
+    sshPublicKey: ${AZURE_SSH_PUBLIC_KEY_B64}
+    vmSize: ${AZURE_NODE_MACHINE_TYPE}
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1alpha3
+kind: KubeadmConfig
+metadata:
+  name: ${CLUSTER_NAME}-mp-0
+  namespace: default
+spec:
+  preKubeadmCommands:
+  - sudo kubeadm init phase upload-config all
+  - iptables -t nat -A POSTROUTING -m iprange --dst-range 168.63.129.16 -m addrtype ! --dst-type local ! -d 10.0.0.0/8 -j MASQUERADE
+  - bash /opt/bin/install-cni.sh v1.1.7
+  postKubeadmCommands:
+  - kubectl --kubeconfig /etc/kubernetes/admin.conf get node -l kubernetes.io/hostname="$(hostname)" -o jsonpath="{.items[0].metadata.name}" > /tmp/nodename
+  - kubectl --kubeconfig /etc/kubernetes/admin.conf label node "$(cat /tmp/nodename)" kubernetes.azure.com/role=agent kubernetes.io/role=agent node-role.kubernetes.io/agent=""
+  files:
+  - contentFrom:
+      secret:
+        key: value
+        name: ${CLUSTER_NAME}-kubeconfig
+    owner: root:root
+    path: /etc/kubernetes/admin.conf
+    permissions: "0644"
+  - contentFrom:
+      secret:
+        key: azure.json
+        name: ${CLUSTER_NAME}-mp-0-azure-json
+    owner: root:root
+    path: /etc/kubernetes/azure.json
+    permissions: "0644"
+  - content: |
+      IyEvdXNyL2Jpbi9lbnYgYmFzaAoKIyBJbnN0YWxscyBhenVyZS12bmV0IENOSSBwbHVnaW5zIG9u
+      IGEgTGludXggbm9kZS4KCiMgQXJndW1lbnRzLgpQTFVHSU5fVkVSU0lPTj0kMQpDTklfVkVSU0lP
+      Tj0kMgpDTklfQklOX0RJUj0vb3B0L2NuaS9iaW4KQ05JX05FVENPTkZfRElSPS9ldGMvY25pL25l
+      dC5kCgpmdW5jdGlvbiB1c2FnZQp7CiAgICBwcmludGYgIkluc3RhbGxzIGF6dXJlLXZuZXQgQ05J
+      IHBsdWdpbnMuXG4iCiAgICBwcmludGYgIlVzYWdlOiBpbnN0YWxsLWNuaS1wbHVnaW4gdmVyc2lv
+      biBbY25pVmVyc2lvbl1cbiIKfQoKaWYgWyAiJFBMVUdJTl9WRVJTSU9OIiA9ICIiIF07IHRoZW4K
+      ICAgIHVzYWdlCiAgICBleGl0IDEKZmkKCmlmIFsgIiRDTklfVkVSU0lPTiIgPSAiIiBdOyB0aGVu
+      CiAgICBDTklfVkVSU0lPTj12MC40LjAKZmkKCiMgQ3JlYXRlIENOSSBkaXJlY3Rvcmllcy4KcHJp
+      bnRmICJDcmVhdGluZyBDTkkgZGlyZWN0b3JpZXMuXG4iCm1rZGlyIC1wICRDTklfQklOX0RJUgpt
+      a2RpciAtcCAkQ05JX05FVENPTkZfRElSCgojIEluc3RhbGwgZWJ0YWJsZXMuCmlmIFsgISAtZSAv
+      c2Jpbi9lYnRhYmxlcyBdCnRoZW4KICAgIHByaW50ZiAiSW5zdGFsbGluZyBlYnRhYmxlcyBwYWNr
+      YWdlLi4uIgogICAgYXB0LWdldCB1cGRhdGUKICAgIGFwdC1nZXQgaW5zdGFsbCAteSBlYnRhYmxl
+      cwogICAgcHJpbnRmICJkb25lLlxuIgplbHNlCiAgICBlY2hvICJQYWNrYWdlIGVidGFibGVzIGlz
+      IGFscmVhZHkgaW5zdGFsbGVkLiIKZmkKL3NiaW4vZWJ0YWJsZXMgLS1saXN0ID4gL2Rldi9udWxs
+      CgojIEluc3RhbGwgYXp1cmUtdm5ldCBDTkkgcGx1Z2lucy4KcHJpbnRmICJJbnN0YWxsaW5nIGF6
+      dXJlLXZuZXQgQ05JIHBsdWdpbiB2ZXJzaW9uICRQTFVHSU5fVkVSU0lPTiB0byAkQ05JX0JJTl9E
+      SVIuLi4iCi91c3IvYmluL2N1cmwgLXNTTCBodHRwczovL2dpdGh1Yi5jb20vQXp1cmUvYXp1cmUt
+      Y29udGFpbmVyLW5ldHdvcmtpbmcvcmVsZWFzZXMvZG93bmxvYWQvJFBMVUdJTl9WRVJTSU9OL2F6
+      dXJlLXZuZXQtY25pLWxpbnV4LWFtZDY0LSRQTFVHSU5fVkVSU0lPTi50Z3ogPiAkQ05JX0JJTl9E
+      SVIvYXp1cmUtdm5ldC50Z3oKdGFyIC14emYgJENOSV9CSU5fRElSL2F6dXJlLXZuZXQudGd6IC1D
+      ICRDTklfQklOX0RJUgpwcmludGYgImRvbmUuXG4iCgojIEluc3RhbGwgYXp1cmUtdm5ldCBDTkkg
+      bmV0d29yayBjb25maWd1cmF0aW9uIGZpbGUuCnByaW50ZiAiSW5zdGFsbGluZyBhenVyZS12bmV0
+      IENOSSBuZXR3b3JrIGNvbmZpZ3VyYXRpb24gZmlsZSB0byAkQ05JX05FVENPTkZfRElSLi4uIgpt
+      diAkQ05JX0JJTl9ESVIvKi5jb25mbGlzdCAkQ05JX05FVENPTkZfRElSCnByaW50ZiAiZG9uZS5c
+      biIKCiMgSW5zdGFsbCBsb29wYmFjayBwbHVnaW4uCnByaW50ZiAiSW5zdGFsbGluZyBsb29wYmFj
+      ayBDTkkgcGx1Z2luIHZlcnNpb24gJENOSV9WRVJTSU9OIHRvICRDTklfQklOX0RJUi4uLiIKL3Vz
+      ci9iaW4vY3VybCAtc1NMIGh0dHBzOi8vZ2l0aHViLmNvbS9jb250YWluZXJuZXR3b3JraW5nL3Bs
+      dWdpbnMvcmVsZWFzZXMvZG93bmxvYWQvJENOSV9WRVJTSU9OL2NuaS1wbHVnaW5zLWxpbnV4LWFt
+      ZDY0LSRDTklfVkVSU0lPTi50Z3ogPiAkQ05JX0JJTl9ESVIvY25pLnRnegp0YXIgLXh6ZiAkQ05J
+      X0JJTl9ESVIvY25pLnRneiAtQyAkQ05JX0JJTl9ESVIgLi9sb29wYmFjawpwcmludGYgImRvbmUu
+      XG4iCgojIENsZWFudXAuCnJtICRDTklfQklOX0RJUi8qLnRnegpjaG93biByb290OnJvb3QgJENO
+      SV9CSU5fRElSLyoKCnByaW50ZiAiYXp1cmUtdm5ldCBDTkkgcGx1Z2luIGlzIHN1Y2Nlc3NmdWxs
+      eSBpbnN0YWxsZWQuXG4iCg==
+    encoding: base64
+    owner: root:root
+    path: /opt/bin/install-cni.sh
+    permissions: "0755"
+  joinConfiguration:
+    discovery:
+      file:
+        kubeConfigPath: /etc/kubernetes/admin.conf
+    nodeRegistration:
+      kubeletExtraArgs:
+        cloud-config: /etc/kubernetes/azure.json
+        cloud-provider: azure
+      name: '{{ ds.meta_data["local_hostname"] }}'
+  verbosity: 6
+  useExperimentalRetryJoin: true

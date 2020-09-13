@@ -169,6 +169,7 @@ func (r *AzureMachineReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, ret
 		return ctrl.Result{}, nil
 	}
 
+	// TODO(ace): refactor next 50-100 lines
 	controlPlaneRefKind := cluster.Spec.ControlPlaneRef.Kind
 	controlPlaneRefGV, err := schema.ParseGroupVersion(cluster.Spec.ControlPlaneRef.APIVersion)
 	if err != nil {
@@ -216,6 +217,7 @@ func (r *AzureMachineReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, ret
 		logger.Info(msg)
 		return reconcile.Result{}, nil
 	}
+	// TODO(ace): refactor ends here
 
 	logger = logger.WithValues(clusterDescriberRef.Kind, clusterDescriber.GetName())
 

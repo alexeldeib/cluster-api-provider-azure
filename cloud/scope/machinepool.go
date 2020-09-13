@@ -103,8 +103,8 @@ func (m *MachinePoolScope) ScaleSetSpec() azure.ScaleSetSpec {
 		SubnetName:              m.NodeSubnet().Name,
 		VNetName:                m.Vnet().Name,
 		VNetResourceGroup:       m.Vnet().ResourceGroup,
-		PublicLBName:            m.ClusterName(),
-		PublicLBAddressPoolName: azure.GenerateOutboundBackendddressPoolName(m.ClusterName()),
+		PublicLBName:            m.LoadBalancerName(),
+		PublicLBAddressPoolName: m.OutboundPoolName(m.LoadBalancerName()),
 		AcceleratedNetworking:   m.AzureMachinePool.Spec.Template.AcceleratedNetworking,
 	}
 }
