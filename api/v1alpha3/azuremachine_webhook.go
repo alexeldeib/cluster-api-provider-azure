@@ -76,6 +76,10 @@ func (m *AzureMachine) ValidateUpdate(oldRaw runtime.Object) error {
 	machinelog.Info("validate update", "name", m.Name)
 	var allErrs field.ErrorList
 
+	if errs := ValidateImage(m.Spec.Image, field.NewPath("image")); len(errs) > 0 {
+		allErrs = append(allErrs, errs...)
+	}
+
 	if errs := ValidateOSDisk(m.Spec.OSDisk, field.NewPath("osDisk")); len(errs) > 0 {
 		allErrs = append(allErrs, errs...)
 	}

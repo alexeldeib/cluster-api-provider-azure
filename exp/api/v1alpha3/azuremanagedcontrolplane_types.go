@@ -130,9 +130,19 @@ func (c *AzureManagedControlPlane) SubscriptionID() string {
 	return c.Spec.SubscriptionID
 }
 
+// ControlPlaneResourceGroup returns the cluster resource group.
+func (c *AzureManagedControlPlane) ControlPlaneResourceGroup() string {
+	return c.ClusterName()
+}
+
 // ResourceGroup returns the cluster resource group.
 func (c *AzureManagedControlPlane) ResourceGroup() string {
-	return c.ClusterName()
+	return c.ManagedResourceGroup()
+}
+
+// ResourceGroups returns the cluster resource group.
+func (c *AzureManagedControlPlane) ResourceGroups() []string {
+	return []string{c.ControlPlaneResourceGroup()}
 }
 
 // ClusterName returns the cluster name.
@@ -176,6 +186,11 @@ func (c *AzureManagedControlPlane) AdditionalTags() infrav1.Tags {
 // LoadBalancerName returns the node load balancer name.
 func (c *AzureManagedControlPlane) LoadBalancerName() string {
 	return "kubernetes" // hard-coded in aks
+}
+
+// OutboundPoolName returns the node load balancer name.
+func (c *AzureManagedControlPlane) OutboundPoolName(_ string) string {
+	return "aksOutboundBackendPool" // hard-coded in aks
 }
 
 // Network returns the cluster network object.

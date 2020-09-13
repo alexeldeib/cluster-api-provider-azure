@@ -17,6 +17,8 @@ limitations under the License.
 package v1alpha3
 
 import (
+	"fmt"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
@@ -120,9 +122,19 @@ func (c *AzureCluster) SubscriptionID() string {
 	return c.Spec.SubscriptionID
 }
 
+// ControlPlaneResourceGroup returns the cluster resource group.
+func (c *AzureCluster) ControlPlaneResourceGroup() string {
+	return c.Spec.ResourceGroup
+}
+
 // ResourceGroup returns the cluster resource group.
 func (c *AzureCluster) ResourceGroup() string {
 	return c.Spec.ResourceGroup
+}
+
+// ResourceGroups returns the cluster resource group.
+func (c *AzureCluster) ResourceGroups() []string {
+	return []string{c.ResourceGroup()}
 }
 
 // ClusterName returns the cluster name.
@@ -171,6 +183,11 @@ func (c *AzureCluster) AdditionalTags() Tags {
 // LoadBalancerName returns the node load balancer name.
 func (c *AzureCluster) LoadBalancerName() string {
 	return c.ClusterName()
+}
+
+// OutboundPoolName returns the node load balancer name.
+func (c *AzureCluster) OutboundPoolName(loadBalancerName string) string {
+	return fmt.Sprintf("%s-%s", loadBalancerName, "outboundBackendPool")
 }
 
 // Network returns the cluster network object.

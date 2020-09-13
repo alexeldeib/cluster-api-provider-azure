@@ -78,6 +78,8 @@ type ClusterDescriber interface {
 	controllerutil.Object
 	NetworkDescriber
 	SubscriptionID() string
+	ResourceGroups() []string
+	ControlPlaneResourceGroup() string
 	ResourceGroup() string
 	ClusterName() string
 	Location() string
@@ -89,6 +91,7 @@ type ClusterDescriber interface {
 // abstracted because it is implemented by managed and unmanaged cluster.
 type NetworkDescriber interface {
 	LoadBalancerName() string
+	OutboundPoolName(string) string
 	Network() *infrav1.Network
 	Vnet() *infrav1.VnetSpec
 	IsVnetManaged() bool

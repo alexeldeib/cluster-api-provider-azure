@@ -164,7 +164,7 @@ func (m *MachineScope) NICSpecs() []azure.NICSpec {
 	} else if m.Role() == infrav1.Node {
 		publicLBName := m.LoadBalancerName()
 		spec.PublicLBName = publicLBName
-		spec.PublicLBAddressPoolName = azure.GenerateOutboundBackendddressPoolName(publicLBName)
+		spec.PublicLBAddressPoolName = m.OutboundPoolName(publicLBName)
 	}
 	specs := []azure.NICSpec{spec}
 	if m.AzureMachine.Spec.AllocatePublicIP == true {

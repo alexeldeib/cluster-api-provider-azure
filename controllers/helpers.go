@@ -41,6 +41,7 @@ import (
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1alpha3"
 	azure "sigs.k8s.io/cluster-api-provider-azure/cloud"
+	expv1 "sigs.k8s.io/cluster-api-provider-azure/exp/api/v1alpha3"
 	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
 )
 
@@ -68,6 +69,59 @@ func AzureClusterToAzureMachinesMapper(c client.Client, scheme *runtime.Scheme, 
 		// Don't handle deleted AzureClusters
 		if !azCluster.ObjectMeta.DeletionTimestamp.IsZero() {
 			log.V(4).Info("AzureCluster has a deletion timestamp, skipping mapping.")
+			return nil
+		}
+
+		clusterName, ok := GetOwnerClusterName(azCluster.ObjectMeta)
+		if !ok {
+			log.Info("unable to get the owner cluster")
+			return nil
+		}
+
+		machineList := &clusterv1.MachineList{}
+		// list all of the requested objects within the cluster namespace with the cluster name label
+		if err := c.List(ctx, machineList, client.InNamespace(azCluster.Namespace), client.MatchingLabels{clusterv1.ClusterLabelName: clusterName}); err != nil {
+			return nil
+		}
+
+		mapFunc := util.MachineToInfrastructureMapFunc(gvk)
+		var results []ctrl.Request
+		for _, machine := range machineList.Items {
+			m := machine
+			azureMachines := mapFunc.Map(handler.MapObject{
+				Object: &m,
+			})
+			results = append(results, azureMachines...)
+		}
+
+		return results
+	}), nil
+}
+
+// AzureManagedClusterToAzureMachinesMapper creates a mapping handler to transform AzureManagedClusters into AzureMachines. The transform
+// requires AzureManagedCluster to map to the owning Cluster, then from the Cluster, collect the Machines belonging to the cluster,
+// then finally projecting the infrastructure reference to the AzureMachine.
+func AzureManagedClusterToAzureMachinesMapper(c client.Client, scheme *runtime.Scheme, log logr.Logger) (handler.Mapper, error) {
+	gvk, err := apiutil.GVKForObject(new(infrav1.AzureMachine), scheme)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to find GVK for AzureMachine")
+	}
+
+	return handler.ToRequestsFunc(func(o handler.MapObject) []ctrl.Request {
+		ctx, cancel := context.WithTimeout(context.Background(), reconciler.DefaultMappingTimeout)
+		defer cancel()
+
+		azCluster, ok := o.Object.(*expv1.AzureManagedCluster)
+		if !ok {
+			log.Error(errors.Errorf("expected an AzureManagedCluster, got %T instead", o.Object), "failed to map AzureManagedCluster")
+			return nil
+		}
+
+		log = log.WithValues("AzureManagedCluster", azCluster.Name, "Namespace", azCluster.Namespace)
+
+		// Don't handle deleted AzureManagedClusters
+		if !azCluster.ObjectMeta.DeletionTimestamp.IsZero() {
+			log.V(4).Info("AzureManagedCluster has a deletion timestamp, skipping mapping.")
 			return nil
 		}
 

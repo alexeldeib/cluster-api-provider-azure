@@ -18,12 +18,14 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/record"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
 	capierrors "sigs.k8s.io/cluster-api/errors"
@@ -40,7 +42,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1alpha3"
+	azure "sigs.k8s.io/cluster-api-provider-azure/cloud"
 	"sigs.k8s.io/cluster-api-provider-azure/cloud/scope"
+	expv1 "sigs.k8s.io/cluster-api-provider-azure/exp/api/v1alpha3"
 	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
 )
 
@@ -60,6 +64,12 @@ func (r *AzureMachineReconciler) SetupWithManager(mgr ctrl.Manager, options cont
 		return errors.Wrapf(err, "failed to create AzureCluster to AzureMachines mapper")
 	}
 
+	// create mapper to transform incoming AzureManagedClusters into AzureMachine requests
+	azureManagedClusterToAzureMachinesMapper, err := AzureManagedClusterToAzureMachinesMapper(r.Client, mgr.GetScheme(), log)
+	if err != nil {
+		return errors.Wrapf(err, "failed to create AzureManagedCluster to AzureMachines mapper")
+	}
+
 	c, err := ctrl.NewControllerManagedBy(mgr).
 		WithOptions(options).
 		For(&infrav1.AzureMachine{}).
@@ -76,6 +86,13 @@ func (r *AzureMachineReconciler) SetupWithManager(mgr ctrl.Manager, options cont
 			&source.Kind{Type: &infrav1.AzureCluster{}},
 			&handler.EnqueueRequestsFromMapFunc{
 				ToRequests: azureClusterToAzureMachinesMapper,
+			},
+		).
+		// watch for changes in AzureManagedCluster
+		Watches(
+			&source.Kind{Type: &expv1.AzureManagedCluster{}},
+			&handler.EnqueueRequestsFromMapFunc{
+				ToRequests: azureManagedClusterToAzureMachinesMapper,
 			},
 		).
 		Build(r)
@@ -152,28 +169,65 @@ func (r *AzureMachineReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, ret
 		return ctrl.Result{}, nil
 	}
 
-	azureClusterName := client.ObjectKey{
-		Namespace: azureMachine.Namespace,
-		Name:      cluster.Spec.InfrastructureRef.Name,
+	controlPlaneRefKind := cluster.Spec.ControlPlaneRef.Kind
+	controlPlaneRefGV, err := schema.ParseGroupVersion(cluster.Spec.ControlPlaneRef.APIVersion)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "failed to parse gv from control plane apiversion")
 	}
-	azureCluster := &infrav1.AzureCluster{}
-	if err := r.Client.Get(ctx, azureClusterName, azureCluster); err != nil {
-		r.Recorder.Eventf(azureMachine, corev1.EventTypeNormal, "AzureCluster unavailable", "AzureCluster is not available yet")
-		logger.Info("AzureCluster is not available yet")
+
+	infraRefKind := cluster.Spec.InfrastructureRef.Kind
+	infraRefGV, err := schema.ParseGroupVersion(cluster.Spec.InfrastructureRef.APIVersion)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "failed to parse gv from infra ref apiversion")
+	}
+
+	// AzureManagedControlPlane only works with AzureManagedCluster
+	var isManaged bool
+	clusterDescriberRef := cluster.Spec.InfrastructureRef
+	if controlPlaneRefGV.Group == expv1.GroupVersion.Group && controlPlaneRefKind == "AzureManagedControlPlane" {
+		isManaged = true
+		clusterDescriberRef = cluster.Spec.ControlPlaneRef
+		if infraRefGV.Group != expv1.GroupVersion.Group || infraRefKind != "AzureManagedCluster" {
+			logger.Info(fmt.Sprintf(
+				"AzureManagedControlPlane only works with AzureManagedCluster, but infraRef on Cluster is of Group: '%s', Kind: '%s'",
+				infraRefGV.Group,
+				infraRefKind,
+			))
+			// do not attempt requeue, this is a terminal error until user action
+			return ctrl.Result{}, nil
+		}
+	}
+
+	var clusterDescriber azure.ClusterDescriber
+	if isManaged {
+		clusterDescriber = new(expv1.AzureManagedControlPlane)
+
+	} else {
+		clusterDescriber = new(infrav1.AzureCluster)
+	}
+
+	clusterDescriberName := client.ObjectKey{
+		Namespace: azureMachine.Namespace,
+		Name:      clusterDescriberRef.Name,
+	}
+	if err := r.Client.Get(ctx, clusterDescriberName, clusterDescriber); err != nil {
+		msg := fmt.Sprintf("%s unavailable", clusterDescriberRef.Kind)
+		r.Recorder.Eventf(azureMachine, corev1.EventTypeNormal, msg, msg)
+		logger.Info(msg)
 		return reconcile.Result{}, nil
 	}
 
-	logger = logger.WithValues("AzureCluster", azureCluster.Name)
+	logger = logger.WithValues(clusterDescriberRef.Kind, clusterDescriber.GetName())
 
 	// Create the cluster scope
 	clusterScope, err := scope.NewClusterScope(scope.ClusterScopeParams{
 		Client:           r.Client,
 		Logger:           logger,
 		Cluster:          cluster,
-		ClusterDescriber: azureCluster,
+		ClusterDescriber: clusterDescriber,
 	})
 	if err != nil {
-		r.Recorder.Eventf(azureCluster, corev1.EventTypeWarning, "Error creating the cluster scope", err.Error())
+		r.Recorder.Eventf(clusterDescriber, corev1.EventTypeWarning, "Error creating the cluster scope", err.Error())
 		return reconcile.Result{}, err
 	}
 
@@ -308,8 +362,8 @@ func (r *AzureMachineReconciler) reconcileDelete(ctx context.Context, machineSco
 	machineScope.Info("Handling deleted AzureMachine")
 
 	if err := newAzureMachineService(machineScope, clusterScope).Delete(ctx); err != nil {
-		r.Recorder.Eventf(machineScope.AzureMachine, corev1.EventTypeWarning, "Error deleting AzureCluster", errors.Wrapf(err, "error deleting AzureCluster %s/%s", clusterScope.Namespace(), clusterScope.ClusterName()).Error())
-		return reconcile.Result{}, errors.Wrapf(err, "error deleting AzureCluster %s/%s", clusterScope.Namespace(), clusterScope.ClusterName())
+		r.Recorder.Eventf(machineScope.AzureMachine, corev1.EventTypeWarning, "Error deleting AzureMachine", errors.Wrapf(err, "error deleting AzureMachine %s/%s", clusterScope.Namespace(), machineScope.Name()).Error())
+		return reconcile.Result{}, errors.Wrapf(err, "error deleting AzureMachine %s/%s", clusterScope.Namespace(), machineScope.Name())
 	}
 
 	defer func() {

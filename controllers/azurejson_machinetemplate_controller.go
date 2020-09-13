@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -25,7 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/annotations"
@@ -35,7 +36,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1alpha3"
+	azure "sigs.k8s.io/cluster-api-provider-azure/cloud"
 	"sigs.k8s.io/cluster-api-provider-azure/cloud/scope"
+	expv1 "sigs.k8s.io/cluster-api-provider-azure/exp/api/v1alpha3"
 	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
 )
 
@@ -91,30 +94,77 @@ func (r *AzureJSONTemplateReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result
 		return ctrl.Result{}, nil
 	}
 
-	// only look at azure clusters
-	if cluster.Spec.InfrastructureRef.Kind != "AzureCluster" {
-		log.WithValues("kind", cluster.Spec.InfrastructureRef.Kind).Info("infra ref was not an AzureCluster")
+	// TODO(ace): refactor the next ~50-100 lines
+	// fetch the corresponding azure cluster
+	controlPlaneRefKind := cluster.Spec.ControlPlaneRef.Kind
+	controlPlaneRefGV, err := schema.ParseGroupVersion(cluster.Spec.ControlPlaneRef.APIVersion)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "failed to parse gv from control plane apiversion")
+	}
+
+	infraRefKind := cluster.Spec.InfrastructureRef.Kind
+	infraRefGV, err := schema.ParseGroupVersion(cluster.Spec.InfrastructureRef.APIVersion)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "failed to parse gv from infra ref apiversion")
+	}
+
+	// AzureManagedControlPlane only works with AzureManagedCluster
+	var isManaged bool
+	var clusterDescriberRef *corev1.ObjectReference
+
+	if controlPlaneRefGV.Group == expv1.GroupVersion.Group && controlPlaneRefKind == "AzureManagedControlPlane" {
+		isManaged = true
+		clusterDescriberRef = cluster.Spec.ControlPlaneRef
+		if infraRefGV.Group != expv1.GroupVersion.Group || infraRefKind != "AzureManagedCluster" {
+			log.Info(fmt.Sprintf(
+				"AzureManagedControlPlane only works with AzureManagedCluster, but infraRef on Cluster is of Group: '%s', Kind: '%s'",
+				infraRefGV.Group,
+				infraRefKind,
+			))
+			// do not attempt requeue, this is a terminal error until user action
+			return ctrl.Result{}, nil
+		}
+	} else if infraRefGV.Group == infrav1.GroupVersion.Group && infraRefKind == "AzureCluster" {
+		clusterDescriberRef = cluster.Spec.InfrastructureRef
+	} else {
+		log.Info(fmt.Sprintf(
+			"unable to generate azure cloud provider configuration for infraRef of Group: '%s', Kind: '%s', and controlPlaneRef of Group: '%s', Kind: '%s'",
+			infraRefGV.Group,
+			infraRefKind,
+			controlPlaneRefGV.Group,
+			controlPlaneRefKind,
+		))
+		// do not attempt requeue, this is a terminal error until user action
 		return ctrl.Result{}, nil
 	}
 
-	// fetch the corresponding azure cluster
-	azureCluster := &infrav1.AzureCluster{}
-	azureClusterName := types.NamespacedName{
-		Namespace: req.Namespace,
-		Name:      cluster.Spec.InfrastructureRef.Name,
+	var clusterDescriber azure.ClusterDescriber
+	if isManaged {
+		clusterDescriber = new(expv1.AzureManagedControlPlane)
+	} else {
+		clusterDescriber = new(infrav1.AzureCluster)
 	}
 
-	if err := r.Get(ctx, azureClusterName, azureCluster); err != nil {
-		log.Error(err, "failed to fetch AzureCluster")
-		return reconcile.Result{}, err
+	clusterDescriberName := client.ObjectKey{
+		Namespace: clusterDescriberRef.Namespace,
+		Name:      clusterDescriberRef.Name,
 	}
+	if err := r.Client.Get(ctx, clusterDescriberName, clusterDescriber); err != nil {
+		msg := fmt.Sprintf("%s unavailable", clusterDescriberRef.Kind)
+		r.Recorder.Eventf(azureMachineTemplate, corev1.EventTypeNormal, msg, msg)
+		log.Info(msg)
+		return reconcile.Result{}, nil
+	}
+	// TODO(ace): end refactor
+
+	log = log.WithValues(clusterDescriberRef.Kind, clusterDescriber.GetName())
 
 	// Create the scope.
 	clusterScope, err := scope.NewClusterScope(scope.ClusterScopeParams{
 		Client:           r.Client,
 		Logger:           log,
 		Cluster:          cluster,
-		ClusterDescriber: azureCluster,
+		ClusterDescriber: clusterDescriber,
 	})
 	if err != nil {
 		return reconcile.Result{}, errors.Errorf("failed to create scope: %+v", err)

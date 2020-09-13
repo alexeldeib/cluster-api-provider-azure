@@ -215,6 +215,11 @@ func (s *ClusterScope) VNetSpecs() []azure.VNetSpec {
 	}
 }
 
+// ResourceGroupSpecs returns the virtual network specs.
+func (s *ClusterScope) ResourceGroupSpecs() []string {
+	return s.ResourceGroups()
+}
+
 // Namespace returns the cluster namespace.
 func (s *ClusterScope) Namespace() string {
 	return s.Cluster.Namespace
