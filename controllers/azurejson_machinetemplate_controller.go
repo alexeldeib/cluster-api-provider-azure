@@ -111,10 +111,10 @@ func (r *AzureJSONTemplateReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result
 
 	// Create the scope.
 	clusterScope, err := scope.NewClusterScope(scope.ClusterScopeParams{
-		Client:       r.Client,
-		Logger:       log,
-		Cluster:      cluster,
-		AzureCluster: azureCluster,
+		Client:           r.Client,
+		Logger:           log,
+		Cluster:          cluster,
+		ClusterDescriber: azureCluster,
 	})
 	if err != nil {
 		return reconcile.Result{}, errors.Errorf("failed to create scope: %+v", err)

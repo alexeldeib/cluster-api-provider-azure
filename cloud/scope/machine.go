@@ -42,7 +42,7 @@ import (
 type MachineScopeParams struct {
 	Client           client.Client
 	Logger           logr.Logger
-	ClusterDescriber azure.ClusterDescriber
+	ClusterDescriber azure.AuthorizedClusterDescriber
 	Machine          *clusterv1.Machine
 	AzureMachine     *infrav1.AzureMachine
 }
@@ -68,12 +68,12 @@ func NewMachineScope(params MachineScopeParams) (*MachineScope, error) {
 		return nil, errors.Wrap(err, "failed to init patch helper")
 	}
 	return &MachineScope{
-		client:           params.Client,
-		Machine:          params.Machine,
-		AzureMachine:     params.AzureMachine,
-		Logger:           params.Logger,
-		patchHelper:      helper,
-		ClusterDescriber: params.ClusterDescriber,
+		client:                     params.Client,
+		Machine:                    params.Machine,
+		AzureMachine:               params.AzureMachine,
+		Logger:                     params.Logger,
+		patchHelper:                helper,
+		AuthorizedClusterDescriber: params.ClusterDescriber,
 	}, nil
 }
 
@@ -83,7 +83,7 @@ type MachineScope struct {
 	client      client.Client
 	patchHelper *patch.Helper
 
-	azure.ClusterDescriber
+	azure.AuthorizedClusterDescriber
 	Machine      *clusterv1.Machine
 	AzureMachine *infrav1.AzureMachine
 }
@@ -162,7 +162,7 @@ func (m *MachineScope) NICSpecs() []azure.NICSpec {
 		spec.InternalLBName = internalLBName
 		spec.InternalLBAddressPoolName = azure.GenerateBackendAddressPoolName(internalLBName)
 	} else if m.Role() == infrav1.Node {
-		publicLBName := m.ClusterName()
+		publicLBName := m.LoadBalancerName()
 		spec.PublicLBName = publicLBName
 		spec.PublicLBAddressPoolName = azure.GenerateOutboundBackendddressPoolName(publicLBName)
 	}
@@ -393,7 +393,7 @@ func (m *MachineScope) Close(ctx context.Context) error {
 func (m *MachineScope) AdditionalTags() infrav1.Tags {
 	tags := make(infrav1.Tags)
 	// Start with the cluster-wide tags...
-	tags.Merge(m.ClusterDescriber.AdditionalTags())
+	tags.Merge(m.AuthorizedClusterDescriber.AdditionalTags())
 	// ... and merge in the Machine's
 	tags.Merge(m.AzureMachine.Spec.AdditionalTags)
 	// Set the cloud provider tag

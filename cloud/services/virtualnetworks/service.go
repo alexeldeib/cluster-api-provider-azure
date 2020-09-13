@@ -25,6 +25,7 @@ import (
 type VNetScope interface {
 	logr.Logger
 	azure.ClusterDescriber
+	azure.Authorizer
 	VNetSpecs() []azure.VNetSpec
 }
 

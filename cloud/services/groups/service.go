@@ -31,7 +31,7 @@ type Service struct {
 // GroupScope defines the scope interface for a group service.
 type GroupScope interface {
 	logr.Logger
-	azure.Authorizer
+	azure.SubscriptionAuthorizer
 	ResourceGroup() string
 	ClusterName() string
 	Location() string

@@ -47,7 +47,7 @@ type Cache struct {
 type NewCacheFunc func(azure.Authorizer, string) *Cache
 
 // NewCache instantiates a cache and initializes its contents.
-func NewCache(auth azure.Authorizer, location string) *Cache {
+func NewCache(auth azure.SubscriptionAuthorizer, location string) *Cache {
 	return &Cache{
 		client:   NewClient(auth),
 		location: location,

@@ -25,6 +25,7 @@ import (
 type DiskScope interface {
 	logr.Logger
 	azure.ClusterDescriber
+	azure.Authorizer
 	DiskSpecs() []azure.DiskSpec
 }
 

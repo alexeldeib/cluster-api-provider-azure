@@ -167,10 +167,10 @@ func (r *AzureMachineReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, ret
 
 	// Create the cluster scope
 	clusterScope, err := scope.NewClusterScope(scope.ClusterScopeParams{
-		Client:       r.Client,
-		Logger:       logger,
-		Cluster:      cluster,
-		AzureCluster: azureCluster,
+		Client:           r.Client,
+		Logger:           logger,
+		Cluster:          cluster,
+		ClusterDescriber: azureCluster,
 	})
 	if err != nil {
 		r.Recorder.Eventf(azureCluster, corev1.EventTypeWarning, "Error creating the cluster scope", err.Error())
@@ -246,7 +246,7 @@ func (r *AzureMachineReconciler) reconcileNormal(ctx context.Context, machineSco
 	if machineScope.AzureMachine.Spec.AvailabilityZone.ID != nil {
 		message := "AvailabilityZone is deprecated, use FailureDomain instead"
 		machineScope.Info(message)
-		r.Recorder.Eventf(clusterScope.AzureCluster, corev1.EventTypeWarning, "DeprecatedField", message)
+		r.Recorder.Eventf(clusterScope.ClusterDescriber, corev1.EventTypeWarning, "DeprecatedField", message)
 
 		// Set FailureDomain if it is not set.
 		if machineScope.AzureMachine.Spec.FailureDomain == nil {

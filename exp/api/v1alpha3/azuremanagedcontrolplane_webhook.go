@@ -114,7 +114,7 @@ func (r *AzureManagedControlPlane) Validate() error {
 func (r *AzureManagedControlPlane) validateDNSServiceIP() *field.Error {
 	if r.Spec.DNSServiceIP != nil {
 		if net.ParseIP(*r.Spec.DNSServiceIP) == nil {
-			return field.Invalid(field.NewPath("spec", "DNSServiceIO"), *r.Spec.DNSServiceIP, "DNSServiceIP must be a valid IP")
+			return field.Invalid(field.NewPath("spec", "dnsServiceIP"), *r.Spec.DNSServiceIP, "dnsServiceIP must be a valid IP")
 		}
 	}
 	return nil

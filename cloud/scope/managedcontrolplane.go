@@ -28,6 +28,7 @@ import (
 	expv1 "sigs.k8s.io/cluster-api/exp/api/v1alpha3"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1alpha3"
+	azure "sigs.k8s.io/cluster-api-provider-azure/cloud"
 	infrav1exp "sigs.k8s.io/cluster-api-provider-azure/exp/api/v1alpha3"
 
 	"sigs.k8s.io/cluster-api/util/patch"
@@ -44,6 +45,7 @@ type ManagedControlPlaneScopeParams struct {
 	InfraMachinePool *infrav1exp.AzureManagedMachinePool
 	MachinePool      *expv1.MachinePool
 	PatchTarget      runtime.Object
+	Scheme           *runtime.Scheme
 }
 
 // NewManagedControlPlaneScope creates a new Scope from the supplied parameters.
@@ -75,11 +77,13 @@ func NewManagedControlPlaneScope(params ManagedControlPlaneScopeParams) (*Manage
 		Client:           params.Client,
 		AzureClients:     params.AzureClients,
 		Cluster:          params.Cluster,
+		ClusterDescriber: params.ControlPlane,
 		ControlPlane:     params.ControlPlane,
 		MachinePool:      params.MachinePool,
 		InfraMachinePool: params.InfraMachinePool,
 		PatchTarget:      params.PatchTarget,
 		patchHelper:      helper,
+		Scheme:           params.Scheme,
 	}, nil
 }
 
@@ -90,43 +94,18 @@ type ManagedControlPlaneScope struct {
 	patchHelper *patch.Helper
 
 	AzureClients
+	azure.ClusterDescriber
 	Cluster          *clusterv1.Cluster
 	MachinePool      *expv1.MachinePool
 	ControlPlane     *infrav1exp.AzureManagedControlPlane
 	InfraMachinePool *infrav1exp.AzureManagedMachinePool
 	PatchTarget      runtime.Object
-}
-
-func (s *ManagedControlPlaneScope) ResourceGroup() string {
-	if s.ControlPlane == nil {
-		return ""
-	}
-	return s.ControlPlane.Spec.ResourceGroup
-}
-
-func (s *ManagedControlPlaneScope) ClusterName() string {
-	return s.Cluster.Name
-}
-
-func (s *ManagedControlPlaneScope) Location() string {
-	if s.ControlPlane == nil {
-		return ""
-	}
-	return s.ControlPlane.Spec.Location
-}
-
-// AdditionalTags returns AdditionalTags from the ControlPlane spec.
-func (s *ManagedControlPlaneScope) AdditionalTags() infrav1.Tags {
-	tags := make(infrav1.Tags)
-	if s.ControlPlane.Spec.AdditionalTags != nil {
-		tags = s.ControlPlane.Spec.AdditionalTags.DeepCopy()
-	}
-	return tags
+	Scheme           *runtime.Scheme
 }
 
 // SubscriptionID returns the Azure client Subscription ID.
 func (s *ManagedControlPlaneScope) SubscriptionID() string {
-	return s.AzureClients.SubscriptionID()
+	return s.ControlPlane.SubscriptionID()
 }
 
 // BaseURI returns the Azure ResourceManagerEndpoint.
@@ -142,29 +121,6 @@ func (s *ManagedControlPlaneScope) Authorizer() autorest.Authorizer {
 // PatchObject persists the cluster configuration and status.
 func (s *ManagedControlPlaneScope) PatchObject(ctx context.Context) error {
 	return s.patchHelper.Patch(ctx, s.PatchTarget)
-}
-
-// ControlPlaneSubnet is empty for managed clusters.
-func (s *ManagedControlPlaneScope) ControlPlaneSubnet() *infrav1.SubnetSpec {
-	return nil
-}
-
-// NodeSubnet is the name of the subnet nodes should join, defaults to aks-subnet.
-func (s *ManagedControlPlaneScope) NodeSubnet() *infrav1.SubnetSpec {
-	return &infrav1.SubnetSpec{
-		Role: infrav1.SubnetNode,
-		Name: "aks-subnet",
-	}
-}
-
-// IsVnetManaged returns true if the vnet is managed.
-func (s *ManagedControlPlaneScope) IsVnetManaged() bool {
-	return true
-}
-
-// RouteTable returns the cluster node routetable.
-func (s *ManagedControlPlaneScope) RouteTable() *infrav1.RouteTable {
-	return nil
 }
 
 // Vnet returns the cluster Vnet.

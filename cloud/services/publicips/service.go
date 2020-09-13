@@ -26,6 +26,7 @@ import (
 type PublicIPScope interface {
 	logr.Logger
 	azure.ClusterDescriber
+	azure.Authorizer
 	PublicIPSpecs() []azure.PublicIPSpec
 }
 

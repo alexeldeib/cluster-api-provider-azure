@@ -110,7 +110,7 @@ spec:
                   key base64 encoded.
                 type: string
               subscriptionID:
-                description: SubscriotionID is the GUID of the Azure subscription
+                description: SubscriptionID is the GUID of the Azure subscription
                   to hold this cluster.
                 type: string
               version:

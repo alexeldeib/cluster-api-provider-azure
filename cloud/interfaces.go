@@ -21,6 +21,9 @@ import (
 
 	"github.com/Azure/go-autorest/autorest"
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1alpha3"
+	expv1 "sigs.k8s.io/cluster-api-provider-azure/exp/api/v1alpha3"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 // Service is a generic interface used by components offering a type of service.
@@ -47,7 +50,6 @@ type CredentialGetter interface {
 
 // Authorizer is an interface which can get the subscription ID, base URI, and authorizer for an Azure service.
 type Authorizer interface {
-	SubscriptionID() string
 	ClientID() string
 	ClientSecret() string
 	CloudEnvironment() string
@@ -56,16 +58,45 @@ type Authorizer interface {
 	Authorizer() autorest.Authorizer
 }
 
+// SubscriptionAuthorizer provides an Authorizer as well as a specific subscription for use.
+type SubscriptionAuthorizer interface {
+	Authorizer
+	SubscriptionID() string
+}
+
+// AuthorizedClusterDescriber combines ClusterDescriber and Authorizer
+// to provider configuration for the Azure cloud provider for
+// Kubernetes. We keep the component interfaces separate for use by
+// other clients.
+type AuthorizedClusterDescriber interface {
+	Authorizer
+	ClusterDescriber
+}
+
 // ClusterDescriber is an interface which can get common Azure Cluster information
 type ClusterDescriber interface {
-	Authorizer
+	controllerutil.Object
+	NetworkDescriber
+	SubscriptionID() string
 	ResourceGroup() string
 	ClusterName() string
 	Location() string
+	SetFailureDomain(id string, spec clusterv1.FailureDomainSpec)
 	AdditionalTags() infrav1.Tags
+}
+
+// NetworkDescriber describes the network configuration for a cluster.
+// abstracted because it is implemented by managed and unmanaged cluster.
+type NetworkDescriber interface {
+	LoadBalancerName() string
+	Network() *infrav1.Network
 	Vnet() *infrav1.VnetSpec
 	IsVnetManaged() bool
+	Subnets() infrav1.Subnets
 	NodeSubnet() *infrav1.SubnetSpec
 	ControlPlaneSubnet() *infrav1.SubnetSpec
 	RouteTable() *infrav1.RouteTable
 }
+
+var _ ClusterDescriber = new(infrav1.AzureCluster)
+var _ ClusterDescriber = new(expv1.AzureManagedControlPlane)

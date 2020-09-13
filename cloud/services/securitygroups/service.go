@@ -24,6 +24,7 @@ import (
 // NSGScope defines the scope interface for a security groups service.
 type NSGScope interface {
 	azure.ClusterDescriber
+    azure.Authorizer
 	logr.Logger
 	NSGSpecs() []azure.NSGSpec
 }

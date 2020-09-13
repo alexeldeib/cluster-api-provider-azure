@@ -29,11 +29,13 @@ import (
 
 // Reconcile gets/creates/updates a resource group.
 func (s *Service) Reconcile(ctx context.Context) error {
+	s.Scope.Info("getting resource group", "resource group", s.Scope.ResourceGroup())
 	if _, err := s.Client.Get(ctx, s.Scope.ResourceGroup()); err == nil {
+		s.Scope.Info("returning early because err was nil")
 		// resource group already exists, skip creation
 		return nil
 	}
-	s.Scope.V(2).Info("creating resource group", "resource group", s.Scope.ResourceGroup())
+	s.Scope.Info("creating resource group", "resource group", s.Scope.ResourceGroup())
 	group := resources.Group{
 		Location: to.StringPtr(s.Scope.Location()),
 		Tags: converters.TagsToMap(infrav1.Build(infrav1.BuildParams{
@@ -50,7 +52,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		return errors.Wrapf(err, "failed to create resource group %s", s.Scope.ResourceGroup())
 	}
 
-	s.Scope.V(2).Info("successfully created resource group", "resource group", s.Scope.ResourceGroup())
+	s.Scope.Info("successfully created resource group", "resource group", s.Scope.ResourceGroup())
 	return nil
 }
 

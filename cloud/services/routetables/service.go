@@ -25,6 +25,7 @@ import (
 // RouteTableScope defines the scope interface for route table service
 type RouteTableScope interface {
 	azure.ClusterDescriber
+    azure.Authorizer
 	logr.Logger
 	RouteTableSpecs() []azure.RouteTableSpec
 }
