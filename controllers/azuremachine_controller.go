@@ -202,13 +202,12 @@ func (r *AzureMachineReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, ret
 	var clusterDescriber azure.ClusterDescriber
 	if isManaged {
 		clusterDescriber = new(expv1.AzureManagedControlPlane)
-
 	} else {
 		clusterDescriber = new(infrav1.AzureCluster)
 	}
 
 	clusterDescriberName := client.ObjectKey{
-		Namespace: azureMachine.Namespace,
+		Namespace: clusterDescriberRef.Namespace,
 		Name:      clusterDescriberRef.Name,
 	}
 	if err := r.Client.Get(ctx, clusterDescriberName, clusterDescriber); err != nil {

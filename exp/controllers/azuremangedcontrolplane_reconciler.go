@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/cluster-api/util/secret"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/yaml"
 
 	azure "sigs.k8s.io/cluster-api-provider-azure/cloud"
 	"sigs.k8s.io/cluster-api-provider-azure/cloud/scope"
@@ -379,7 +380,7 @@ func makeClusterInfo(controlPlane *infrav1exp.AzureManagedControlPlane, caData [
 		),
 	}
 
-	data, err := clientcmd.Write(*discoveryFile)
+	data, err := yaml.Marshal(discoveryFile)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to serialize cluster-info to yaml")
 	}
