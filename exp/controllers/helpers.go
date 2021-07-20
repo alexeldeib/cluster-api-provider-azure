@@ -606,3 +606,38 @@ func MachinePoolMachineHasStateOrVersionChange(logger logr.Logger) predicate.Fun
 		GenericFunc: func(e event.GenericEvent) bool { return false },
 	}
 }
+
+// ClusterToControlPlaneMapFunc returns a handler.ToRequestsFunc that watches for
+// Cluster events and returns reconciliation requests for a control plane provider object.
+func ClusterToControlPlaneMapFunc(gvk schema.GroupVersionKind, log logr.Logger) handler.MapFunc {
+	return func(o client.Object) []reconcile.Request {
+		c, ok := o.(*clusterv1.Cluster)
+		if !ok {
+			log.Error(errors.Errorf("expected a v but got a %T", o), "failed to get Cluster")
+			return nil
+		}
+
+		// Return early if the InfrastructureRef is nil.
+		if c.Spec.ControlPlaneRef == nil {
+			log.Info("control plane ref was nil")
+			return nil
+		}
+
+		gk := gvk.GroupKind()
+		// Return early if the GroupKind doesn't match what we expect.
+		controlPlaneGK := c.Spec.ControlPlaneRef.GroupVersionKind().GroupKind()
+		if gk != controlPlaneGK {
+			log.Info("gk %s/%s not equal to gk %s/%s", controlPlaneGK.Group, controlPlaneGK.Kind, gk.Group, gk.Kind)
+			return nil
+		}
+
+		return []reconcile.Request{
+			{
+				NamespacedName: client.ObjectKey{
+					Namespace: c.Namespace,
+					Name:      c.Spec.ControlPlaneRef.Name,
+				},
+			},
+		}
+	}
+}

@@ -403,6 +403,63 @@ func TestAzureManagedControlPlaneToAzureManagedClusterMapper(t *testing.T) {
 	}))
 }
 
+func TestClusterToControlPlaneMapFunc(t *testing.T) {
+	g := NewWithT(t)
+	cluster := newCluster("my-cluster")
+	azManagedCluster := &infrav1exp.AzureManagedCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "az-" + cluster.Name,
+			Namespace: "default",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					Name:       cluster.Name,
+					Kind:       "Cluster",
+					APIVersion: clusterv1.GroupVersion.String(),
+				},
+			},
+		},
+	}
+
+	cluster.Spec.ControlPlaneRef = &corev1.ObjectReference{
+		APIVersion: infrav1exp.GroupVersion.String(),
+		Kind:       "AzureManagedControlPlane",
+		Name:       cpName,
+		Namespace:  cluster.Namespace,
+	}
+	cluster.Spec.InfrastructureRef = &corev1.ObjectReference{
+		APIVersion: infrav1exp.GroupVersion.String(),
+		Kind:       "AzureManagedCluster",
+		Name:       azManagedCluster.Name,
+		Namespace:  azManagedCluster.Namespace,
+	}
+
+	log := mock_log.NewMockLogger(gomock.NewController(t))
+	log.EXPECT().Info("gk %s/%s not equal to gk %s/%s", "infrastructure.cluster.x-k8s.io", "UnsupportedFoo", "infrastructure.cluster.x-k8s.io", "AzureManagedControlPlane")
+
+	mapper := ClusterToControlPlaneMapFunc(infrav1exp.GroupVersion.WithKind("AzureManagedControlPlane"), log)
+	// good requests
+	requests := mapper(cluster)
+	g.Expect(requests).To(HaveLen(1))
+	g.Expect(requests).To(Equal([]reconcile.Request{
+		{
+			NamespacedName: types.NamespacedName{
+				Name:      cpName,
+				Namespace: cluster.Namespace,
+			},
+		},
+	}))
+
+	// failed requests
+	cluster.Spec.ControlPlaneRef = &corev1.ObjectReference{
+		APIVersion: infrav1exp.GroupVersion.String(),
+		Kind:       "UnsupportedFoo",
+		Name:       cpName,
+		Namespace:  cluster.Namespace,
+	}
+	requests = mapper(cluster)
+	g.Expect(requests).To(HaveLen(0))
+}
+
 func Test_MachinePoolToInfrastructureMapFunc(t *testing.T) {
 	cases := []struct {
 		Name             string
