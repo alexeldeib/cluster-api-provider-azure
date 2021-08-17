@@ -25,6 +25,10 @@ metadata:
   name: ${CLUSTER_NAME}
   namespace: default
 spec:
+  identityRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1alpha4
+    kind: AzureClusterIdentity
+    name: ${CLUSTER_IDENTITY_NAME}
   location: ${AZURE_LOCATION}
   networkSpec:
     vnet:
@@ -123,6 +127,7 @@ spec:
     - mac=$(ip -o link | grep eth0 | grep ether | awk '{ print $17 }')
     - sed -i -e "s/MACADDRESS/$${mac}/g" /etc/netplan/60-eth0.yaml
     - netplan apply
+    preKubeadmCommands: []
   machineTemplate:
     infrastructureRef:
       apiVersion: infrastructure.cluster.x-k8s.io/v1alpha4
@@ -156,7 +161,7 @@ metadata:
   namespace: default
 spec:
   clusterName: ${CLUSTER_NAME}
-  replicas: ${WORKER_MACHINE_COUNT}
+  replicas: ${LINUX_WORKER_MACHINE_COUNT:-1}
   selector:
     matchLabels: null
   template:
@@ -228,6 +233,7 @@ spec:
       - mac=$(ip -o link | grep eth0 | grep ether | awk '{ print $17 }')
       - sed -i -e "s/MACADDRESS/$${mac}/g" /etc/netplan/60-eth0.yaml
       - netplan apply
+      preKubeadmCommands: []
       useExperimentalRetryJoin: true
 ---
 apiVersion: cluster.x-k8s.io/v1alpha4
@@ -311,3 +317,19 @@ spec:
         name: capi
         sshAuthorizedKeys:
         - ${AZURE_SSH_PUBLIC_KEY:=""}
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha4
+kind: AzureClusterIdentity
+metadata:
+  labels:
+    clusterctl.cluster.x-k8s.io/move-hierarchy: "true"
+  name: ${CLUSTER_IDENTITY_NAME}
+  namespace: default
+spec:
+  allowedNamespaces: {}
+  clientID: ${AZURE_CLIENT_ID}
+  clientSecret:
+    name: ${AZURE_CLUSTER_IDENTITY_SECRET_NAME}
+    namespace: ${AZURE_CLUSTER_IDENTITY_SECRET_NAMESPACE}
+  tenantID: ${AZURE_TENANT_ID}
+  type: ServicePrincipal

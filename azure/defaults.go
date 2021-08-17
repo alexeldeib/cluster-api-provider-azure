@@ -97,6 +97,11 @@ func GenerateFrontendIPConfigName(lbName string) string {
 	return fmt.Sprintf("%s-%s", lbName, "frontEnd")
 }
 
+// GenerateNatGatewayIPName generates a nat gateway IP name.
+func GenerateNatGatewayIPName(clusterName, subnetName string) string {
+	return fmt.Sprintf("pip-%s-%s-natgw", clusterName, subnetName)
+}
+
 // GenerateNodeOutboundIPName generates a public IP name, based on the cluster name.
 func GenerateNodeOutboundIPName(clusterName string) string {
 	return fmt.Sprintf("pip-%s-node-outbound", clusterName)
@@ -195,6 +200,11 @@ func SecurityGroupID(subscriptionID, resourceGroup, nsgName string) string {
 	return fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/networkSecurityGroups/%s", subscriptionID, resourceGroup, nsgName)
 }
 
+// NatGatewayID returns the azure resource ID for a given nat gateway.
+func NatGatewayID(subscriptionID, resourceGroup, natgatewayName string) string {
+	return fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/natGateways/%s", subscriptionID, resourceGroup, natgatewayName)
+}
+
 // NetworkInterfaceID returns the azure resource ID for a given network interface.
 func NetworkInterfaceID(subscriptionID, resourceGroup, nicName string) string {
 	return fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/networkInterfaces/%s", subscriptionID, resourceGroup, nicName)
@@ -236,7 +246,21 @@ func getDefaultImageSKUID(k8sVersion, os, osVersion string) (string, error) {
 
 // GetDefaultUbuntuImage returns the default image spec for Ubuntu.
 func GetDefaultUbuntuImage(k8sVersion string) (*infrav1.Image, error) {
-	skuID, err := getDefaultImageSKUID(k8sVersion, "ubuntu", "1804")
+	v, err := semver.ParseTolerant(k8sVersion)
+	if err != nil {
+		return nil, errors.Wrapf(err, "unable to parse Kubernetes version \"%s\"", k8sVersion)
+	}
+	// Default to Ubuntu 20.04 LTS, except for k8s versions which have only 18.04 reference images.
+	osVersion := "2004"
+	if (v.Major == 1 && v.Minor == 21 && v.Patch < 2) ||
+		(v.Major == 1 && v.Minor == 20 && v.Patch < 8) ||
+		(v.Major == 1 && v.Minor == 19 && v.Patch < 12) ||
+		(v.Major == 1 && v.Minor == 18 && v.Patch < 20) ||
+		(v.Major == 1 && v.Minor < 18) {
+		osVersion = "1804"
+	}
+
+	skuID, err := getDefaultImageSKUID(k8sVersion, "ubuntu", osVersion)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get default image")
 	}

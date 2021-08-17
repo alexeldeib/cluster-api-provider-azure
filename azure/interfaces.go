@@ -31,14 +31,6 @@ type Reconciler interface {
 	Delete(ctx context.Context) error
 }
 
-// OldService is a generic interface for services that have not yet been refactored.
-// Once all services have been converted to use Service, this should be removed.
-// Example: virtualnetworks service would offer Reconcile/Delete methods.
-type OldService interface {
-	Reconcile(ctx context.Context, spec interface{}) error
-	Delete(ctx context.Context, spec interface{}) error
-}
-
 // CredentialGetter is a Service which knows how to retrieve credentials for an Azure
 // resource in a resource group.
 type CredentialGetter interface {
@@ -62,11 +54,12 @@ type Authorizer interface {
 type NetworkDescriber interface {
 	Vnet() *infrav1.VnetSpec
 	IsVnetManaged() bool
-	NodeSubnet() infrav1.SubnetSpec
 	ControlPlaneSubnet() infrav1.SubnetSpec
+	Subnets() infrav1.Subnets
+	Subnet(string) infrav1.SubnetSpec
+	NodeSubnets() []infrav1.SubnetSpec
 	SetSubnet(infrav1.SubnetSpec)
 	IsIPv6Enabled() bool
-	NodeRouteTable() infrav1.RouteTable
 	ControlPlaneRouteTable() infrav1.RouteTable
 	APIServerLBName() string
 	APIServerLBPoolName(string) string

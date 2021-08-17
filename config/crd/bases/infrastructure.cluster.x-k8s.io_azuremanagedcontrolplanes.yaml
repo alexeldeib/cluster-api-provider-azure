@@ -42,6 +42,23 @@ spec:
             description: AzureManagedControlPlaneSpec defines the desired state of
               AzureManagedControlPlane.
             properties:
+              aadProfile:
+                description: AadProfile is Azure Active Directory configuration to
+                  integrate with AKS for aad authentication.
+                properties:
+                  adminGroupObjectIDs:
+                    description: AdminGroupObjectIDs - AAD group object IDs that will
+                      have admin role of the cluster.
+                    items:
+                      type: string
+                    type: array
+                  managed:
+                    description: Managed - Whether to enable managed AAD.
+                    type: boolean
+                required:
+                - adminGroupObjectIDs
+                - managed
+                type: object
               additionalTags:
                 additionalProperties:
                   type: string
@@ -63,15 +80,6 @@ spec:
                 required:
                 - host
                 - port
-                type: object
-              defaultPoolRef:
-                description: DefaultPoolRef is the specification for the default pool,
-                  without which an AKS cluster cannot be created.
-                properties:
-                  name:
-                    description: 'Name of the referent. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                      TODO: Add other useful fields. apiVersion, kind, uid?'
-                    type: string
                 type: object
               dnsServiceIP:
                 description: DNSServiceIP is an IP address assigned to the Kubernetes
@@ -147,7 +155,6 @@ spec:
                 - name
                 type: object
             required:
-            - defaultPoolRef
             - location
             - nodeResourceGroupName
             - resourceGroupName
@@ -195,6 +202,23 @@ spec:
             description: AzureManagedControlPlaneSpec defines the desired state of
               AzureManagedControlPlane.
             properties:
+              aadProfile:
+                description: AadProfile is Azure Active Directory configuration to
+                  integrate with AKS for aad authentication.
+                properties:
+                  adminGroupObjectIDs:
+                    description: AdminGroupObjectIDs - AAD group object IDs that will
+                      have admin role of the cluster.
+                    items:
+                      type: string
+                    type: array
+                  managed:
+                    description: Managed - Whether to enable managed AAD.
+                    type: boolean
+                required:
+                - adminGroupObjectIDs
+                - managed
+                type: object
               additionalTags:
                 additionalProperties:
                   type: string
@@ -216,15 +240,6 @@ spec:
                 required:
                 - host
                 - port
-                type: object
-              defaultPoolRef:
-                description: DefaultPoolRef is the specification for the default pool,
-                  without which an AKS cluster cannot be created.
-                properties:
-                  name:
-                    description: 'Name of the referent. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                      TODO: Add other useful fields. apiVersion, kind, uid?'
-                    type: string
                 type: object
               dnsServiceIP:
                 description: DNSServiceIP is an IP address assigned to the Kubernetes
@@ -337,7 +352,6 @@ spec:
                 - name
                 type: object
             required:
-            - defaultPoolRef
             - location
             - resourceGroupName
             - sshPublicKey

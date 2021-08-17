@@ -20,6 +20,7 @@ import (
 	"reflect"
 
 	"github.com/google/go-cmp/cmp"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1alpha4"
 )
 
@@ -77,6 +78,13 @@ type RouteTableSpec struct {
 	Subnet infrav1.SubnetSpec
 }
 
+// NatGatewaySpec defines the specification for a Nat Gateway.
+type NatGatewaySpec struct {
+	NatGatewayIP infrav1.PublicIPSpec
+	Name         string
+	Subnet       infrav1.SubnetSpec
+}
+
 // InboundNatSpec defines the specification for an inbound NAT rule.
 type InboundNatSpec struct {
 	Name             string
@@ -91,6 +99,7 @@ type SubnetSpec struct {
 	RouteTableName    string
 	SecurityGroupName string
 	Role              infrav1.SubnetRole
+	NatGatewayName    string
 }
 
 // VNetSpec defines the specification for a Virtual Network.
@@ -148,7 +157,7 @@ type BastionSpec struct {
 }
 
 // AzureBastionSpec defines the specification for azure bastion feature.
-type AzureBastionSpec struct { //nolint
+type AzureBastionSpec struct { // nolint
 	Name         string
 	SubnetSpec   infrav1.SubnetSpec
 	PublicIPName string
@@ -298,4 +307,97 @@ func (vmss VMSS) HasEnoughLatestModelOrNotMixedModel() bool {
 func (vmss VMSS) HasLatestModelApplied(vm VMSSVM) bool {
 	// if the images match, then the VM is of the same model
 	return reflect.DeepEqual(vm.Image, vmss.Image)
+}
+
+// ManagedClusterSpec contains properties to create a managed cluster.
+type ManagedClusterSpec struct {
+	// Name is the name of this AKS Cluster.
+	Name string
+
+	// ResourceGroupName is the name of the Azure resource group for this AKS Cluster.
+	ResourceGroupName string
+
+	// NodeResourceGroupName is the name of the Azure resource group containing IaaS VMs.
+	NodeResourceGroupName string
+
+	// VnetSubnetID is the Azure Resource ID for the subnet which should contain nodes.
+	VnetSubnetID string
+
+	// Location is a string matching one of the canonical Azure region names. Examples: "westus2", "eastus".
+	Location string
+
+	// Tags is a set of tags to add to this cluster.
+	Tags map[string]string
+
+	// Version defines the desired Kubernetes version.
+	Version string
+
+	// LoadBalancerSKU for the managed cluster. Possible values include: 'Standard', 'Basic'. Defaults to Standard.
+	LoadBalancerSKU string
+
+	// NetworkPlugin used for building Kubernetes network. Possible values include: 'azure', 'kubenet'. Defaults to azure.
+	NetworkPlugin string
+
+	// NetworkPolicy used for building Kubernetes network. Possible values include: 'calico', 'azure'. Defaults to azure.
+	NetworkPolicy string
+
+	// SSHPublicKey is a string literal containing an ssh public key. Will autogenerate and discard if not provided.
+	SSHPublicKey string
+
+	// AgentPools is the list of agent pool specifications in this cluster.
+	AgentPools []AgentPoolSpec
+
+	// PodCIDR is the CIDR block for IP addresses distributed to pods
+	PodCIDR string
+
+	// ServiceCIDR is the CIDR block for IP addresses distributed to services
+	ServiceCIDR string
+
+	// DNSServiceIP is an IP address assigned to the Kubernetes DNS service
+	DNSServiceIP *string
+
+	// AADProfile is Azure Active Directory configuration to integrate with AKS, for aad authentication.
+	AADProfile *AADProfile
+}
+
+// AADProfile is Azure Active Directory configuration to integrate with AKS, for aad authentication.
+type AADProfile struct {
+	// Managed - Whether to enable managed AAD.
+	Managed bool
+
+	// EnableAzureRBAC - Whether to enable Azure RBAC for Kubernetes authorization.
+	EnableAzureRBAC bool
+
+	// AdminGroupObjectIDs - AAD group object IDs that will have admin role of the cluster.
+	AdminGroupObjectIDs []string
+}
+
+// AgentPoolSpec contains agent pool specification details.
+type AgentPoolSpec struct {
+	// Name is the name of agent pool.
+	Name string
+
+	// ResourceGroup is the name of the Azure resource group for the AKS Cluster.
+	ResourceGroup string
+
+	// Cluster is the name of the AKS cluster.
+	Cluster string
+
+	// Version defines the desired Kubernetes version.
+	Version *string
+
+	// SKU defines the Azure VM size for the agent pool VMs.
+	SKU string
+
+	// Replicas is the number of desired machines.
+	Replicas int32
+
+	// OSDiskSizeGB is the OS disk size in GB for every machine in this agent pool.
+	OSDiskSizeGB int32
+
+	// VnetSubnetID is the Azure Resource ID for the subnet which should contain nodes.
+	VnetSubnetID string
+
+	// Mode represents mode of an agent pool. Possible values include: 'System', 'User'.
+	Mode string
 }

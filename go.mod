@@ -3,7 +3,7 @@ module sigs.k8s.io/cluster-api-provider-azure
 go 1.16
 
 require (
-	github.com/Azure/aad-pod-identity v1.7.1
+	github.com/Azure/aad-pod-identity v1.8.0
 	github.com/Azure/azure-sdk-for-go v55.2.0+incompatible
 	github.com/Azure/go-autorest/autorest v0.11.18
 	github.com/Azure/go-autorest/autorest/adal v0.9.13
@@ -25,12 +25,15 @@ require (
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.11.0
 	github.com/spf13/pflag v1.0.5
-	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.20.0
-	go.opentelemetry.io/otel v0.20.0
-	go.opentelemetry.io/otel/exporters/metric/prometheus v0.20.0
-	go.opentelemetry.io/otel/exporters/trace/jaeger v0.20.1-0.20210504183141-c99d5e999c69
-	go.opentelemetry.io/otel/sdk v0.20.1-0.20210504183141-c99d5e999c69
-	go.opentelemetry.io/otel/trace v0.20.0
+	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.22.0
+	go.opentelemetry.io/otel v1.0.0-RC2
+	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.0.0-RC2
+	go.opentelemetry.io/otel/exporters/prometheus v0.22.0
+	go.opentelemetry.io/otel/metric v0.22.0
+	go.opentelemetry.io/otel/sdk v1.0.0-RC2
+	go.opentelemetry.io/otel/sdk/export/metric v0.22.0
+	go.opentelemetry.io/otel/sdk/metric v0.22.0
+	go.opentelemetry.io/otel/trace v1.0.0-RC2
 	golang.org/x/crypto v0.0.0-20210322153248-0c34fe9e7dc2
 	golang.org/x/mod v0.4.2
 	k8s.io/api v0.21.2
@@ -44,6 +47,7 @@ require (
 	sigs.k8s.io/cluster-api/test v0.4.0
 	sigs.k8s.io/controller-runtime v0.9.1
 	sigs.k8s.io/kind v0.11.1
+	sigs.k8s.io/yaml v1.2.0
 )
 
 replace sigs.k8s.io/cluster-api => sigs.k8s.io/cluster-api v0.4.0

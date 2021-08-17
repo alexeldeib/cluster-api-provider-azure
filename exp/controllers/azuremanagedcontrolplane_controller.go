@@ -21,13 +21,11 @@ import (
 	"fmt"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	"sigs.k8s.io/cluster-api/util/patch"
-
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/tools/record"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha4"
@@ -150,52 +148,6 @@ func (r *AzureManagedControlPlaneReconciler) Reconcile(ctx context.Context, req 
 		return ctrl.Result{}, nil
 	}
 
-	// Handle deleted clusters
-	// needs to happen before trying to fetch the default pool to avoid circular deletion dependencies
-	if !azureControlPlane.DeletionTimestamp.IsZero() {
-		// Create the scope.
-		mcpScope, err := scope.NewManagedControlPlaneScope(ctx, scope.ManagedControlPlaneScopeParams{
-			Client:       r.Client,
-			Logger:       log,
-			Cluster:      cluster,
-			ControlPlane: azureControlPlane,
-			PatchTarget:  azureControlPlane,
-		})
-		if err != nil {
-			return reconcile.Result{}, errors.Errorf("failed to create scope: %+v", err)
-		}
-		defer func() {
-			if err := mcpScope.PatchObject(ctx); err != nil && reterr == nil {
-				reterr = err
-			}
-		}()
-		return r.reconcileDelete(ctx, mcpScope)
-	}
-
-	// fetch default pool
-	defaultPoolKey := client.ObjectKey{
-		Name:      azureControlPlane.Spec.DefaultPoolRef.Name,
-		Namespace: azureControlPlane.Namespace,
-	}
-	defaultPool := &infrav1exp.AzureManagedMachinePool{}
-	if err := r.Client.Get(ctx, defaultPoolKey, defaultPool); err != nil {
-		return reconcile.Result{}, errors.Wrap(err, "failed to fetch default pool reference")
-	}
-
-	log = log.WithValues("azureManagedMachinePool", defaultPoolKey.Name)
-
-	// Fetch the owning MachinePool.
-	ownerPool, err := infracontroller.GetOwnerMachinePool(ctx, r.Client, defaultPool.ObjectMeta)
-	if err != nil {
-		return reconcile.Result{}, err
-	}
-	if ownerPool == nil {
-		log.Info("failed to fetch owner ref for default pool")
-		return reconcile.Result{}, nil
-	}
-
-	log = log.WithValues("machinePool", ownerPool.Name)
-
 	// check if the control plane's namespace is allowed for this identity and update owner references for the identity.
 	if azureControlPlane.Spec.IdentityRef != nil {
 		identity, err := infracontroller.GetClusterIdentityFromRef(ctx, r.Client, azureControlPlane.Namespace, azureControlPlane.Spec.IdentityRef)
@@ -204,16 +156,6 @@ func (r *AzureManagedControlPlaneReconciler) Reconcile(ctx context.Context, req 
 		}
 		if !scope.IsClusterNamespaceAllowed(ctx, r.Client, identity.Spec.AllowedNamespaces, azureControlPlane.Namespace) {
 			return reconcile.Result{}, errors.New("AzureClusterIdentity list of allowed namespaces doesn't include current azure managed control plane namespace")
-		}
-		if identity.Namespace == azureControlPlane.Namespace {
-			patchHelper, err := patch.NewHelper(identity, r.Client)
-			if err != nil {
-				return reconcile.Result{}, errors.Wrap(err, "failed to init patch helper")
-			}
-			identity.ObjectMeta.OwnerReferences = azureControlPlane.GetOwnerReferences()
-			if err := patchHelper.Patch(ctx, identity); err != nil {
-				return reconcile.Result{}, err
-			}
 		}
 	} else {
 		warningMessage := ("You're using deprecated functionality: ")
@@ -225,13 +167,11 @@ func (r *AzureManagedControlPlaneReconciler) Reconcile(ctx context.Context, req 
 
 	// Create the scope.
 	mcpScope, err := scope.NewManagedControlPlaneScope(ctx, scope.ManagedControlPlaneScopeParams{
-		Client:           r.Client,
-		Logger:           log,
-		Cluster:          cluster,
-		ControlPlane:     azureControlPlane,
-		MachinePool:      ownerPool,
-		InfraMachinePool: defaultPool,
-		PatchTarget:      azureControlPlane,
+		Client:       r.Client,
+		Logger:       log,
+		Cluster:      cluster,
+		ControlPlane: azureControlPlane,
+		PatchTarget:  azureControlPlane,
 	})
 	if err != nil {
 		return reconcile.Result{}, errors.Errorf("failed to create scope: %+v", err)
@@ -239,11 +179,15 @@ func (r *AzureManagedControlPlaneReconciler) Reconcile(ctx context.Context, req 
 
 	// Always patch when exiting so we can persist changes to finalizers and status
 	defer func() {
-		if err := mcpScope.PatchObject(ctx); err != nil && reterr == nil {
+		if err := mcpScope.Close(ctx); err != nil && reterr == nil {
 			reterr = err
 		}
 	}()
 
+	// Handle deleted clusters
+	if !azureControlPlane.DeletionTimestamp.IsZero() {
+		return r.reconcileDelete(ctx, mcpScope)
+	}
 	// Handle non-deleted clusters
 	return r.reconcileNormal(ctx, mcpScope)
 }
@@ -261,7 +205,7 @@ func (r *AzureManagedControlPlaneReconciler) reconcileNormal(ctx context.Context
 		return reconcile.Result{}, err
 	}
 
-	if err := newAzureManagedControlPlaneReconciler(scope).Reconcile(ctx, scope); err != nil {
+	if err := newAzureManagedControlPlaneReconciler(scope).Reconcile(ctx); err != nil {
 		return reconcile.Result{}, errors.Wrapf(err, "error creating AzureManagedControlPlane %s/%s", scope.ControlPlane.Namespace, scope.ControlPlane.Name)
 	}
 
@@ -278,7 +222,7 @@ func (r *AzureManagedControlPlaneReconciler) reconcileDelete(ctx context.Context
 
 	scope.Logger.Info("Reconciling AzureManagedControlPlane delete")
 
-	if err := newAzureManagedControlPlaneReconciler(scope).Delete(ctx, scope); err != nil {
+	if err := newAzureManagedControlPlaneReconciler(scope).Delete(ctx); err != nil {
 		return reconcile.Result{}, errors.Wrapf(err, "error deleting AzureManagedControlPlane %s/%s", scope.ControlPlane.Namespace, scope.ControlPlane.Name)
 	}
 

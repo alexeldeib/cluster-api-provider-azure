@@ -4,7 +4,7 @@ envsubst_cmd = "./hack/tools/bin/envsubst"
 tools_bin = "./hack/tools/bin"
 
 #Add tools to path
-os.putenv('PATH', os.getenv('PATH') + ':' + tools_bin) 
+os.putenv('PATH', os.getenv('PATH') + ':' + tools_bin)
 
 update_settings(k8s_upsert_timeout_secs=60)  # on first tilt up, often can take longer than 30 seconds
 
@@ -22,7 +22,7 @@ settings = {
     "aks_kubernetes_version": "v1.20.5"
 }
 
-keys = ["AZURE_SUBSCRIPTION_ID_B64", "AZURE_TENANT_ID_B64", "AZURE_CLIENT_SECRET_B64", "AZURE_CLIENT_ID_B64"]
+keys = ["AZURE_SUBSCRIPTION_ID", "AZURE_TENANT_ID", "AZURE_CLIENT_SECRET", "AZURE_CLIENT_ID"]
 
 # global settings
 settings.update(read_json(
@@ -96,7 +96,11 @@ def fixup_yaml_empty_arrays(yaml_str):
 
 def validate_auth():
     substitutions = settings.get("kustomize_substitutions", {})
-    missing = [k for k in keys if k not in substitutions and not os.environ.get(k)]
+    os.environ.update(substitutions)
+    for sub in substitutions:
+        if sub[-4:] == "_B64":
+            os.environ[sub[:-4]] = base64_decode(os.environ[sub])
+    missing = [k for k in keys if not os.environ.get(k)]
     if missing:
         fail("missing kustomize_substitutions keys {} in tilt-setting.json".format(missing))
 
@@ -117,13 +121,32 @@ COPY --from=tilt-helper /restart.sh .
 COPY manager .
 """
 
+# Install the OpenTelemetry helm chart
+def observability():
+    instrumentation_key = os.getenv("AZURE_INSTRUMENTATION_KEY", "")
+    if instrumentation_key == "":
+        warn("AZURE_INSTRUMENTATION_KEY is not set, so traces won't be exported to Application Insights")
+        trace_links = []
+    else:
+        trace_links = [link("https://ms.portal.azure.com/#blade/HubsExtension/BrowseResource/resourceType/microsoft.insights%2Fcomponents", "App Insights")]
+    k8s_yaml(helm("./hack/observability/opentelemetry/chart",
+         name="opentelemetry-collector", namespace="capz-system",
+         values=["./hack/observability/opentelemetry/values.yaml"],
+         set=["config.exporters.azuremonitor.instrumentation_key="+instrumentation_key]))
+    k8s_yaml(helm("./hack/observability/jaeger/chart",
+         name="jaeger-all-in-one", namespace="capz-system",
+         set=["crd.install=false", "rbac.create=false",
+              "resources.limits.cpu=200m", "resources.limits.memory=256Mi"]))
+    k8s_resource(workload="jaeger-all-in-one", new_name="traces: jaeger-all-in-one",
+        port_forwards=[port_forward(16686, name="View traces", link_path='/search?service=capz')],
+        links=trace_links)
+    k8s_resource(workload="prometheus-operator", new_name="metrics: prometheus-operator",
+        port_forwards=[port_forward(9090, name="View metrics")], extra_pod_selectors=[{"app": "prometheus"}])
+
 # Build CAPZ and add feature gates
 def capz():
     # Apply the kustomized yaml for this provider
-    substitutions = settings.get("kustomize_substitutions", {})
-    os.environ.update(substitutions)
     yaml = str(kustomizesub("./hack/observability")) # build an observable kind deployment by default
-
 
     # add extra_args if they are defined
     if settings.get("extra_args"):
@@ -138,7 +161,7 @@ def capz():
     local_resource(
         "manager",
         cmd = 'mkdir -p .tiltbuild;CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags \'-extldflags "-static"\' -o .tiltbuild/manager',
-        deps = ["api", "cloud", "config", "controllers", "exp", "feature", "pkg", "go.mod", "go.sum", "main.go"]
+        deps = ["api", "azure", "config", "controllers", "exp", "feature", "pkg", "util", "go.mod", "go.sum", "main.go"]
     )
 
     dockerfile_contents = "\n".join([
@@ -169,6 +192,18 @@ def capz():
 
     k8s_yaml(blob(yaml))
 
+def create_identity_secret():
+    #create secret for identity password
+    local("kubectl delete secret cluster-identity-secret --ignore-not-found=true")
+
+    os.putenv('AZURE_CLUSTER_IDENTITY_SECRET_NAME', 'cluster-identity-secret')
+    os.putenv('AZURE_CLUSTER_IDENTITY_SECRET_NAMESPACE', 'default')
+    os.putenv('CLUSTER_IDENTITY_NAME', 'cluster-identity')
+
+    os.putenv('AZURE_CLIENT_SECRET_B64', base64_encode(os.environ.get("AZURE_CLIENT_SECRET")))
+    local("cat templates/azure-cluster-identity/secret.yaml | " + envsubst_cmd + " | kubectl apply -f -", quiet=True, echo_off=True)
+    os.unsetenv('AZURE_CLIENT_SECRET_B64')
+
 def create_crs():
     # create config maps
     local("kubectl delete configmaps calico-addon --ignore-not-found=true")
@@ -177,7 +212,7 @@ def create_crs():
     local("kubectl create configmap calico-ipv6-addon --from-file=templates/addons/calico-ipv6.yaml")
     local("kubectl delete configmaps flannel-windows-addon --ignore-not-found=true")
 
-    # need to set version for kube-proxy on windows.  
+    # need to set version for kube-proxy on windows.
     os.putenv("KUBERNETES_VERSION", settings.get("kubernetes_version", {}))
     local("kubectl create configmap flannel-windows-addon --from-file=templates/addons/windows/ --dry-run=client -o yaml | " + envsubst_cmd + " | kubectl apply -f -")
 
@@ -191,12 +226,8 @@ def flavors():
     config.define_string_list("worker-flavors")
     cfg = config.parse()
     worker_templates = cfg.get('templates-to-run', [])
-
+   
     substitutions = settings.get("kustomize_substitutions", {})
-    for key in keys:
-        if key[-4:] == "_B64":
-            os.environ[key[:-4]] = base64_decode(os.environ[key])
-
     ssh_pub_key_B64 = "AZURE_SSH_PUBLIC_KEY_B64"
     ssh_pub_key_path = "$HOME/.ssh/id_rsa.pub"
     if substitutions.get(ssh_pub_key_B64):
@@ -204,7 +235,7 @@ def flavors():
     else:
         print("{} was not specified in tilt_config.json, attempting to load {}".format(ssh_pub_key_B64, ssh_pub_key_path))
         os.environ.update({ssh_pub_key_B64: base64_encode_file(ssh_pub_key_path)})
-    
+
     ssh_pub_key = "AZURE_SSH_PUBLIC_KEY"
     if substitutions.get(ssh_pub_key):
         os.environ.update({ssh_pub_key: substitutions.get(ssh_pub_key)})
@@ -284,7 +315,7 @@ def deploy_worker_templates(template, substitutions):
 
 
 def base64_encode(to_encode):
-    encode_blob = local("echo '{}' | tr -d '\n' | base64 - | tr -d '\n'".format(to_encode), quiet=True)
+    encode_blob = local("echo '{}' | tr -d '\n' | base64 - | tr -d '\n'".format(to_encode), quiet=True, echo_off=True)
     return str(encode_blob)
 
 
@@ -297,7 +328,7 @@ def read_file_from_path(path_to_read):
     return str(str_blob)
 
 def base64_decode(to_decode):
-    decode_blob = local("echo '{}' | base64 --decode -".format(to_decode), quiet=True)
+    decode_blob = local("echo '{}' | base64 --decode -".format(to_decode), quiet=True, echo_off=True)
     return str(decode_blob)
 
 def kustomizesub(folder):
@@ -308,7 +339,7 @@ def waitforsystem():
     local("kubectl wait --for=condition=ready --timeout=300s pod --all -n capi-kubeadm-bootstrap-system")
     local("kubectl wait --for=condition=ready --timeout=300s pod --all -n capi-kubeadm-control-plane-system")
     local("kubectl wait --for=condition=ready --timeout=300s pod --all -n capi-system")
-    
+
 ##############################
 # Actual work happens here
 ##############################
@@ -324,7 +355,11 @@ if settings.get("deploy_cert_manager"):
 
 deploy_capi()
 
+create_identity_secret()
+
 capz()
+
+observability()
 
 waitforsystem()
 

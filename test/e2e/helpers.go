@@ -33,6 +33,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/blang/semver"
 	. "github.com/onsi/ginkgo"
 	"github.com/onsi/ginkgo/config"
 	. "github.com/onsi/gomega"
@@ -303,6 +304,20 @@ func logCheckpoint(specTimes map[string]time.Time) {
 	}
 }
 
+// getClusterName gets the cluster name for the test cluster
+// and sets the environment variables that depend on it.
+func getClusterName(prefix, specName string) string {
+	clusterName := os.Getenv("CLUSTER_NAME")
+	if clusterName == "" {
+		clusterName = fmt.Sprintf("%s-%s", prefix, specName)
+	}
+	fmt.Fprintf(GinkgoWriter, "INFO: Cluster name is %s\n", clusterName)
+
+	Expect(os.Setenv(AzureResourceGroup, clusterName)).NotTo(HaveOccurred())
+	Expect(os.Setenv(AzureVNetName, fmt.Sprintf("%s-vnet", clusterName))).NotTo(HaveOccurred())
+	return clusterName
+}
+
 // nodeSSHInfo provides information to establish an SSH connection to a VM or VMSS instance.
 type nodeSSHInfo struct {
 	Endpoint string // Endpoint is the control plane hostname or IP address for initial connection.
@@ -561,4 +576,37 @@ func latestCIVersion(label string) (string, error) {
 	}
 
 	return strings.TrimSpace(string(b)), nil
+}
+
+// resolveKubetestRepoListPath will set the correct repo list for Windows:
+// - if WIN_REPO_URL is set use the custom file downloaded via makefile
+// - if CI version is "latest" will use repo-list.yaml
+// - if CI version is  "latest-1.xx" will compare values and use correct repoList
+// - if standard version will compare values and use correct repoList
+// - if unable to determine version falls back to using latest
+func resolveKubetestRepoListPath(version string, path string) (string, error) {
+	if _, ok := os.LookupEnv("WIN_REPO_URL"); ok {
+		return filepath.Join(path, "custom-repo-list.yaml"), nil
+	}
+
+	if version == "latest" {
+		return filepath.Join(path, "repo-list.yaml"), nil
+	}
+
+	version = strings.TrimPrefix(version, "latest-")
+	currentVersion, err := semver.ParseTolerant(version)
+	if err != nil {
+		return "", err
+	}
+
+	versionCutoff, err := semver.Make("1.21.0")
+	if err != nil {
+		return "", err
+	}
+
+	if currentVersion.LT(versionCutoff) {
+		return filepath.Join(path, "repo-list-k8sprow.yaml"), nil
+	}
+
+	return filepath.Join(path, "repo-list.yaml"), nil
 }

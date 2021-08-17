@@ -45,7 +45,7 @@ func (r *AzureManagedControlPlane) SetupWebhookWithManager(mgr ctrl.Manager) err
 		Complete()
 }
 
-// +kubebuilder:webhook:path=/mutate-infrastructure-cluster-x-k8s-io-v1alpha4-azuremanagedcontrolplane,mutating=true,failurePolicy=fail,groups=infrastructure.cluster.x-k8s.io,resources=azuremanagedcontrolplanes,verbs=create;update,versions=v1alpha4,name=default.azuremanagedcontrolplanes.infrastructure.cluster.x-k8s.io,sideEffects=None,admissionReviewVersions=v1beta1
+// +kubebuilder:webhook:path=/mutate-infrastructure-cluster-x-k8s-io-v1alpha4-azuremanagedcontrolplane,mutating=true,failurePolicy=fail,groups=infrastructure.cluster.x-k8s.io,resources=azuremanagedcontrolplanes,verbs=create;update,versions=v1alpha4,name=default.azuremanagedcontrolplanes.infrastructure.cluster.x-k8s.io,sideEffects=None,admissionReviewVersions=v1;v1beta1
 
 var _ webhook.Defaulter = &AzureManagedControlPlane{}
 
@@ -81,7 +81,7 @@ func (r *AzureManagedControlPlane) Default() {
 	r.setDefaultSubnet()
 }
 
-// +kubebuilder:webhook:verbs=create;update,path=/validate-infrastructure-cluster-x-k8s-io-v1alpha4-azuremanagedcontrolplane,mutating=false,failurePolicy=fail,groups=infrastructure.cluster.x-k8s.io,resources=azuremanagedcontrolplanes,versions=v1alpha4,name=validation.azuremanagedcontrolplanes.infrastructure.cluster.x-k8s.io,sideEffects=None,admissionReviewVersions=v1beta1
+// +kubebuilder:webhook:verbs=create;update,path=/validate-infrastructure-cluster-x-k8s-io-v1alpha4-azuremanagedcontrolplane,mutating=false,failurePolicy=fail,groups=infrastructure.cluster.x-k8s.io,resources=azuremanagedcontrolplanes,versions=v1alpha4,name=validation.azuremanagedcontrolplanes.infrastructure.cluster.x-k8s.io,sideEffects=None,admissionReviewVersions=v1;v1beta1
 
 var _ webhook.Validator = &AzureManagedControlPlane{}
 
@@ -217,13 +217,28 @@ func (r *AzureManagedControlPlane) ValidateUpdate(oldRaw runtime.Object) error {
 		}
 	}
 
-	if old.Spec.DefaultPoolRef.Name != "" {
-		if r.Spec.DefaultPoolRef.Name != old.Spec.DefaultPoolRef.Name {
+	if old.Spec.AADProfile != nil {
+		if r.Spec.AADProfile == nil {
 			allErrs = append(allErrs,
 				field.Invalid(
-					field.NewPath("Spec", "DefaultPoolRef", "Name"),
-					r.Spec.DefaultPoolRef.Name,
-					"field is immutable"))
+					field.NewPath("Spec", "AADProfile"),
+					r.Spec.AADProfile,
+					"field cannot be nil, cannot disable AADProfile"))
+		} else {
+			if !r.Spec.AADProfile.Managed && old.Spec.AADProfile.Managed {
+				allErrs = append(allErrs,
+					field.Invalid(
+						field.NewPath("Spec", "AADProfile.Managed"),
+						r.Spec.AADProfile.Managed,
+						"cannot set AADProfile.Managed to false"))
+			}
+			if len(r.Spec.AADProfile.AdminGroupObjectIDs) == 0 {
+				allErrs = append(allErrs,
+					field.Invalid(
+						field.NewPath("Spec", "AADProfile.AdminGroupObjectIDs"),
+						r.Spec.AADProfile.AdminGroupObjectIDs,
+						"length of AADProfile.AdminGroupObjectIDs cannot be zero"))
+			}
 		}
 	}
 

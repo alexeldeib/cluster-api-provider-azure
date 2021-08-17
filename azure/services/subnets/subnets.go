@@ -64,15 +64,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		case err == nil:
 			// subnet already exists, update the spec and skip creation
 			var subnet infrav1.SubnetSpec
-			if subnetSpec.Role == infrav1.SubnetControlPlane {
-				subnet = s.Scope.ControlPlaneSubnet()
-			} else if subnetSpec.Role == infrav1.SubnetNode {
-				subnet = s.Scope.NodeSubnet()
-			} else {
-				continue
-			}
-
 			subnet.ID = existingSubnet.ID
+			subnet.Name = existingSubnet.Name
+			subnet.Role = existingSubnet.Role
 			subnet.CIDRBlocks = existingSubnet.CIDRBlocks
 
 			s.Scope.SetSubnet(subnet)
@@ -96,6 +90,12 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			if subnetSpec.RouteTableName != "" {
 				subnetProperties.RouteTable = &network.RouteTable{
 					ID: to.StringPtr(azure.RouteTableID(s.Scope.SubscriptionID(), s.Scope.ResourceGroup(), subnetSpec.RouteTableName)),
+				}
+			}
+
+			if subnetSpec.NatGatewayName != "" {
+				subnetProperties.NatGateway = &network.SubResource{
+					ID: to.StringPtr(azure.NatGatewayID(s.Scope.SubscriptionID(), s.Scope.ResourceGroup(), subnetSpec.NatGatewayName)),
 				}
 			}
 

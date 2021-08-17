@@ -18,47 +18,62 @@ package agentpools
 
 import (
 	"context"
+	"fmt"
 
-	"github.com/Azure/azure-sdk-for-go/services/containerservice/mgmt/2020-02-01/containerservice"
+	"github.com/Azure/azure-sdk-for-go/services/containerservice/mgmt/2021-05-01/containerservice"
+	"github.com/go-logr/logr"
 	"github.com/google/go-cmp/cmp"
 	"github.com/pkg/errors"
 	"k8s.io/klog/v2"
 
+	infrav1alpha4 "sigs.k8s.io/cluster-api-provider-azure/api/v1alpha4"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
 )
 
-// Spec contains properties to create a agent pool.
-type Spec struct {
-	Name          string
-	ResourceGroup string
-	Cluster       string
-	Version       *string
-	SKU           string
-	Replicas      int32
-	OSDiskSizeGB  int32
-	VnetSubnetID  string
+// ManagedMachinePoolScope defines the scope interface for a managed machine pool.
+type ManagedMachinePoolScope interface {
+	logr.Logger
+	azure.ClusterDescriber
+
+	NodeResourceGroup() string
+	AgentPoolSpec() azure.AgentPoolSpec
+	SetAgentPoolProviderIDList([]string)
+	SetAgentPoolReplicas(int32)
+	SetAgentPoolReady(bool)
+}
+
+// Service provides operations on Azure resources.
+type Service struct {
+	scope ManagedMachinePoolScope
+	Client
+}
+
+// New creates a new service.
+func New(scope ManagedMachinePoolScope) *Service {
+	return &Service{
+		scope:  scope,
+		Client: NewClient(scope),
+	}
 }
 
 // Reconcile idempotently creates or updates a agent pool, if possible.
-func (s *Service) Reconcile(ctx context.Context, spec interface{}) error {
+func (s *Service) Reconcile(ctx context.Context) error {
 	ctx, span := tele.Tracer().Start(ctx, "agentpools.Service.Reconcile")
 	defer span.End()
 
-	agentPoolSpec, ok := spec.(*Spec)
-	if !ok {
-		return errors.New("invalid agent pool specification")
-	}
+	agentPoolSpec := s.scope.AgentPoolSpec()
 
 	profile := containerservice.AgentPool{
 		ManagedClusterAgentPoolProfileProperties: &containerservice.ManagedClusterAgentPoolProfileProperties{
-			VMSize:              containerservice.VMSizeTypes(agentPoolSpec.SKU),
-			OsType:              containerservice.Linux,
+			VMSize:              &agentPoolSpec.SKU,
+			OsType:              containerservice.OSTypeLinux,
 			OsDiskSizeGB:        &agentPoolSpec.OSDiskSizeGB,
 			Count:               &agentPoolSpec.Replicas,
-			Type:                containerservice.VirtualMachineScaleSets,
+			Type:                containerservice.AgentPoolTypeVirtualMachineScaleSets,
 			OrchestratorVersion: agentPoolSpec.Version,
 			VnetSubnetID:        &agentPoolSpec.VnetSubnetID,
+			Mode:                containerservice.AgentPoolMode(agentPoolSpec.Mode),
 		},
 	}
 
@@ -79,26 +94,31 @@ func (s *Service) Reconcile(ctx context.Context, spec interface{}) error {
 		}
 	} else {
 		ps := *existingPool.ManagedClusterAgentPoolProfileProperties.ProvisioningState
-		if ps != "Canceled" && ps != "Failed" && ps != "Succeeded" {
-			klog.V(2).Infof("Unable to update existing agent pool in non terminal state.  Agent pool must be in one of the following provisioning states: canceled, failed, or succeeded")
-			return nil
+		if ps != string(infrav1alpha4.Canceled) && ps != string(infrav1alpha4.Failed) && ps != string(infrav1alpha4.Succeeded) {
+			msg := fmt.Sprintf("Unable to update existing agent pool in non terminal state. Agent pool must be in one of the following provisioning states: canceled, failed, or succeeded. Actual state: %s", ps)
+			klog.V(2).Infof(msg)
+			return errors.New(msg)
 		}
 
 		// Normalize individual agent pools to diff in case we need to update
 		existingProfile := containerservice.AgentPool{
 			ManagedClusterAgentPoolProfileProperties: &containerservice.ManagedClusterAgentPoolProfileProperties{
-				VMSize:              existingPool.ManagedClusterAgentPoolProfileProperties.VMSize,
-				OsType:              containerservice.Linux,
-				OsDiskSizeGB:        existingPool.ManagedClusterAgentPoolProfileProperties.OsDiskSizeGB,
-				Count:               existingPool.ManagedClusterAgentPoolProfileProperties.Count,
-				Type:                containerservice.VirtualMachineScaleSets,
-				OrchestratorVersion: existingPool.ManagedClusterAgentPoolProfileProperties.OrchestratorVersion,
-				VnetSubnetID:        existingPool.ManagedClusterAgentPoolProfileProperties.VnetSubnetID,
+				Count:               existingPool.Count,
+				OrchestratorVersion: existingPool.OrchestratorVersion,
+				Mode:                existingPool.Mode,
+			},
+		}
+
+		normalizedProfile := containerservice.AgentPool{
+			ManagedClusterAgentPoolProfileProperties: &containerservice.ManagedClusterAgentPoolProfileProperties{
+				Count:               profile.Count,
+				OrchestratorVersion: profile.OrchestratorVersion,
+				Mode:                profile.Mode,
 			},
 		}
 
 		// Diff and check if we require an update
-		diff := cmp.Diff(profile, existingProfile)
+		diff := cmp.Diff(existingProfile, normalizedProfile)
 		if diff != "" {
 			klog.V(2).Infof("Update required (+new -old):\n%s", diff)
 			err = s.Client.CreateOrUpdate(ctx, agentPoolSpec.ResourceGroup, agentPoolSpec.Cluster, agentPoolSpec.Name, profile)
@@ -114,14 +134,11 @@ func (s *Service) Reconcile(ctx context.Context, spec interface{}) error {
 }
 
 // Delete deletes the virtual network with the provided name.
-func (s *Service) Delete(ctx context.Context, spec interface{}) error {
+func (s *Service) Delete(ctx context.Context) error {
 	ctx, span := tele.Tracer().Start(ctx, "agentpools.Service.Delete")
 	defer span.End()
 
-	agentPoolSpec, ok := spec.(*Spec)
-	if !ok {
-		return errors.New("invalid agent pool specification")
-	}
+	agentPoolSpec := s.scope.AgentPoolSpec()
 
 	klog.V(2).Infof("deleting agent pool  %s ", agentPoolSpec.Name)
 	err := s.Client.Delete(ctx, agentPoolSpec.ResourceGroup, agentPoolSpec.Cluster, agentPoolSpec.Name)

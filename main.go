@@ -27,16 +27,7 @@ import (
 
 	// +kubebuilder:scaffold:imports
 
-	"github.com/Azure/go-autorest/tracing"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/pflag"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
-	otelProm "go.opentelemetry.io/otel/exporters/metric/prometheus"
-	"go.opentelemetry.io/otel/exporters/trace/jaeger"
-	"go.opentelemetry.io/otel/sdk/resource"
-	tracesdk "go.opentelemetry.io/otel/sdk/trace"
-	"go.opentelemetry.io/otel/semconv"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -53,7 +44,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
-	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	aadpodv1 "github.com/Azure/aad-pod-identity/pkg/apis/aadpodidentity/v1"
 
@@ -66,7 +56,7 @@ import (
 	"sigs.k8s.io/cluster-api-provider-azure/feature"
 	"sigs.k8s.io/cluster-api-provider-azure/pkg/ot"
 	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
-	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
+	"sigs.k8s.io/cluster-api-provider-azure/util/webhook"
 	"sigs.k8s.io/cluster-api-provider-azure/version"
 )
 
@@ -88,7 +78,7 @@ func init() {
 	// +kubebuilder:scaffold:scheme
 
 	// Add aadpodidentity v1 to the scheme.
-	aadPodIdentityGroupVersion := schema.GroupVersion{Group: aadpodv1.CRDGroup, Version: aadpodv1.CRDVersion}
+	aadPodIdentityGroupVersion := schema.GroupVersion{Group: aadpodv1.GroupName, Version: "v1"}
 	scheme.AddKnownTypes(aadPodIdentityGroupVersion,
 		&aadpodv1.AzureIdentity{},
 		&aadpodv1.AzureIdentityList{},
@@ -236,7 +226,7 @@ func InitFlags(fs *pflag.FlagSet) {
 		&enableTracing,
 		"enable-tracing",
 		false,
-		"Enable Jaeger tracing to an agent running as a sidecar to the controller.",
+		"Enable tracing to the opentelemetry-collector service in the same namespace.",
 	)
 
 	feature.MutableGates.AddFlag(fs)
@@ -288,23 +278,26 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := initPrometheusMetrics(); err != nil {
-		setupLog.Error(err, "failed to init Prometheus metrics")
-		os.Exit(1)
-	}
-
 	// Initialize event recorder.
 	record.InitFromRecorder(mgr.GetEventRecorderFor("azure-controller"))
 
 	// Setup the context that's going to be used in controllers and for the manager.
 	ctx := ctrl.SetupSignalHandler()
-	registerControllers(ctx, mgr)
-	// +kubebuilder:scaffold:builder
 
-	if err := registerTracing(ctx); err != nil {
-		setupLog.Error(err, "unable to initialize tracing")
+	if enableTracing {
+		if err := ot.RegisterTracing(ctx, setupLog); err != nil {
+			setupLog.Error(err, "unable to initialize tracing")
+			os.Exit(1)
+		}
+	}
+
+	if err := ot.RegisterMetrics(); err != nil {
+		setupLog.Error(err, "unable to initialize metrics")
 		os.Exit(1)
 	}
+
+	registerControllers(ctx, mgr)
+	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddReadyzCheck("ping", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to create ready check")
@@ -321,28 +314,6 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
-}
-
-func registerTracing(ctx context.Context) error {
-	if !enableTracing {
-		return nil
-	}
-	tp, err := jaegerTracerProvider("http://localhost:5778/api/traces")
-	if err != nil {
-		return err
-	}
-	otel.SetTracerProvider(tp)
-	tracing.Register(ot.NewOpenTelemetryAutorestTracer(tele.Tracer()))
-	go func() {
-		<-ctx.Done()
-		// Allow five seconds for tracing componentry to shut down.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := tp.Shutdown(ctx); err != nil {
-			setupLog.Error(err, "failed to shut down tracing")
-		}
-	}()
-	return nil
 }
 
 func registerControllers(ctx context.Context, mgr manager.Manager) {
@@ -511,6 +482,16 @@ func registerControllers(ctx context.Context, mgr manager.Manager) {
 		}
 	}
 
+	if feature.Gates.Enabled(feature.AKS) {
+		hookServer := mgr.GetWebhookServer()
+		hookServer.Register("/mutate-infrastructure-cluster-x-k8s-io-v1alpha4-azuremanagedmachinepool", webhook.NewMutatingWebhook(
+			&infrav1alpha4exp.AzureManagedMachinePool{}, mgr.GetClient(),
+		))
+		hookServer.Register("/validate-infrastructure-cluster-x-k8s-io-v1alpha4-azuremanagedmachinepool", webhook.NewValidatingWebhook(
+			&infrav1alpha4exp.AzureManagedMachinePool{}, mgr.GetClient(),
+		))
+	}
+
 	if err := mgr.AddReadyzCheck("ping", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to create ready check")
 		os.Exit(1)
@@ -527,30 +508,4 @@ func registerControllers(ctx context.Context, mgr manager.Manager) {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
-}
-
-func initPrometheusMetrics() error {
-	_, err := otelProm.InstallNewPipeline(otelProm.Config{
-		Registry: metrics.Registry.(*prometheus.Registry), // use the controller runtime metrics registry / gatherer
-	})
-
-	return err
-}
-
-// jaegerTracerProvider creates a jaeger tracing provider.
-func jaegerTracerProvider(url string) (*tracesdk.TracerProvider, error) {
-	exp, err := jaeger.NewRawExporter(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint(url)))
-	if err != nil {
-		return nil, err
-	}
-	tp := tracesdk.NewTracerProvider(
-		// Always be sure to batch in production.
-		tracesdk.WithBatcher(exp),
-		// Record information about this application in an Resource.
-		tracesdk.WithResource(resource.NewWithAttributes(
-			semconv.ServiceNameKey.String("capz"),
-			attribute.String("exporter", "jaeger"),
-		)),
-	)
-	return tp, nil
 }

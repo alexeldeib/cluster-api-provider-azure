@@ -67,11 +67,11 @@ func NewClusterScope(ctx context.Context, params ClusterScopeParams) (*ClusterSc
 			return nil, errors.Wrap(err, "failed to configure azure settings and credentials from environment")
 		}
 	} else {
-		credentailsProvider, err := NewAzureClusterCredentialsProvider(ctx, params.Client, params.AzureCluster)
+		credentialsProvider, err := NewAzureClusterCredentialsProvider(ctx, params.Client, params.AzureCluster)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to init credentials provider")
 		}
-		err = params.AzureClients.setCredentialsWithProvider(ctx, params.AzureCluster.Spec.SubscriptionID, params.AzureCluster.Spec.AzureEnvironment, credentailsProvider)
+		err = params.AzureClients.setCredentialsWithProvider(ctx, params.AzureCluster.Spec.SubscriptionID, params.AzureCluster.Spec.AzureEnvironment, credentialsProvider)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to configure azure settings and credentials for Identity")
 		}
@@ -118,40 +118,38 @@ func (s *ClusterScope) PublicIPSpecs() []azure.PublicIPSpec {
 	var publicIPSpecs []azure.PublicIPSpec
 
 	// Public IP specs for control plane lb
-	var controlPlaneOutboundIP azure.PublicIPSpec
+	var controlPlaneOutboundIPSpecs []azure.PublicIPSpec
 	if s.IsAPIServerPrivate() {
-		controlPlaneOutboundIP = azure.PublicIPSpec{
-			Name: azure.GenerateControlPlaneOutboundIPName(s.ClusterName()),
+		// Public IP specs for control plane outbound lb
+		if s.ControlPlaneOutboundLB() != nil {
+			controlPlaneOutboundIPSpecs = s.getOutboundLBPublicIPSpecs(s.ControlPlaneOutboundLB(), azure.GenerateControlPlaneOutboundIPName)
 		}
 	} else {
-		controlPlaneOutboundIP = azure.PublicIPSpec{
+		controlPlaneOutboundIPSpecs = []azure.PublicIPSpec{{
 			Name:    s.APIServerPublicIP().Name,
 			DNSName: s.APIServerPublicIP().DNSName,
 			IsIPv6:  false, // currently azure requires a ipv4 lb rule to enable ipv6
-		}
+		}}
 	}
-	publicIPSpecs = append(publicIPSpecs, controlPlaneOutboundIP)
+	publicIPSpecs = append(publicIPSpecs, controlPlaneOutboundIPSpecs...)
 
 	// Public IP specs for node outbound lb
-	var nodeOutboundIPSpecs []azure.PublicIPSpec
 	if s.NodeOutboundLB() != nil {
-		loadBalancerNodeOutboundIPs := s.NodeOutboundLB().FrontendIPsCount
-		if loadBalancerNodeOutboundIPs == nil || *loadBalancerNodeOutboundIPs == 0 {
-			// do nothing
-		} else if *loadBalancerNodeOutboundIPs == 1 {
-			nodeOutboundIPSpecs = append(nodeOutboundIPSpecs, azure.PublicIPSpec{
-				Name: azure.GenerateNodeOutboundIPName(s.ClusterName()),
-			})
-		} else {
-			for i := 0; i < int(*loadBalancerNodeOutboundIPs); i++ {
-				publicIPSpecs = append(publicIPSpecs, azure.PublicIPSpec{
-					Name: azure.WithIndex(azure.GenerateNodeOutboundIPName(s.ClusterName()), i+1),
-				})
-			}
-		}
+		nodeOutboundIPSpecs := s.getOutboundLBPublicIPSpecs(s.NodeOutboundLB(), azure.GenerateNodeOutboundIPName)
+		publicIPSpecs = append(publicIPSpecs, nodeOutboundIPSpecs...)
 	}
 
-	publicIPSpecs = append(publicIPSpecs, nodeOutboundIPSpecs...)
+	// Public IP specs for node nat gateways
+	var nodeNatGatewayIPSpecs []azure.PublicIPSpec
+	for _, subnet := range s.NodeSubnets() {
+		if subnet.IsNatGatewayEnabled() {
+			nodeNatGatewayIPSpecs = append(nodeNatGatewayIPSpecs, azure.PublicIPSpec{
+				Name:    subnet.NatGateway.NatGatewayIP.Name,
+				DNSName: subnet.NatGateway.NatGatewayIP.DNSName,
+			})
+		}
+		publicIPSpecs = append(publicIPSpecs, nodeNatGatewayIPSpecs...)
+	}
 
 	if s.AzureCluster.Spec.BastionSpec.AzureBastion != nil {
 		// public IP for Azure Bastion.
@@ -169,7 +167,7 @@ func (s *ClusterScope) PublicIPSpecs() []azure.PublicIPSpec {
 func (s *ClusterScope) LBSpecs() []azure.LBSpec {
 	specs := []azure.LBSpec{
 		{
-			// Control Plane LB
+			// API Server LB
 			Name:                 s.APIServerLB().Name,
 			SubnetName:           s.ControlPlaneSubnet().Name,
 			FrontendIPConfigs:    s.APIServerLB().FrontendIPs,
@@ -182,7 +180,7 @@ func (s *ClusterScope) LBSpecs() []azure.LBSpec {
 		},
 	}
 
-	// Public Node outbound LB
+	// Node outbound LB
 	if s.NodeOutboundLB() != nil {
 		specs = append(specs, azure.LBSpec{
 			Name:                 s.NodeOutboundLBName(),
@@ -195,27 +193,18 @@ func (s *ClusterScope) LBSpecs() []azure.LBSpec {
 		})
 	}
 
-	if !s.IsAPIServerPrivate() {
-		return specs
+	// Control Plane Outbound LB
+	if s.ControlPlaneOutboundLB() != nil {
+		specs = append(specs, azure.LBSpec{
+			Name:                 s.ControlPlaneOutboundLB().Name,
+			FrontendIPConfigs:    s.ControlPlaneOutboundLB().FrontendIPs,
+			Type:                 s.ControlPlaneOutboundLB().Type,
+			SKU:                  s.ControlPlaneOutboundLB().SKU,
+			BackendPoolName:      s.OutboundPoolName(azure.GenerateControlPlaneOutboundLBName(s.ClusterName())),
+			IdleTimeoutInMinutes: s.NodeOutboundLB().IdleTimeoutInMinutes,
+			Role:                 infrav1.ControlPlaneOutboundRole,
+		})
 	}
-
-	specs = append(specs, azure.LBSpec{
-		// Public Control Plane outbound LB
-		Name: azure.GenerateControlPlaneOutboundLBName(s.ClusterName()),
-		FrontendIPConfigs: []infrav1.FrontendIP{
-			{
-				Name: azure.GenerateFrontendIPConfigName(azure.GenerateControlPlaneOutboundLBName(s.ClusterName())),
-				PublicIP: &infrav1.PublicIPSpec{
-					Name: azure.GenerateControlPlaneOutboundIPName(s.ClusterName()),
-				},
-			},
-		},
-		Type:                 infrav1.Public,
-		SKU:                  infrav1.SKUStandard,
-		BackendPoolName:      s.OutboundPoolName(azure.GenerateControlPlaneOutboundLBName(s.ClusterName())),
-		Role:                 infrav1.ControlPlaneOutboundRole,
-		IdleTimeoutInMinutes: to.Int32Ptr(4),
-	})
 
 	return specs
 }
@@ -223,48 +212,62 @@ func (s *ClusterScope) LBSpecs() []azure.LBSpec {
 // RouteTableSpecs returns the node route table.
 func (s *ClusterScope) RouteTableSpecs() []azure.RouteTableSpec {
 	routetables := []azure.RouteTableSpec{}
-	if s.ControlPlaneRouteTable().Name != "" {
-		routetables = append(routetables, azure.RouteTableSpec{Name: s.ControlPlaneRouteTable().Name, Subnet: s.ControlPlaneSubnet()})
+	for _, subnet := range s.AzureCluster.Spec.NetworkSpec.Subnets {
+		if subnet.RouteTable.Name != "" {
+			routetables = append(routetables, azure.RouteTableSpec{Name: subnet.RouteTable.Name, Subnet: subnet})
+		}
 	}
-	if s.NodeRouteTable().Name != "" {
-		routetables = append(routetables, azure.RouteTableSpec{Name: s.NodeRouteTable().Name, Subnet: s.NodeSubnet()})
-	}
+
 	return routetables
+}
+
+// NatGatewaySpecs returns the node nat gateway.
+func (s *ClusterScope) NatGatewaySpecs() []azure.NatGatewaySpec {
+	natGateways := []azure.NatGatewaySpec{}
+
+	// We ignore the control plane nat gateway, as we will always use a LB to enable egress on the control plane.
+	for _, subnet := range s.NodeSubnets() {
+		if subnet.IsNatGatewayEnabled() {
+			natGateways = append(natGateways, azure.NatGatewaySpec{
+				Name: subnet.NatGateway.Name,
+				NatGatewayIP: infrav1.PublicIPSpec{
+					Name: subnet.NatGateway.NatGatewayIP.Name,
+				},
+				Subnet: subnet,
+			})
+		}
+	}
+
+	return natGateways
 }
 
 // NSGSpecs returns the security group specs.
 func (s *ClusterScope) NSGSpecs() []azure.NSGSpec {
-	return []azure.NSGSpec{
-		{
-			Name:          s.ControlPlaneSubnet().SecurityGroup.Name,
-			SecurityRules: s.ControlPlaneSubnet().SecurityGroup.SecurityRules,
-		},
-		{
-			Name:          s.NodeSubnet().SecurityGroup.Name,
-			SecurityRules: s.NodeSubnet().SecurityGroup.SecurityRules,
-		},
+	nsgspecs := []azure.NSGSpec{}
+	for _, subnet := range s.AzureCluster.Spec.NetworkSpec.Subnets {
+		nsgspecs = append(nsgspecs, azure.NSGSpec{
+			Name:          subnet.SecurityGroup.Name,
+			SecurityRules: subnet.SecurityGroup.SecurityRules,
+		})
 	}
+
+	return nsgspecs
 }
 
 // SubnetSpecs returns the subnets specs.
 func (s *ClusterScope) SubnetSpecs() []azure.SubnetSpec {
-	subnetSpecs := []azure.SubnetSpec{
-		{
-			Name:              s.ControlPlaneSubnet().Name,
-			CIDRs:             s.ControlPlaneSubnet().CIDRBlocks,
+	subnetSpecs := []azure.SubnetSpec{}
+	for _, subnet := range s.AzureCluster.Spec.NetworkSpec.Subnets {
+		subnetSpec := azure.SubnetSpec{
+			Name:              subnet.Name,
+			CIDRs:             subnet.CIDRBlocks,
 			VNetName:          s.Vnet().Name,
-			SecurityGroupName: s.ControlPlaneSubnet().SecurityGroup.Name,
-			Role:              s.ControlPlaneSubnet().Role,
-			RouteTableName:    s.ControlPlaneSubnet().RouteTable.Name,
-		},
-		{
-			Name:              s.NodeSubnet().Name,
-			CIDRs:             s.NodeSubnet().CIDRBlocks,
-			VNetName:          s.Vnet().Name,
-			SecurityGroupName: s.NodeSubnet().SecurityGroup.Name,
-			RouteTableName:    s.NodeSubnet().RouteTable.Name,
-			Role:              s.NodeSubnet().Role,
-		},
+			SecurityGroupName: subnet.SecurityGroup.Name,
+			RouteTableName:    subnet.RouteTable.Name,
+			Role:              subnet.Role,
+			NatGatewayName:    subnet.NatGateway.Name,
+		}
+		subnetSpecs = append(subnetSpecs, subnetSpec)
 	}
 
 	if s.AzureCluster.Spec.BastionSpec.AzureBastion != nil {
@@ -357,16 +360,33 @@ func (s *ClusterScope) ControlPlaneSubnet() infrav1.SubnetSpec {
 	return subnet
 }
 
-// NodeSubnet returns the cluster node subnet.
-func (s *ClusterScope) NodeSubnet() infrav1.SubnetSpec {
-	subnet, _ := s.AzureCluster.Spec.NetworkSpec.GetNodeSubnet()
-	return subnet
+// NodeSubnets returns the subnets with the node role.
+func (s *ClusterScope) NodeSubnets() []infrav1.SubnetSpec {
+	subnets := []infrav1.SubnetSpec{}
+	for _, subnet := range s.AzureCluster.Spec.NetworkSpec.Subnets {
+		if subnet.Role == infrav1.SubnetNode {
+			subnets = append(subnets, subnet)
+		}
+	}
+
+	return subnets
 }
 
-// SetSubnet sets the subnet spec for the subnet with the same role.
+// Subnet returns the subnet with the provided name.
+func (s *ClusterScope) Subnet(name string) infrav1.SubnetSpec {
+	for _, sn := range s.AzureCluster.Spec.NetworkSpec.Subnets {
+		if sn.Name == name {
+			return sn
+		}
+	}
+
+	return infrav1.SubnetSpec{}
+}
+
+// SetSubnet sets the subnet spec for the subnet with the same name.
 func (s *ClusterScope) SetSubnet(subnetSpec infrav1.SubnetSpec) {
 	for i, sn := range s.AzureCluster.Spec.NetworkSpec.Subnets {
-		if sn.Role == subnetSpec.Role {
+		if sn.Name == subnetSpec.Name {
 			s.AzureCluster.Spec.NetworkSpec.Subnets[i] = subnetSpec
 			return
 		}
@@ -379,12 +399,6 @@ func (s *ClusterScope) ControlPlaneRouteTable() infrav1.RouteTable {
 	return subnet.RouteTable
 }
 
-// NodeRouteTable returns the cluster node routetable.
-func (s *ClusterScope) NodeRouteTable() infrav1.RouteTable {
-	subnet, _ := s.AzureCluster.Spec.NetworkSpec.GetNodeSubnet()
-	return subnet.RouteTable
-}
-
 // APIServerLB returns the cluster API Server load balancer.
 func (s *ClusterScope) APIServerLB() *infrav1.LoadBalancerSpec {
 	return &s.AzureCluster.Spec.NetworkSpec.APIServerLB
@@ -393,6 +407,11 @@ func (s *ClusterScope) APIServerLB() *infrav1.LoadBalancerSpec {
 // NodeOutboundLB returns the cluster node outbound load balancer.
 func (s *ClusterScope) NodeOutboundLB() *infrav1.LoadBalancerSpec {
 	return s.AzureCluster.Spec.NetworkSpec.NodeOutboundLB
+}
+
+// ControlPlaneOutboundLB returns the cluster control plane outbound load balancer.
+func (s *ClusterScope) ControlPlaneOutboundLB() *infrav1.LoadBalancerSpec {
+	return s.AzureCluster.Spec.NetworkSpec.ControlPlaneOutboundLB
 }
 
 // APIServerLBName returns the API Server LB name.
@@ -628,4 +647,25 @@ func (s *ClusterScope) SetDNSName() {
 	if !s.IsAPIServerPrivate() && s.APIServerPublicIP().DNSName == "" {
 		s.APIServerPublicIP().DNSName = s.GenerateFQDN(s.APIServerPublicIP().Name)
 	}
+}
+
+// getOutboundLBPublicIPSpecs returns the public ip specs for a LoadBalancerSpec based on the number of frontend ips configured.
+func (s *ClusterScope) getOutboundLBPublicIPSpecs(outboundLB *infrav1.LoadBalancerSpec, generateOutboundIPName func(string) string) []azure.PublicIPSpec {
+	var outboundIPSpecs []azure.PublicIPSpec
+	loadBalancerNodeOutboundIPs := outboundLB.FrontendIPsCount
+	if loadBalancerNodeOutboundIPs == nil || *loadBalancerNodeOutboundIPs == 0 {
+		// do nothing
+	} else if *loadBalancerNodeOutboundIPs == 1 {
+		outboundIPSpecs = append(outboundIPSpecs, azure.PublicIPSpec{
+			Name: generateOutboundIPName(s.ClusterName()),
+		})
+	} else {
+		for i := 0; i < int(*loadBalancerNodeOutboundIPs); i++ {
+			outboundIPSpecs = append(outboundIPSpecs, azure.PublicIPSpec{
+				Name: azure.WithIndex(generateOutboundIPName(s.ClusterName()), i+1),
+			})
+		}
+	}
+
+	return outboundIPSpecs
 }

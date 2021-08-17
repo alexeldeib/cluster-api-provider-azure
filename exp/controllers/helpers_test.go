@@ -20,6 +20,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/Azure/go-autorest/autorest/to"
 	"github.com/golang/mock/gomock"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
@@ -208,22 +209,31 @@ func TestMachinePoolToAzureManagedControlPlaneMapFuncSuccess(t *testing.T) {
 		Name:       cpName,
 		Namespace:  cluster.Namespace,
 	}
-	controlPlane.Spec.DefaultPoolRef.Name = "azuremy-mmp-0"
-	managedMachinePool := newManagedMachinePoolInfraReference(clusterName, "my-mmp-0")
-	managedMachinePool.Spec.ClusterName = clusterName
+
+	// controlPlane.Spec.DefaultPoolRef.Name = "azuremy-mmp-0"
+	managedMachinePool0 := newManagedMachinePoolInfraReference(clusterName, "my-mmp-0")
+	azureManagedMachinePool0 := newAzureManagedMachinePool(clusterName, "azuremy-mmp-0", "System")
+	managedMachinePool0.Spec.ClusterName = clusterName
+
+	managedMachinePool1 := newManagedMachinePoolInfraReference(clusterName, "my-mmp-1")
+	azureManagedMachinePool1 := newAzureManagedMachinePool(clusterName, "azuremy-mmp-1", "User")
+	managedMachinePool1.Spec.ClusterName = clusterName
+
 	initObjects := []runtime.Object{
 		cluster,
 		controlPlane,
-		managedMachinePool,
+		managedMachinePool0,
+		azureManagedMachinePool0,
 		// Create two Machines with an infrastructure ref and one without.
-		newManagedMachinePoolInfraReference(clusterName, "my-mmp-1"),
+		managedMachinePool1,
+		azureManagedMachinePool1,
 	}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(initObjects...).Build()
 
 	log := mock_log.NewMockLogger(gomock.NewController(t))
 	mapper := MachinePoolToAzureManagedControlPlaneMapFunc(context.Background(), fakeClient, infrav1exp.GroupVersion.WithKind("AzureManagedControlPlane"), log)
 
-	// default pool should trigger
+	// system pool should trigger
 	requests := mapper(newManagedMachinePoolInfraReference(clusterName, "my-mmp-0"))
 	g.Expect(requests).To(ConsistOf([]reconcile.Request{
 		{
@@ -243,14 +253,12 @@ func TestMachinePoolToAzureManagedControlPlaneMapFuncFailure(t *testing.T) {
 	g := NewWithT(t)
 	scheme := newScheme(g)
 	cluster := newCluster(clusterName)
-	controlPlane := newAzureManagedControlPlane(cpName)
 	cluster.Spec.ControlPlaneRef = &corev1.ObjectReference{
 		APIVersion: infrav1exp.GroupVersion.String(),
 		Kind:       "AzureManagedControlPlane",
 		Name:       cpName,
 		Namespace:  cluster.Namespace,
 	}
-	controlPlane.Spec.DefaultPoolRef.Name = "azuremy-mmp-0"
 	managedMachinePool := newManagedMachinePoolInfraReference(clusterName, "my-mmp-0")
 	managedMachinePool.Spec.ClusterName = clusterName
 	initObjects := []runtime.Object{
@@ -457,7 +465,6 @@ func Test_MachinePoolToInfrastructureMapFunc(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.Name, func(t *testing.T) {
-			t.Parallel()
 			g := NewWithT(t)
 
 			mockCtrl := gomock.NewController(t)
@@ -468,6 +475,76 @@ func Test_MachinePoolToInfrastructureMapFunc(t *testing.T) {
 				c.Setup(log)
 			}
 			f := MachinePoolToInfrastructureMapFunc(infrav1exp.GroupVersion.WithKind("AzureMachinePool"), log)
+			reqs := f(c.MapObjectFactory(g))
+			c.Expect(g, reqs)
+		})
+	}
+}
+
+func Test_ManagedMachinePoolToInfrastructureMapFunc(t *testing.T) {
+	cases := []struct {
+		Name             string
+		Setup            func(logMock *mock_log.MockLogger)
+		MapObjectFactory func(*GomegaWithT) client.Object
+		Expect           func(*GomegaWithT, []reconcile.Request)
+	}{
+		{
+			Name: "MachinePoolToAzureManagedMachinePool",
+			MapObjectFactory: func(g *GomegaWithT) client.Object {
+				return newManagedMachinePoolWithInfrastructureRef("azureManagedCluster", "ManagedMachinePool")
+			},
+			Expect: func(g *GomegaWithT, reqs []reconcile.Request) {
+				g.Expect(reqs).To(HaveLen(1))
+				g.Expect(reqs[0]).To(Equal(reconcile.Request{
+					NamespacedName: types.NamespacedName{
+						Name:      "azureManagedMachinePool",
+						Namespace: "default",
+					},
+				}))
+			},
+		},
+		{
+			Name: "MachinePoolWithoutMatchingInfraRef",
+			MapObjectFactory: func(g *GomegaWithT) client.Object {
+				return newMachinePool("azureManagedCluster", "machinePool")
+			},
+			Setup: func(logMock *mock_log.MockLogger) {
+				ampGK := infrav1exp.GroupVersion.WithKind("AzureManagedMachinePool").GroupKind()
+				logMock.EXPECT().V(4).Return(logMock)
+				logMock.EXPECT().Info("gk does not match", "gk", ampGK, "infraGK", gomock.Any())
+			},
+			Expect: func(g *GomegaWithT, reqs []reconcile.Request) {
+				g.Expect(reqs).To(HaveLen(0))
+			},
+		},
+		{
+			Name: "NotAMachinePool",
+			MapObjectFactory: func(g *GomegaWithT) client.Object {
+				return newCluster("azureManagedCluster")
+			},
+			Setup: func(logMock *mock_log.MockLogger) {
+				logMock.EXPECT().V(4).Return(logMock)
+				logMock.EXPECT().Info("attempt to map incorrect type", "type", "*v1alpha4.Cluster")
+			},
+			Expect: func(g *GomegaWithT, reqs []reconcile.Request) {
+				g.Expect(reqs).To(HaveLen(0))
+			},
+		},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.Name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			mockCtrl := gomock.NewController(t)
+			defer mockCtrl.Finish()
+
+			log := mock_log.NewMockLogger(mockCtrl)
+			if c.Setup != nil {
+				c.Setup(log)
+			}
+			f := MachinePoolToInfrastructureMapFunc(infrav1exp.GroupVersion.WithKind("AzureManagedMachinePool"), log)
 			reqs := f(c.MapObjectFactory(g))
 			c.Expect(g, reqs)
 		})
@@ -629,4 +706,21 @@ func newManagedMachinePoolInfraReference(clusterName, poolName string) *clusterv
 		APIVersion: infrav1exp.GroupVersion.String(),
 	}
 	return m
+}
+
+func newAzureManagedMachinePool(clusterName, poolName, mode string) *infrav1exp.AzureManagedMachinePool {
+	return &infrav1exp.AzureManagedMachinePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{
+				clusterv1.ClusterLabelName: clusterName,
+			},
+			Name:      poolName,
+			Namespace: "default",
+		},
+		Spec: infrav1exp.AzureManagedMachinePoolSpec{
+			Mode:         mode,
+			SKU:          "Standard_D2s_v3",
+			OSDiskSizeGB: to.Int32Ptr(512),
+		},
+	}
 }

@@ -34,6 +34,7 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/pointer"
 	capi_e2e "sigs.k8s.io/cluster-api/test/e2e"
 	"sigs.k8s.io/cluster-api/test/framework/clusterctl"
@@ -49,6 +50,7 @@ var _ = Describe("Conformance Tests", func() {
 		clusterName   string
 		namespace     *corev1.Namespace
 		specName      = "conformance-tests"
+		repoList      = ""
 	)
 
 	BeforeEach(func() {
@@ -75,6 +77,24 @@ var _ = Describe("Conformance Tests", func() {
 		Expect(os.Setenv(AzureVNetName, fmt.Sprintf("%s-vnet", clusterName))).NotTo(HaveOccurred())
 
 		result = new(clusterctl.ApplyClusterTemplateAndWaitResult)
+
+		spClientSecret := os.Getenv(AzureClientSecret)
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "cluster-identity-secret",
+				Namespace: namespace.Name,
+			},
+			Type: corev1.SecretTypeOpaque,
+			Data: map[string][]byte{"clientSecret": []byte(spClientSecret)},
+		}
+		err = bootstrapClusterProxy.GetClient().Create(ctx, secret)
+		Expect(err).ToNot(HaveOccurred())
+
+		identityName := e2eConfig.GetVariable(ClusterIdentityName)
+		Expect(os.Setenv(ClusterIdentityName, identityName)).NotTo(HaveOccurred())
+		Expect(os.Setenv(ClusterIdentityNamespace, namespace.Name)).NotTo(HaveOccurred())
+		Expect(os.Setenv(ClusterIdentitySecretName, "cluster-identity-secret")).NotTo(HaveOccurred())
+		Expect(os.Setenv(ClusterIdentitySecretNamespace, namespace.Name)).NotTo(HaveOccurred())
 	})
 
 	Measure(specName, func(b Benchmarker) {
@@ -84,6 +104,8 @@ var _ = Describe("Conformance Tests", func() {
 		flavor := clusterctl.DefaultFlavor
 		if isWindows(kubetestConfigFilePath) {
 			flavor = "windows"
+			// conformance for windows doesn't require any linux worker machines.
+			Expect(os.Setenv("LINUX_WORKER_MACHINE_COUNT", "0")).To(Succeed())
 		}
 
 		// clusters with CI artifacts or PR artifacts are based on a known CI version
@@ -133,8 +155,8 @@ var _ = Describe("Conformance Tests", func() {
 		b.RecordValue("cluster creation", runtime.Seconds())
 		workloadProxy := bootstrapClusterProxy.GetWorkloadCluster(ctx, namespace.Name, clusterName)
 
-		// Windows requires a taint on control nodes nodes since not all conformance tests have ability to run
 		if isWindows(kubetestConfigFilePath) {
+			// Windows requires a taint on control nodes nodes since not all conformance tests have ability to run
 			options := v1.ListOptions{
 				LabelSelector: "kubernetes.io/os=linux",
 			}
@@ -147,6 +169,11 @@ var _ = Describe("Conformance Tests", func() {
 
 			err := node.TaintNode(workloadProxy.GetClientSet(), options, noScheduleTaint)
 			Expect(err).NotTo(HaveOccurred())
+
+			// Windows requires a repo-list because some images are not in k8s gcr
+			repoList, err = resolveKubetestRepoListPath(kubernetesVersion, kubetestRepoListPath)
+			Expect(err).NotTo(HaveOccurred())
+			fmt.Fprintf(GinkgoWriter, "INFO: Using repo-list %s for version %s\n", repoList, kubernetesVersion)
 		}
 
 		ginkgoNodes, err := strconv.Atoi(e2eConfig.GetVariable("CONFORMANCE_NODES"))
@@ -158,7 +185,7 @@ var _ = Describe("Conformance Tests", func() {
 					ClusterProxy:         workloadProxy,
 					NumberOfNodes:        int(workerMachineCount),
 					ConfigFilePath:       kubetestConfigFilePath,
-					KubeTestRepoListPath: kubetestRepoListPath,
+					KubeTestRepoListPath: repoList,
 					ConformanceImage:     e2eConfig.GetVariable("CONFORMANCE_IMAGE"),
 					GinkgoNodes:          ginkgoNodes,
 				},
@@ -174,8 +201,18 @@ var _ = Describe("Conformance Tests", func() {
 			_ = bootstrapClusterProxy.GetClient().Get(ctx, types.NamespacedName{Name: clusterName, Namespace: namespace.Name}, result.Cluster)
 		}
 
+		cleanInput := cleanupInput{
+			SpecName:        specName,
+			Cluster:         result.Cluster,
+			ClusterProxy:    bootstrapClusterProxy,
+			Namespace:       namespace,
+			CancelWatches:   cancelWatches,
+			IntervalsGetter: e2eConfig.GetIntervals,
+			SkipCleanup:     skipCleanup,
+			ArtifactFolder:  artifactFolder,
+		}
 		// Dumps all the resources in the spec namespace, then cleanups the cluster object and the spec namespace itself.
-		dumpSpecResourcesAndCleanup(ctx, specName, bootstrapClusterProxy, artifactFolder, namespace, cancelWatches, result.Cluster, e2eConfig.GetIntervals, skipCleanup)
+		dumpSpecResourcesAndCleanup(ctx, cleanInput)
 
 		Expect(os.Unsetenv(AzureResourceGroup)).NotTo(HaveOccurred())
 		Expect(os.Unsetenv(AzureVNetName)).NotTo(HaveOccurred())

@@ -1,14 +1,16 @@
 on:
   push:
     branches:
-    - master
+    - master # TODO: remove this after rename
+    - main
 
 jobs:
   coverage:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@master
-    - run: "make test-cover"
+    - run: "bash hack/install-go.sh"
+    - run: "PATH=/usr/local/go/bin:$PATH make test-cover"
     - uses: codecov/codecov-action@v1
       with:
         file: ./coverage.out

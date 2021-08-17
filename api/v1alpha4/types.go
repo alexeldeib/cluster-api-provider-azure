@@ -64,6 +64,11 @@ type NetworkSpec struct {
 	// +optional
 	NodeOutboundLB *LoadBalancerSpec `json:"nodeOutboundLB,omitempty"`
 
+	// ControlPlaneOutboundLB is the configuration for the control-plane outbound load balancer.
+	// This is different from APIServerLB, and is used only in private clusters (optionally) for enabling outbound traffic.
+	// +optional
+	ControlPlaneOutboundLB *LoadBalancerSpec `json:"controlPlaneOutboundLB,omitempty"`
+
 	// PrivateDNSZoneName defines the zone name for the Azure Private DNS.
 	// +optional
 	PrivateDNSZoneName string `json:"privateDNSZoneName,omitempty"`
@@ -110,6 +115,14 @@ type SecurityGroup struct {
 type RouteTable struct {
 	ID   string `json:"id,omitempty"`
 	Name string `json:"name,omitempty"`
+}
+
+// NatGateway defines an Azure Nat Gateway.
+// NAT gateway resources are part of Vnet NAT and provide outbound Internet connectivity for subnets of a virtual network.
+type NatGateway struct {
+	ID           string       `json:"id,omitempty"`
+	Name         string       `json:"name,omitempty"`
+	NatGatewayIP PublicIPSpec `json:"ip,omitempty"`
 }
 
 // SecurityGroupProtocol defines the protocol type for a security group rule.
@@ -232,6 +245,8 @@ const (
 	Succeeded ProvisioningState = "Succeeded"
 	// Updating ...
 	Updating ProvisioningState = "Updating"
+	// Canceled represents an action which was initiated but terminated by the user before completion.
+	Canceled ProvisioningState = "Canceled"
 	// Deleted represents a deleted VM
 	// NOTE: This state is specific to capz, and does not have corresponding mapping in Azure API (https://docs.microsoft.com/en-us/azure/virtual-machines/states-billing#provisioning-states)
 	Deleted ProvisioningState = "Deleted"
@@ -379,6 +394,9 @@ const (
 
 	// ServicePrincipal represents a service principal.
 	ServicePrincipal IdentityType = "ServicePrincipal"
+
+	// ManualServicePrincipal represents a manual service principal.
+	ManualServicePrincipal IdentityType = "ManualServicePrincipal"
 )
 
 // OSDisk defines the operating system disk for a VM.
@@ -477,6 +495,10 @@ type SubnetSpec struct {
 	// RouteTable defines the route table that should be attached to this subnet.
 	// +optional
 	RouteTable RouteTable `json:"routeTable,omitempty"`
+
+	// NatGateway associated with this subnet.
+	// +optional
+	NatGateway NatGateway `json:"natGateway,omitempty"`
 }
 
 // GetControlPlaneSubnet returns the cluster control plane subnet.
@@ -498,16 +520,6 @@ func (n *NetworkSpec) UpdateControlPlaneSubnet(subnet SubnetSpec) {
 	}
 }
 
-// GetNodeSubnet returns the cluster node subnet.
-func (n *NetworkSpec) GetNodeSubnet() (SubnetSpec, error) {
-	for _, sn := range n.Subnets {
-		if sn.Role == SubnetNode {
-			return sn, nil
-		}
-	}
-	return SubnetSpec{}, errors.Errorf("no subnet found with role %s", SubnetNode)
-}
-
 // UpdateNodeSubnet updates the cluster node subnet.
 func (n *NetworkSpec) UpdateNodeSubnet(subnet SubnetSpec) {
 	for i, sn := range n.Subnets {
@@ -515,6 +527,11 @@ func (n *NetworkSpec) UpdateNodeSubnet(subnet SubnetSpec) {
 			n.Subnets[i] = subnet
 		}
 	}
+}
+
+// IsNatGatewayEnabled returns whether or not a Nat Gateway is enabled on the subnet.
+func (s SubnetSpec) IsNatGatewayEnabled() bool {
+	return s.NatGateway.Name != ""
 }
 
 // SecurityProfile specifies the Security profile settings for a

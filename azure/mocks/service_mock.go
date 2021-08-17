@@ -80,57 +80,6 @@ func (mr *MockReconcilerMockRecorder) Reconcile(ctx interface{}) *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Reconcile", reflect.TypeOf((*MockReconciler)(nil).Reconcile), ctx)
 }
 
-// MockOldService is a mock of OldService interface.
-type MockOldService struct {
-	ctrl     *gomock.Controller
-	recorder *MockOldServiceMockRecorder
-}
-
-// MockOldServiceMockRecorder is the mock recorder for MockOldService.
-type MockOldServiceMockRecorder struct {
-	mock *MockOldService
-}
-
-// NewMockOldService creates a new mock instance.
-func NewMockOldService(ctrl *gomock.Controller) *MockOldService {
-	mock := &MockOldService{ctrl: ctrl}
-	mock.recorder = &MockOldServiceMockRecorder{mock}
-	return mock
-}
-
-// EXPECT returns an object that allows the caller to indicate expected use.
-func (m *MockOldService) EXPECT() *MockOldServiceMockRecorder {
-	return m.recorder
-}
-
-// Delete mocks base method.
-func (m *MockOldService) Delete(ctx context.Context, spec interface{}) error {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Delete", ctx, spec)
-	ret0, _ := ret[0].(error)
-	return ret0
-}
-
-// Delete indicates an expected call of Delete.
-func (mr *MockOldServiceMockRecorder) Delete(ctx, spec interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Delete", reflect.TypeOf((*MockOldService)(nil).Delete), ctx, spec)
-}
-
-// Reconcile mocks base method.
-func (m *MockOldService) Reconcile(ctx context.Context, spec interface{}) error {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Reconcile", ctx, spec)
-	ret0, _ := ret[0].(error)
-	return ret0
-}
-
-// Reconcile indicates an expected call of Reconcile.
-func (mr *MockOldServiceMockRecorder) Reconcile(ctx, spec interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Reconcile", reflect.TypeOf((*MockOldService)(nil).Reconcile), ctx, spec)
-}
-
 // MockCredentialGetter is a mock of CredentialGetter interface.
 type MockCredentialGetter struct {
 	ctrl     *gomock.Controller
@@ -467,32 +416,18 @@ func (mr *MockNetworkDescriberMockRecorder) IsVnetManaged() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IsVnetManaged", reflect.TypeOf((*MockNetworkDescriber)(nil).IsVnetManaged))
 }
 
-// NodeRouteTable mocks base method.
-func (m *MockNetworkDescriber) NodeRouteTable() v1alpha4.RouteTable {
+// NodeSubnets mocks base method.
+func (m *MockNetworkDescriber) NodeSubnets() []v1alpha4.SubnetSpec {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "NodeRouteTable")
-	ret0, _ := ret[0].(v1alpha4.RouteTable)
+	ret := m.ctrl.Call(m, "NodeSubnets")
+	ret0, _ := ret[0].([]v1alpha4.SubnetSpec)
 	return ret0
 }
 
-// NodeRouteTable indicates an expected call of NodeRouteTable.
-func (mr *MockNetworkDescriberMockRecorder) NodeRouteTable() *gomock.Call {
+// NodeSubnets indicates an expected call of NodeSubnets.
+func (mr *MockNetworkDescriberMockRecorder) NodeSubnets() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "NodeRouteTable", reflect.TypeOf((*MockNetworkDescriber)(nil).NodeRouteTable))
-}
-
-// NodeSubnet mocks base method.
-func (m *MockNetworkDescriber) NodeSubnet() v1alpha4.SubnetSpec {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "NodeSubnet")
-	ret0, _ := ret[0].(v1alpha4.SubnetSpec)
-	return ret0
-}
-
-// NodeSubnet indicates an expected call of NodeSubnet.
-func (mr *MockNetworkDescriberMockRecorder) NodeSubnet() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "NodeSubnet", reflect.TypeOf((*MockNetworkDescriber)(nil).NodeSubnet))
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "NodeSubnets", reflect.TypeOf((*MockNetworkDescriber)(nil).NodeSubnets))
 }
 
 // OutboundLBName mocks base method.
@@ -533,6 +468,34 @@ func (m *MockNetworkDescriber) SetSubnet(arg0 v1alpha4.SubnetSpec) {
 func (mr *MockNetworkDescriberMockRecorder) SetSubnet(arg0 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetSubnet", reflect.TypeOf((*MockNetworkDescriber)(nil).SetSubnet), arg0)
+}
+
+// Subnet mocks base method.
+func (m *MockNetworkDescriber) Subnet(arg0 string) v1alpha4.SubnetSpec {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Subnet", arg0)
+	ret0, _ := ret[0].(v1alpha4.SubnetSpec)
+	return ret0
+}
+
+// Subnet indicates an expected call of Subnet.
+func (mr *MockNetworkDescriberMockRecorder) Subnet(arg0 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Subnet", reflect.TypeOf((*MockNetworkDescriber)(nil).Subnet), arg0)
+}
+
+// Subnets mocks base method.
+func (m *MockNetworkDescriber) Subnets() v1alpha4.Subnets {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Subnets")
+	ret0, _ := ret[0].(v1alpha4.Subnets)
+	return ret0
+}
+
+// Subnets indicates an expected call of Subnets.
+func (mr *MockNetworkDescriberMockRecorder) Subnets() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Subnets", reflect.TypeOf((*MockNetworkDescriber)(nil).Subnets))
 }
 
 // Vnet mocks base method.
@@ -1057,32 +1020,18 @@ func (mr *MockClusterScoperMockRecorder) Location() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Location", reflect.TypeOf((*MockClusterScoper)(nil).Location))
 }
 
-// NodeRouteTable mocks base method.
-func (m *MockClusterScoper) NodeRouteTable() v1alpha4.RouteTable {
+// NodeSubnets mocks base method.
+func (m *MockClusterScoper) NodeSubnets() []v1alpha4.SubnetSpec {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "NodeRouteTable")
-	ret0, _ := ret[0].(v1alpha4.RouteTable)
+	ret := m.ctrl.Call(m, "NodeSubnets")
+	ret0, _ := ret[0].([]v1alpha4.SubnetSpec)
 	return ret0
 }
 
-// NodeRouteTable indicates an expected call of NodeRouteTable.
-func (mr *MockClusterScoperMockRecorder) NodeRouteTable() *gomock.Call {
+// NodeSubnets indicates an expected call of NodeSubnets.
+func (mr *MockClusterScoperMockRecorder) NodeSubnets() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "NodeRouteTable", reflect.TypeOf((*MockClusterScoper)(nil).NodeRouteTable))
-}
-
-// NodeSubnet mocks base method.
-func (m *MockClusterScoper) NodeSubnet() v1alpha4.SubnetSpec {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "NodeSubnet")
-	ret0, _ := ret[0].(v1alpha4.SubnetSpec)
-	return ret0
-}
-
-// NodeSubnet indicates an expected call of NodeSubnet.
-func (mr *MockClusterScoperMockRecorder) NodeSubnet() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "NodeSubnet", reflect.TypeOf((*MockClusterScoper)(nil).NodeSubnet))
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "NodeSubnets", reflect.TypeOf((*MockClusterScoper)(nil).NodeSubnets))
 }
 
 // OutboundLBName mocks base method.
@@ -1137,6 +1086,34 @@ func (m *MockClusterScoper) SetSubnet(arg0 v1alpha4.SubnetSpec) {
 func (mr *MockClusterScoperMockRecorder) SetSubnet(arg0 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetSubnet", reflect.TypeOf((*MockClusterScoper)(nil).SetSubnet), arg0)
+}
+
+// Subnet mocks base method.
+func (m *MockClusterScoper) Subnet(arg0 string) v1alpha4.SubnetSpec {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Subnet", arg0)
+	ret0, _ := ret[0].(v1alpha4.SubnetSpec)
+	return ret0
+}
+
+// Subnet indicates an expected call of Subnet.
+func (mr *MockClusterScoperMockRecorder) Subnet(arg0 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Subnet", reflect.TypeOf((*MockClusterScoper)(nil).Subnet), arg0)
+}
+
+// Subnets mocks base method.
+func (m *MockClusterScoper) Subnets() v1alpha4.Subnets {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Subnets")
+	ret0, _ := ret[0].(v1alpha4.Subnets)
+	return ret0
+}
+
+// Subnets indicates an expected call of Subnets.
+func (mr *MockClusterScoperMockRecorder) Subnets() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Subnets", reflect.TypeOf((*MockClusterScoper)(nil).Subnets))
 }
 
 // SubscriptionID mocks base method.

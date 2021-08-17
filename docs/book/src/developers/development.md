@@ -112,6 +112,23 @@ Makefile targets and scripts are offered to work with go modules:
 Your environment must have the Azure credentials as outlined in the [getting
 started prerequisites](../topics/getting-started.md#Prerequisites) section.
 
+### Tilt Requirements
+
+Install [Tilt](https://docs.tilt.dev/install.html):
+ - `brew install tilt-dev/tap/tilt` on macOS or Linux
+ - `scoop bucket add tilt-dev https://github.com/tilt-dev/scoop-bucket` & `scoop install tilt` on Windows
+ - for alternatives you can follow the installation instruction for [macOS](https://docs.tilt.dev/install.html#macos),
+   [Linux](https://docs.tilt.dev/install.html#linux) or [Windows](https://docs.tilt.dev/install.html#windows)
+
+After the installation is done, verify that you have installed it correctly with: `tilt version`
+
+Install [Helm](https://helm.sh/docs/intro/install/):
+ - `brew install helm` on MacOS
+ - `choco install kubernetes-helm` on Windows
+ - [Install Instruction](https://helm.sh/docs/intro/install/#from-source-linux-macos) on Linux
+
+You would require installation of Helm for succesfully setting up Tilt.
+
 ### Using Tilt
 
 Both of the [Tilt](https://tilt.dev) setups below will get you started developing CAPZ in a local kind cluster.
@@ -213,18 +230,29 @@ make delete-workload-cluster
 > Check out the [troubleshooting guide](../topics/troubleshooting.md) for common errors you might run into.
 
 #### Viewing Telemetry
-The CAPZ controller emits tracing and metrics data. When run in Tilt, the KinD cluster is provisioned with a development
-deployment of Jaeger, for distributed tracing, and Prometheus for metrics scraping and visualization.
 
-The Jaeger and Prometheus deployments are for development purposes only. These illustrate the hooks for tracing and
-metrics, but lack the robustness of production cluster deployments. For example, Jaeger in "all-in-one" mode with only
-in-memory persistence of traces.
+The CAPZ controller emits tracing and metrics data. When run in Tilt, the KinD management cluster is
+provisioned with development deployments of OpenTelemetry for collecting distributed traces, Jaeger
+for viewing traces, and Prometheus for scraping and visualizing metrics.
 
-After the Tilt cluster has been initialized, to view distributed traces in Jaeger open a browser to
-`http://localhost:8080`.
+The OpenTelemetry, Jaeger, and Prometheus deployments are for development purposes only. These
+illustrate the hooks for tracing and metrics, but lack the robustness of production cluster
+deployments. For example, the Jaeger "all-in-one" component only keeps traces in memory, not in a
+persistent store.
 
-To view metrics, run `kubectl port-forward -n capz-system prometheus-prometheus-0 9090` and open
-`http://localhost:9090` to see the Prometheus UI.
+To view traces in the Jaeger interface, wait until the Tilt cluster is fully initialized. Then open
+the Tilt web interface, select the "traces: jaeger-all-in-one" resource, and click "View traces"
+near the top of the screen. Or visit http://localhost:16686/ in your browser. <!-- markdown-link-check-disable-line -->
+
+To view traces in App Insights, follow the
+[tracing documentation](../../../../hack/observability/opentelemetry/readme.md) before running
+`make tilt-up`. Then open the Azure Portal in your browser. Find the App Insights resource you
+specified in `AZURE_INSTRUMENTATION_KEY`, choose "Transaction search" on the left, and click
+"Refresh" to see recent trace data.
+
+To view metrics in the Prometheus interface, open the Tilt web interface, select the
+"metrics: prometheus-operator" resource, and click "View metrics" near the top of the screen. Or
+visit http://localhost:9090/ in your browser. <!-- markdown-link-check-disable-line -->
 
 ### Manual Testing
 
@@ -285,7 +313,7 @@ export CONTROL_PLANE_MACHINE_COUNT=3
 export AZURE_CONTROL_PLANE_MACHINE_TYPE="Standard_D2s_v3"
 export AZURE_NODE_MACHINE_TYPE="Standard_D2s_v3"
 export WORKER_MACHINE_COUNT=2
-export KUBERNETES_VERSION="v1.19.7"
+export KUBERNETES_VERSION="v1.21.2"
 
 # Generate SSH key.
 # If you want to provide your own key, skip this step and set AZURE_SSH_PUBLIC_KEY_B64 to your existing file.
