@@ -18,174 +18,147 @@ package virtualmachines
 
 import (
 	"context"
-	"encoding/json"
+	"time"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2021-04-01/compute"
-	"github.com/Azure/go-autorest/autorest"
-	azureautorest "github.com/Azure/go-autorest/autorest/azure"
-	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
 	"github.com/pkg/errors"
-	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
+	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
-	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/async"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
 )
 
 type (
-	// Client wraps go-sdk.
-	Client interface {
-		Get(context.Context, azure.ResourceSpecGetter) (interface{}, error)
-		CreateOrUpdateAsync(ctx context.Context, spec azure.ResourceSpecGetter, parameters interface{}) (result interface{}, future azureautorest.FutureAPI, err error)
-		DeleteAsync(ctx context.Context, spec azure.ResourceSpecGetter) (future azureautorest.FutureAPI, err error)
-		IsDone(ctx context.Context, future azureautorest.FutureAPI) (isDone bool, err error)
-		Result(ctx context.Context, future azureautorest.FutureAPI, futureType string) (result interface{}, err error)
-	}
-
 	// AzureClient contains the Azure go-sdk Client.
 	AzureClient struct {
-		virtualmachines compute.VirtualMachinesClient
+		virtualmachines *armcompute.VirtualMachinesClient
+		apiCallTimeout  time.Duration
+	}
+
+	// Client provides operations on Azure virtual machine resources.
+	Client interface {
+		Get(context.Context, azure.ResourceSpecGetter) (any, error)
+		CreateOrUpdateAsync(ctx context.Context, spec azure.ResourceSpecGetter, resumeToken string, parameters any) (result any, poller *runtime.Poller[armcompute.VirtualMachinesClientCreateOrUpdateResponse], err error)
+		DeleteAsync(ctx context.Context, spec azure.ResourceSpecGetter, resumeToken string) (poller *runtime.Poller[armcompute.VirtualMachinesClientDeleteResponse], err error)
+		ReapplyAsync(ctx context.Context, spec azure.ResourceSpecGetter, resumeToken string) (poller *runtime.Poller[armcompute.VirtualMachinesClientReapplyResponse], err error)
 	}
 )
 
 var _ Client = &AzureClient{}
 
-// NewClient creates a new VM client from subscription ID.
-func NewClient(auth azure.Authorizer) *AzureClient {
-	c := newVirtualMachinesClient(auth.SubscriptionID(), auth.BaseURI(), auth.Authorizer())
-	return &AzureClient{c}
-}
-
-// newVirtualMachinesClient creates a new VM client from subscription ID.
-func newVirtualMachinesClient(subscriptionID string, baseURI string, authorizer autorest.Authorizer) compute.VirtualMachinesClient {
-	vmClient := compute.NewVirtualMachinesClientWithBaseURI(baseURI, subscriptionID)
-	azure.SetAutoRestClientDefaults(&vmClient.Client, authorizer)
-	return vmClient
+// NewClient creates a VMs client from an authorizer.
+func NewClient(auth azure.Authorizer, apiCallTimeout time.Duration) (*AzureClient, error) {
+	opts, err := azure.ARMClientOptionsForAuth(auth)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create virtualmachines client options")
+	}
+	factory, err := armcompute.NewClientFactory(auth.SubscriptionID(), auth.Token(), opts)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create armcompute client factory")
+	}
+	return &AzureClient{factory.NewVirtualMachinesClient(), apiCallTimeout}, nil
 }
 
 // Get retrieves information about the model view or the instance view of a virtual machine.
-func (ac *AzureClient) Get(ctx context.Context, spec azure.ResourceSpecGetter) (result interface{}, err error) {
+func (ac *AzureClient) Get(ctx context.Context, spec azure.ResourceSpecGetter) (result any, err error) {
 	ctx, _, done := tele.StartSpanWithLogger(ctx, "virtualmachines.AzureClient.Get")
 	defer done()
 
-	return ac.virtualmachines.Get(ctx, spec.ResourceGroupName(), spec.ResourceName(), "")
+	resp, err := ac.virtualmachines.Get(ctx, spec.ResourceGroupName(), spec.ResourceName(), nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp.VirtualMachine, nil
 }
 
 // CreateOrUpdateAsync creates or updates a virtual machine asynchronously.
-// It sends a PUT request to Azure and if accepted without error, the func will return a Future which can be used to track the ongoing
+// It sends a PUT request to Azure and if accepted without error, the func will return a Poller which can be used to track the ongoing
 // progress of the operation.
-func (ac *AzureClient) CreateOrUpdateAsync(ctx context.Context, spec azure.ResourceSpecGetter, parameters interface{}) (result interface{}, future azureautorest.FutureAPI, err error) {
+func (ac *AzureClient) CreateOrUpdateAsync(ctx context.Context, spec azure.ResourceSpecGetter, resumeToken string, parameters any) (result any, poller *runtime.Poller[armcompute.VirtualMachinesClientCreateOrUpdateResponse], err error) {
 	ctx, _, done := tele.StartSpanWithLogger(ctx, "virtualmachines.AzureClient.CreateOrUpdate")
 	defer done()
 
-	vm, ok := parameters.(compute.VirtualMachine)
-	if !ok {
-		return nil, nil, errors.Errorf("%T is not a compute.VirtualMachine", parameters)
+	vm, ok := parameters.(armcompute.VirtualMachine)
+	if !ok && parameters != nil {
+		return nil, nil, errors.Errorf("%T is not an armcompute.VirtualMachine", parameters)
 	}
 
-	createFuture, err := ac.virtualmachines.CreateOrUpdate(ctx, spec.ResourceGroupName(), spec.ResourceName(), vm)
+	opts := &armcompute.VirtualMachinesClientBeginCreateOrUpdateOptions{ResumeToken: resumeToken}
+	poller, err = ac.virtualmachines.BeginCreateOrUpdate(ctx, spec.ResourceGroupName(), spec.ResourceName(), vm, opts)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultAzureCallTimeout)
+	ctx, cancel := context.WithTimeout(ctx, ac.apiCallTimeout)
 	defer cancel()
 
-	err = createFuture.WaitForCompletionRef(ctx, ac.virtualmachines.Client)
+	pollOpts := &runtime.PollUntilDoneOptions{Frequency: async.DefaultPollerFrequency}
+	resp, err := poller.PollUntilDone(ctx, pollOpts)
 	if err != nil {
-		// if an error occurs, return the future.
+		// if an error occurs, return the poller.
 		// this means the long-running operation didn't finish in the specified timeout.
-		return nil, &createFuture, err
+		return nil, poller, err
 	}
-	result, err = createFuture.Result(ac.virtualmachines)
-	// if the operation completed, return a nil future
-	return result, nil, err
+
+	// if the operation completed, return a nil poller
+	return resp.VirtualMachine, nil, err
 }
 
 // DeleteAsync deletes a virtual machine asynchronously. DeleteAsync sends a DELETE
-// request to Azure and if accepted without error, the func will return a Future which can be used to track the ongoing
+// request to Azure and if accepted without error, the func will return a Poller which can be used to track the ongoing
 // progress of the operation.
-func (ac *AzureClient) DeleteAsync(ctx context.Context, spec azure.ResourceSpecGetter) (future azureautorest.FutureAPI, err error) {
+func (ac *AzureClient) DeleteAsync(ctx context.Context, spec azure.ResourceSpecGetter, resumeToken string) (poller *runtime.Poller[armcompute.VirtualMachinesClientDeleteResponse], err error) {
 	ctx, _, done := tele.StartSpanWithLogger(ctx, "virtualmachines.AzureClient.Delete")
 	defer done()
 
-	// TODO: pass variable to force the deletion or not
-	// now we are not forcing.
-	deleteFuture, err := ac.virtualmachines.Delete(ctx, spec.ResourceGroupName(), spec.ResourceName(), to.BoolPtr(false))
+	forceDelete := ptr.To(true)
+	opts := &armcompute.VirtualMachinesClientBeginDeleteOptions{ResumeToken: resumeToken, ForceDeletion: forceDelete}
+	poller, err = ac.virtualmachines.BeginDelete(ctx, spec.ResourceGroupName(), spec.ResourceName(), opts)
 	if err != nil {
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultAzureCallTimeout)
+	ctx, cancel := context.WithTimeout(ctx, ac.apiCallTimeout)
 	defer cancel()
 
-	err = deleteFuture.WaitForCompletionRef(ctx, ac.virtualmachines.Client)
+	pollOpts := &runtime.PollUntilDoneOptions{Frequency: async.DefaultPollerFrequency}
+	_, err = poller.PollUntilDone(ctx, pollOpts)
 	if err != nil {
-		// if an error occurs, return the future.
+		// if an error occurs, return the Poller.
 		// this means the long-running operation didn't finish in the specified timeout.
-		return &deleteFuture, err
+		return poller, err
 	}
-	_, err = deleteFuture.Result(ac.virtualmachines)
-	// if the operation completed, return a nil future.
+
+	// if the operation completed, return a nil poller.
 	return nil, err
 }
 
-// IsDone returns true if the long-running operation has completed.
-func (ac *AzureClient) IsDone(ctx context.Context, future azureautorest.FutureAPI) (isDone bool, err error) {
-	ctx, _, done := tele.StartSpanWithLogger(ctx, "virtualmachines.AzureClient.IsDone")
+// ReapplyAsync reapplies a virtual machine's state asynchronously.
+// It sends a POST request to Azure to reapply the VM, which is useful for recovering from failed provisioning states.
+// If accepted without error, the func will return a Poller which can be used to track the ongoing progress of the operation.
+func (ac *AzureClient) ReapplyAsync(ctx context.Context, spec azure.ResourceSpecGetter, resumeToken string) (poller *runtime.Poller[armcompute.VirtualMachinesClientReapplyResponse], err error) {
+	ctx, _, done := tele.StartSpanWithLogger(ctx, "virtualmachines.AzureClient.Reapply")
 	defer done()
 
-	isDone, err = future.DoneWithContext(ctx, ac.virtualmachines)
+	opts := &armcompute.VirtualMachinesClientBeginReapplyOptions{ResumeToken: resumeToken}
+	poller, err = ac.virtualmachines.BeginReapply(ctx, spec.ResourceGroupName(), spec.ResourceName(), opts)
 	if err != nil {
-		return false, errors.Wrap(err, "failed checking if the operation was complete")
+		return nil, err
 	}
 
-	return isDone, nil
-}
+	ctx, cancel := context.WithTimeout(ctx, ac.apiCallTimeout)
+	defer cancel()
 
-// Result fetches the result of a long-running operation future.
-func (ac *AzureClient) Result(ctx context.Context, future azureautorest.FutureAPI, futureType string) (result interface{}, err error) {
-	_, _, done := tele.StartSpanWithLogger(ctx, "virtualmachines.AzureClient.Result")
-	defer done()
-
-	if future == nil {
-		return nil, errors.Errorf("cannot get result from nil future")
+	pollOpts := &runtime.PollUntilDoneOptions{Frequency: async.DefaultPollerFrequency}
+	_, err = poller.PollUntilDone(ctx, pollOpts)
+	if err != nil {
+		// if an error occurs, return the poller.
+		// this means the long-running operation didn't finish in the specified timeout.
+		return poller, err
 	}
 
-	switch futureType {
-	case infrav1.PatchFuture:
-		// Marshal and Unmarshal the future to put it into the correct future type so we can access the Result function.
-		// Unfortunately the FutureAPI can't be casted directly to VirtualMachinesUpdateFuture because it is a azureautorest.Future, which doesn't implement the Result function. See PR #1686 for discussion on alternatives.
-		// It was converted back to a generic azureautorest.Future from the CAPZ infrav1.Future type stored in Status: https://github.com/kubernetes-sigs/cluster-api-provider-azure/blob/main/azure/converters/futures.go#L49.
-		var updateFuture *compute.VirtualMachinesUpdateFuture
-		jsonData, err := future.MarshalJSON()
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to marshal future")
-		}
-		if err := json.Unmarshal(jsonData, &updateFuture); err != nil {
-			return nil, errors.Wrap(err, "failed to unmarshal future data")
-		}
-		return (*updateFuture).Result(ac.virtualmachines)
-
-	case infrav1.PutFuture:
-		// Marshal and Unmarshal the future to put it into the correct future type so we can access the Result function.
-		// Unfortunately the FutureAPI can't be casted directly to VirtualMachinesCreateOrUpdateFuture because it is a azureautorest.Future, which doesn't implement the Result function. See PR #1686 for discussion on alternatives.
-		// It was converted back to a generic azureautorest.Future from the CAPZ infrav1.Future type stored in Status: https://github.com/kubernetes-sigs/cluster-api-provider-azure/blob/main/azure/converters/futures.go#L49.
-		var createFuture *compute.VirtualMachinesCreateOrUpdateFuture
-		jsonData, err := future.MarshalJSON()
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to marshal future")
-		}
-		if err := json.Unmarshal(jsonData, &createFuture); err != nil {
-			return nil, errors.Wrap(err, "failed to unmarshal future data")
-		}
-		return (*createFuture).Result(ac.virtualmachines)
-
-	case infrav1.DeleteFuture:
-		// Delete does not return a result VM.
-		return nil, nil
-
-	default:
-		return nil, errors.Errorf("unknown future type %q", futureType)
-	}
+	// if the operation completed, return a nil poller.
+	return nil, err
 }

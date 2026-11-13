@@ -5,7 +5,7 @@ metadata:
   namespace: system
   labels:
     control-plane: capz-controller-manager
-    aadpodidbinding: capz-controller-aadpodidentity-selector
+
 spec:
   selector:
     matchLabels:
@@ -15,29 +15,37 @@ spec:
     metadata:
       labels:
         control-plane: capz-controller-manager
-        aadpodidbinding: capz-controller-aadpodidentity-selector
+        azure.workload.identity/use: "true"
       annotations:
-        kubectl.kubernetes.io/default-logs-container: manager
+        kubectl.kubernetes.io/default-container: manager
     spec:
       containers:
         - args:
             - --leader-elect
-            - "--metrics-bind-addr=localhost:8080"
-            - "--feature-gates=MachinePool=${EXP_MACHINE_POOL:=false},AKS=${EXP_AKS:=false}"
+            - "--diagnostics-address=${CAPZ_DIAGNOSTICS_ADDRESS:=:8443}"
+            - "--insecure-diagnostics=${CAPZ_INSECURE_DIAGNOSTICS:=false}"
+            - "--feature-gates=MachinePool=${EXP_MACHINE_POOL:=true},AKSResourceHealth=${EXP_AKS_RESOURCE_HEALTH:=false},EdgeZone=${EXP_EDGEZONE:=false},ASOAPI=${EXP_ASO_API:=true},APIServerILB=${EXP_APISERVER_ILB:=false},SkipMachinePoolModelReconciliation=${EXP_SKIP_MACHINE_POOL_MODEL_RECONCILIATION:=false}"
             - "--v=0"
           image: controller:latest
           imagePullPolicy: Always
           name: manager
+          volumeMounts:
+            - mountPath: /var/run/secrets/azure/tokens
+              name: azure-identity-token
+              readOnly: true
           ports:
             - containerPort: 9440
               name: healthz
+              protocol: TCP
+            - containerPort: 8443
+              name: metrics
               protocol: TCP
           readinessProbe:
             httpGet:
               path: /readyz
               port: healthz
             initialDelaySeconds: 10
-            periodSeconds: 10  
+            periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /healthz
@@ -56,6 +64,35 @@ spec:
           - name: POD_NAMESPACE
             valueFrom:
               fieldRef:
-                fieldPath: metadata.namespace      
+                fieldPath: metadata.namespace
+          - name: POD_UID
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.uid
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            runAsUser: 65532
+            runAsGroup: 65532
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       terminationGracePeriodSeconds: 10
       serviceAccountName: manager
+      tolerations:
+        - effect: NoSchedule
+          key: node-role.kubernetes.io/master
+        - effect: NoSchedule
+          key: node-role.kubernetes.io/control-plane
+      volumes:
+      - name: azure-identity-token
+        projected:
+          defaultMode: 420
+          sources:
+          - serviceAccountToken:
+              audience: api://AzureADTokenExchange
+              expirationSeconds: 3600
+              path: azure-identity-token

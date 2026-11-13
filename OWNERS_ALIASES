@@ -5,21 +5,20 @@ aliases:
     - fabriziopandini
     - justinsb
     - neolit123
-    - timothysc
+    - hakman
+    - sbueringer
   cluster-api-admins:
-    - CecileRobertMichon
-    - vincepri
-  cluster-api-maintainers:
-    - CecileRobertMichon
-    - enxebre
     - fabriziopandini
-    - vincepri
+    - sbueringer
+  cluster-api-maintainers:
+    - chrischdi
+    - fabriziopandini
+    - JoelSpeed
+    - sbueringer
   cluster-api-azure-maintainers:
-    - alexeldeib
-    - CecileRobertMichon
-    - devigned
-    - nader-ziada
-    - shysank
-  cluster-api-azure-reviewers:
-    - juan-lee
+    - bryan-cox
+    - jackfrancis
     - mboersma
+    - nojnhuh
+    - willie-yao
+  cluster-api-azure-reviewers: []

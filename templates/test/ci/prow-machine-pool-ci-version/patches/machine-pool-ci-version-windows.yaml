@@ -6,10 +6,12 @@ metadata:
 spec:
   template:
     image:
-      # we use the 1.23.1 image as a workaround there is no published marketplace image for k8s CI versions.
-      # 1.23.1 binaries and images will get replaced to the desired version by the script in this template.
-      marketplace:
-        publisher: cncf-upstream
-        offer: capi-windows
-        sku: k8s-1dot23dot1-windows-2019-containerd
-        version: "2021.12.16"
+      # we use the latest image as a workaround there is no published marketplace image for k8s CI versions.
+      # latest binaries and images will get replaced to the desired version by the script in this template.
+      computeGallery:
+        gallery: ClusterAPI-f72ceb4f-5159-4c26-a0fe-2ea738f0d019
+        name: capi-win-${WINDOWS_SERVER_VERSION#windows-}-containerd
+        version: latest
+  identity: UserAssigned
+  userAssignedIdentities:
+    - providerID: azure:///subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${CI_RG:=capz-ci}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/${USER_IDENTITY:=cloud-provider-user-identity}

@@ -1,0 +1,31 @@
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: KubeadmControlPlane
+metadata:
+  name: "${CLUSTER_NAME}-control-plane"
+spec:
+  kubeadmConfigSpec:
+    initConfiguration:
+      nodeRegistration:
+        name: '{{ ds.meta_data["local_hostname"] }}'
+        kubeletExtraArgs:
+          cloud-provider: external
+      localAPIEndpoint:
+        bindPort: 6443
+    joinConfiguration:
+      nodeRegistration:
+        name: '{{ ds.meta_data["local_hostname"] }}'
+        kubeletExtraArgs:
+          cloud-provider: external
+      controlPlane:
+        localAPIEndpoint:
+          bindPort: 6443
+    clusterConfiguration:
+      apiServer:
+        timeoutForControlPlane: 20m
+      controllerManager:
+        extraArgs:
+          #required for ipv6 using calico
+          allocate-node-cidrs: "true"
+          cluster-cidr: "10.244.0.0/16,2001:1234:5678:9a40::/58"
+          configure-cloud-routes: "true"
+          cloud-provider: external

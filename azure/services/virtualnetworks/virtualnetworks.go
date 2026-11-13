@@ -18,151 +18,70 @@ package virtualnetworks
 
 import (
 	"context"
-	"fmt"
 
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-02-01/network"
-	"github.com/Azure/go-autorest/autorest/to"
+	asonetworkv1 "github.com/Azure/azure-service-operator/v2/api/network/v1api20201101"
+	"github.com/Azure/azure-service-operator/v2/pkg/common/labels"
 	"github.com/pkg/errors"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/converters"
-	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/aso"
 )
+
+const serviceName = "virtualnetworks"
 
 // VNetScope defines the scope interface for a virtual network service.
 type VNetScope interface {
-	azure.ClusterDescriber
+	aso.Scope
 	Vnet() *infrav1.VnetSpec
-	VNetSpec() azure.VNetSpec
-}
-
-// Service provides operations on Azure resources.
-type Service struct {
-	Scope VNetScope
-	Client
+	VNetSpec() azure.ASOResourceSpecGetter[*asonetworkv1.VirtualNetwork]
+	UpdateSubnetCIDRs(string, []string)
 }
 
 // New creates a new service.
-func New(scope VNetScope) *Service {
-	return &Service{
-		Scope:  scope,
-		Client: NewClient(scope),
-	}
+func New(scope VNetScope) *aso.Service[*asonetworkv1.VirtualNetwork, VNetScope] {
+	svc := aso.NewService[*asonetworkv1.VirtualNetwork](serviceName, scope)
+	svc.Specs = []azure.ASOResourceSpecGetter[*asonetworkv1.VirtualNetwork]{scope.VNetSpec()}
+	svc.ConditionType = infrav1.VNetReadyCondition
+	svc.PostCreateOrUpdateResourceHook = postCreateOrUpdateResourceHook
+	return svc
 }
 
-// Reconcile gets/creates/updates a virtual network.
-func (s *Service) Reconcile(ctx context.Context) error {
-	ctx, log, done := tele.StartSpanWithLogger(ctx, "virtualnetworks.Service.Reconcile")
-	defer done()
+func postCreateOrUpdateResourceHook(ctx context.Context, scope VNetScope, existingVnet *asonetworkv1.VirtualNetwork, err error) error {
+	if err != nil {
+		return err
+	}
 
-	// Following should be created upstream and provided as an input to NewService
-	// A VNet has following dependencies
-	//    * VNet Cidr
-	//    * Control Plane Subnet Cidr
-	//    * Node Subnet Cidr
-	//    * Control Plane NSG
-	//    * Node NSG
-	//    * Node Route Table
-	vnetSpec := s.Scope.VNetSpec()
-	existingVnet, err := s.getExisting(ctx, vnetSpec)
+	vnet := scope.Vnet()
+	vnet.ID = ptr.Deref(existingVnet.Status.Id, "")
+	vnet.Tags = existingVnet.Status.Tags
 
-	switch {
-	case err != nil && !azure.ResourceNotFound(err):
-		return errors.Wrapf(err, "failed to get VNet %s", vnetSpec.Name)
-
-	case err == nil:
-		// vnet already exists, cannot update since it's immutable
-		if !existingVnet.IsManaged(s.Scope.ClusterName()) {
-			log.V(2).Info("Working on custom VNet", "vnet-id", existingVnet.ID)
+	// Update the subnet CIDRs if they already exist.
+	// This makes sure the subnet CIDRs are up to date and there are no validation errors when updating the VNet.
+	// Subnets that are not part of this cluster spec are silently ignored.
+	subnets := &asonetworkv1.VirtualNetworksSubnetList{}
+	err = scope.GetClient().List(ctx, subnets,
+		client.InNamespace(existingVnet.Namespace),
+		client.MatchingLabels{labels.OwnerNameLabel: existingVnet.Name},
+	)
+	if err != nil {
+		return errors.Wrap(err, "failed to list subnets")
+	}
+	for _, subnet := range subnets.Items {
+		statusASOCIDRs := converters.GetSubnetAddresses(subnet)
+		if len(statusASOCIDRs) != 0 {
+			scope.UpdateSubnetCIDRs(subnet.AzureName(), statusASOCIDRs)
 		}
-		existingVnet.DeepCopyInto(s.Scope.Vnet())
-
-	default:
-		log.V(2).Info("creating VNet", "VNet", vnetSpec.Name)
-
-		vnetProperties := network.VirtualNetwork{
-			Tags: converters.TagsToMap(infrav1.Build(infrav1.BuildParams{
-				ClusterName: s.Scope.ClusterName(),
-				Lifecycle:   infrav1.ResourceLifecycleOwned,
-				Name:        to.StringPtr(vnetSpec.Name),
-				Role:        to.StringPtr(infrav1.CommonRole),
-				Additional:  s.Scope.AdditionalTags(),
-			})),
-			Location: to.StringPtr(s.Scope.Location()),
-			VirtualNetworkPropertiesFormat: &network.VirtualNetworkPropertiesFormat{
-				AddressSpace: &network.AddressSpace{
-					AddressPrefixes: &vnetSpec.CIDRs,
-				},
-			},
-		}
-
-		err = s.Client.CreateOrUpdate(ctx, vnetSpec.ResourceGroup, vnetSpec.Name, vnetProperties)
-
-		if err != nil {
-			return errors.Wrapf(err, "failed to create virtual network %s", vnetSpec.Name)
-		}
-		log.V(2).Info("successfully created VNet", "VNet", vnetSpec.Name)
+	}
+	// Only update the vnet's CIDRBlocks when we also updated subnets' since the vnet is created before
+	// subnets to prevent an updated vnet CIDR from invalidating subnet CIDRs that were defaulted and do not
+	// exist yet.
+	if len(subnets.Items) > 0 && existingVnet.Status.AddressSpace != nil {
+		vnet.CIDRBlocks = existingVnet.Status.AddressSpace.AddressPrefixes
 	}
 
 	return nil
-}
-
-// Delete deletes the virtual network with the provided name.
-func (s *Service) Delete(ctx context.Context) error {
-	ctx, log, done := tele.StartSpanWithLogger(ctx, "virtualnetworks.Service.Delete")
-	defer done()
-
-	vnetSpec := s.Scope.VNetSpec()
-	existingVnet, err := s.getExisting(ctx, vnetSpec)
-	if azure.ResourceNotFound(err) {
-		// vnet does not exist, there is nothing to delete
-		return nil
-	}
-
-	if !existingVnet.IsManaged(s.Scope.ClusterName()) {
-		log.V(4).Info("Skipping VNet deletion in custom vnet mode")
-		return nil
-	}
-
-	log.V(2).Info("deleting VNet", "VNet", vnetSpec.Name)
-	err = s.Client.Delete(ctx, vnetSpec.ResourceGroup, vnetSpec.Name)
-	if err != nil {
-		if azure.ResourceGroupNotFound(err) || azure.ResourceNotFound(err) {
-			return nil
-		}
-	}
-	if err != nil {
-		return errors.Wrapf(err, "failed to delete VNet %s in resource group %s", vnetSpec.Name, vnetSpec.ResourceGroup)
-	}
-
-	log.V(2).Info("successfully deleted VNet", "VNet", vnetSpec.Name)
-	return nil
-}
-
-// getExisting provides information about an existing virtual network.
-func (s *Service) getExisting(ctx context.Context, spec azure.VNetSpec) (*infrav1.VnetSpec, error) {
-	ctx, log, done := tele.StartSpanWithLogger(ctx, "virtualnetworks.Service.getExisting")
-	defer done()
-
-	vnet, err := s.Client.Get(ctx, spec.ResourceGroup, spec.Name)
-	if err != nil {
-		if azure.ResourceNotFound(err) {
-			log.V(2).Info(fmt.Sprintf("Resource not found for VNet %q from resource group %q", spec.Name, spec.ResourceGroup))
-			return nil, err
-		}
-		return nil, errors.Wrapf(err, "failed to get VNet %s", spec.Name)
-	}
-	var prefixes []string
-	if vnet.VirtualNetworkPropertiesFormat != nil && vnet.VirtualNetworkPropertiesFormat.AddressSpace != nil {
-		prefixes = to.StringSlice(vnet.VirtualNetworkPropertiesFormat.AddressSpace.AddressPrefixes)
-	}
-
-	return &infrav1.VnetSpec{
-		ResourceGroup: spec.ResourceGroup,
-		ID:            to.String(vnet.ID),
-		Name:          to.String(vnet.Name),
-		CIDRBlocks:    prefixes,
-		Peerings:      s.Scope.Vnet().Peerings,
-		Tags:          converters.MapToTags(vnet.Tags),
-	}, nil
 }

@@ -17,20 +17,22 @@ limitations under the License.
 package loadbalancers
 
 import (
-	"context"
+	"io"
 	"net/http"
+	"strings"
 	"testing"
 
-	"github.com/Azure/go-autorest/autorest"
-	"github.com/Azure/go-autorest/autorest/to"
-	"github.com/golang/mock/gomock"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	. "github.com/onsi/gomega"
+	"go.uber.org/mock/gomock"
+	"k8s.io/utils/ptr"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/async/mock_async"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/loadbalancers/mock_loadbalancers"
 	gomockinternal "sigs.k8s.io/cluster-api-provider-azure/internal/test/matchers/gomock"
+	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
 )
 
 var (
@@ -45,7 +47,7 @@ var (
 		SKU:                  infrav1.SKUStandard,
 		SubnetName:           "my-cp-subnet",
 		BackendPoolName:      "my-publiclb-backendPool",
-		IdleTimeoutInMinutes: to.Int32Ptr(4),
+		IdleTimeoutInMinutes: ptr.To[int32](4),
 		FrontendIPConfigs: []infrav1.FrontendIP{
 			{
 				Name: "my-publiclb-frontEnd",
@@ -55,7 +57,37 @@ var (
 				},
 			},
 		},
-		APIServerPort: 6443,
+		APIServerPort:         6443,
+		APIServerFrontendPort: 6443,
+	}
+
+	fakePublicAPILBSpecWithAdditionalPorts = LBSpec{
+		Name:                 "my-publiclb",
+		ResourceGroup:        "my-rg",
+		SubscriptionID:       "123",
+		ClusterName:          "my-cluster",
+		Location:             "my-location",
+		Role:                 infrav1.APIServerRole,
+		Type:                 infrav1.Public,
+		SKU:                  infrav1.SKUStandard,
+		SubnetName:           "my-cp-subnet",
+		BackendPoolName:      "my-publiclb-backendPool",
+		IdleTimeoutInMinutes: ptr.To[int32](4),
+		FrontendIPConfigs: []infrav1.FrontendIP{
+			{
+				Name: "my-publiclb-frontEnd",
+				PublicIP: &infrav1.PublicIPSpec{
+					Name:    "my-publicip",
+					DNSName: "my-cluster.12345.mydomain.com",
+				},
+			},
+		},
+		APIServerPort:         6443,
+		APIServerFrontendPort: 6443,
+		AdditionalPorts: []infrav1.LoadBalancerPort{{
+			Name: "rke2-agent",
+			Port: 9345,
+		}},
 	}
 
 	fakeInternalAPILBSpec = LBSpec{
@@ -69,11 +101,67 @@ var (
 		SKU:                  infrav1.SKUStandard,
 		SubnetName:           "my-cp-subnet",
 		BackendPoolName:      "my-private-lb-backendPool",
-		IdleTimeoutInMinutes: to.Int32Ptr(4),
+		IdleTimeoutInMinutes: ptr.To[int32](4),
 		FrontendIPConfigs: []infrav1.FrontendIP{
 			{
-				Name:             "my-private-lb-frontEnd",
-				PrivateIPAddress: "10.0.0.10",
+				Name: "my-private-lb-frontEnd",
+				FrontendIPClass: infrav1.FrontendIPClass{
+					PrivateIPAddress: "10.0.0.10",
+				},
+			},
+		},
+		APIServerPort:         6443,
+		APIServerFrontendPort: 6443,
+	}
+
+	fakeInternalAPILBSpecWithZones = LBSpec{
+		Name:                 "my-private-lb",
+		ResourceGroup:        "my-rg",
+		SubscriptionID:       "123",
+		ClusterName:          "my-cluster",
+		Location:             "my-location",
+		Role:                 infrav1.APIServerRole,
+		Type:                 infrav1.Internal,
+		SKU:                  infrav1.SKUStandard,
+		SubnetName:           "my-cp-subnet",
+		BackendPoolName:      "my-private-lb-backendPool",
+		IdleTimeoutInMinutes: ptr.To[int32](4),
+		AvailabilityZones:    []string{"1", "2", "3"},
+		FrontendIPConfigs: []infrav1.FrontendIP{
+			{
+				Name: "my-private-lb-frontEnd",
+				FrontendIPClass: infrav1.FrontendIPClass{
+					PrivateIPAddress: "10.0.0.10",
+				},
+			},
+		},
+		APIServerPort: 6443,
+	}
+
+	// fakePublicAPILBSpecWithZones tests that zones are NOT applied to public LB frontends.
+	// Azure does not allow zones on frontend IP configurations that reference public IP addresses.
+	// Instead, zone-redundancy for public LBs is achieved by setting zones on the public IP itself.
+	// See: https://learn.microsoft.com/en-us/azure/reliability/reliability-load-balancer#zone-redundant-load-balancer
+	fakePublicAPILBSpecWithZones = LBSpec{
+		Name:                 "my-publiclb",
+		ResourceGroup:        "my-rg",
+		SubscriptionID:       "123",
+		ClusterName:          "my-cluster",
+		Location:             "my-location",
+		Role:                 infrav1.APIServerRole,
+		Type:                 infrav1.Public,
+		SKU:                  infrav1.SKUStandard,
+		SubnetName:           "my-cp-subnet",
+		BackendPoolName:      "my-publiclb-backendPool",
+		IdleTimeoutInMinutes: ptr.To[int32](4),
+		AvailabilityZones:    []string{"1", "2", "3"}, // These should NOT be applied to frontend
+		FrontendIPConfigs: []infrav1.FrontendIP{
+			{
+				Name: "my-publiclb-frontEnd",
+				PublicIP: &infrav1.PublicIPSpec{
+					Name:    "my-publicip",
+					DNSName: "my-cluster.12345.mydomain.com",
+				},
 			},
 		},
 		APIServerPort: 6443,
@@ -89,7 +177,7 @@ var (
 		Type:                 infrav1.Public,
 		SKU:                  infrav1.SKUStandard,
 		BackendPoolName:      "my-cluster-outboundBackendPool",
-		IdleTimeoutInMinutes: to.Int32Ptr(30),
+		IdleTimeoutInMinutes: ptr.To[int32](30),
 		FrontendIPConfigs: []infrav1.FrontendIP{
 			{
 				Name: "my-cluster-frontEnd",
@@ -100,7 +188,12 @@ var (
 		},
 	}
 
-	internalError = autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 500}, "Internal Server Error")
+	internalError = &azcore.ResponseError{
+		RawResponse: &http.Response{
+			Body:       io.NopCloser(strings.NewReader("#: Internal Server Error: StatusCode=500")),
+			StatusCode: http.StatusInternalServerError,
+		},
+	}
 )
 
 func TestReconcileLoadBalancer(t *testing.T) {
@@ -110,11 +203,20 @@ func TestReconcileLoadBalancer(t *testing.T) {
 		expect        func(s *mock_loadbalancers.MockLBScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder)
 	}{
 		{
+			name:          "noop if no LBSpecs are found",
+			expectedError: "",
+			expect: func(s *mock_loadbalancers.MockLBScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
+				s.LBSpecs().Return([]azure.ResourceSpecGetter{})
+			},
+		},
+		{
 			name:          "fail to create a public LB",
 			expectedError: "#: Internal Server Error: StatusCode=500",
 			expect: func(s *mock_loadbalancers.MockLBScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
 				s.LBSpecs().Return([]azure.ResourceSpecGetter{&fakePublicAPILBSpec})
-				r.CreateResource(gomockinternal.AContext(), &fakePublicAPILBSpec, serviceName).Return(nil, internalError)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakePublicAPILBSpec, serviceName).Return(nil, internalError)
 				s.UpdatePutStatus(infrav1.LoadBalancersReadyCondition, serviceName, internalError)
 			},
 		},
@@ -122,8 +224,9 @@ func TestReconcileLoadBalancer(t *testing.T) {
 			name:          "create public apiserver LB",
 			expectedError: "",
 			expect: func(s *mock_loadbalancers.MockLBScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
 				s.LBSpecs().Return([]azure.ResourceSpecGetter{&fakePublicAPILBSpec})
-				r.CreateResource(gomockinternal.AContext(), &fakePublicAPILBSpec, serviceName).Return(nil, nil)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakePublicAPILBSpec, serviceName).Return(nil, nil)
 				s.UpdatePutStatus(infrav1.LoadBalancersReadyCondition, serviceName, nil)
 			},
 		},
@@ -131,8 +234,9 @@ func TestReconcileLoadBalancer(t *testing.T) {
 			name:          "create internal apiserver LB",
 			expectedError: "",
 			expect: func(s *mock_loadbalancers.MockLBScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
 				s.LBSpecs().Return([]azure.ResourceSpecGetter{&fakeInternalAPILBSpec})
-				r.CreateResource(gomockinternal.AContext(), &fakeInternalAPILBSpec, serviceName).Return(nil, nil)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakeInternalAPILBSpec, serviceName).Return(nil, nil)
 				s.UpdatePutStatus(infrav1.LoadBalancersReadyCondition, serviceName, nil)
 			},
 		},
@@ -140,8 +244,9 @@ func TestReconcileLoadBalancer(t *testing.T) {
 			name:          "create node outbound LB",
 			expectedError: "",
 			expect: func(s *mock_loadbalancers.MockLBScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
 				s.LBSpecs().Return([]azure.ResourceSpecGetter{&fakeNodeOutboundLBSpec})
-				r.CreateResource(gomockinternal.AContext(), &fakeNodeOutboundLBSpec, serviceName).Return(nil, nil)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakeNodeOutboundLBSpec, serviceName).Return(nil, nil)
 				s.UpdatePutStatus(infrav1.LoadBalancersReadyCondition, serviceName, nil)
 			},
 		},
@@ -149,17 +254,17 @@ func TestReconcileLoadBalancer(t *testing.T) {
 			name:          "create multiple LBs",
 			expectedError: "",
 			expect: func(s *mock_loadbalancers.MockLBScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
 				s.LBSpecs().Return([]azure.ResourceSpecGetter{&fakePublicAPILBSpec, &fakeInternalAPILBSpec, &fakeNodeOutboundLBSpec})
-				r.CreateResource(gomockinternal.AContext(), &fakePublicAPILBSpec, serviceName).Return(nil, nil)
-				r.CreateResource(gomockinternal.AContext(), &fakeInternalAPILBSpec, serviceName).Return(nil, nil)
-				r.CreateResource(gomockinternal.AContext(), &fakeNodeOutboundLBSpec, serviceName).Return(nil, nil)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakePublicAPILBSpec, serviceName).Return(nil, nil)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakeInternalAPILBSpec, serviceName).Return(nil, nil)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakeNodeOutboundLBSpec, serviceName).Return(nil, nil)
 				s.UpdatePutStatus(infrav1.LoadBalancersReadyCondition, serviceName, nil)
 			},
 		},
 	}
 
 	for _, tc := range testcases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 			t.Parallel()
@@ -176,10 +281,10 @@ func TestReconcileLoadBalancer(t *testing.T) {
 				Scope:      scopeMock,
 				Reconciler: asyncMock,
 			}
-			err := s.Reconcile(context.TODO())
+			err := s.Reconcile(t.Context())
 			if tc.expectedError != "" {
 				g.Expect(err).To(HaveOccurred())
-				g.Expect(err).To(MatchError(tc.expectedError))
+				g.Expect(err.Error()).To(ContainSubstring(tc.expectedError))
 			} else {
 				g.Expect(err).NotTo(HaveOccurred())
 			}
@@ -194,9 +299,18 @@ func TestDeleteLoadBalancer(t *testing.T) {
 		expect        func(s *mock_loadbalancers.MockLBScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder)
 	}{
 		{
+			name:          "noop if no LBSpecs are found",
+			expectedError: "",
+			expect: func(s *mock_loadbalancers.MockLBScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
+				s.LBSpecs().Return([]azure.ResourceSpecGetter{})
+			},
+		},
+		{
 			name:          "delete a load balancer",
 			expectedError: "",
 			expect: func(s *mock_loadbalancers.MockLBScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
 				s.LBSpecs().Return([]azure.ResourceSpecGetter{&fakePublicAPILBSpec})
 				r.DeleteResource(gomockinternal.AContext(), &fakePublicAPILBSpec, serviceName).Return(nil)
 				s.UpdateDeleteStatus(infrav1.LoadBalancersReadyCondition, serviceName, nil)
@@ -206,6 +320,7 @@ func TestDeleteLoadBalancer(t *testing.T) {
 			name:          "delete multiple load balancers",
 			expectedError: "",
 			expect: func(s *mock_loadbalancers.MockLBScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
 				s.LBSpecs().Return([]azure.ResourceSpecGetter{&fakePublicAPILBSpec, &fakeInternalAPILBSpec, &fakeNodeOutboundLBSpec})
 				r.DeleteResource(gomockinternal.AContext(), &fakePublicAPILBSpec, serviceName).Return(nil)
 				r.DeleteResource(gomockinternal.AContext(), &fakeInternalAPILBSpec, serviceName).Return(nil)
@@ -217,6 +332,7 @@ func TestDeleteLoadBalancer(t *testing.T) {
 			name:          "load balancer deletion fails",
 			expectedError: "#: Internal Server Error: StatusCode=500",
 			expect: func(s *mock_loadbalancers.MockLBScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
 				s.LBSpecs().Return([]azure.ResourceSpecGetter{&fakePublicAPILBSpec})
 				r.DeleteResource(gomockinternal.AContext(), &fakePublicAPILBSpec, serviceName).Return(internalError)
 				s.UpdateDeleteStatus(infrav1.LoadBalancersReadyCondition, serviceName, internalError)
@@ -225,7 +341,6 @@ func TestDeleteLoadBalancer(t *testing.T) {
 	}
 
 	for _, tc := range testcases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 			t.Parallel()
@@ -243,10 +358,10 @@ func TestDeleteLoadBalancer(t *testing.T) {
 				Reconciler: asyncMock,
 			}
 
-			err := s.Delete(context.TODO())
+			err := s.Delete(t.Context())
 			if tc.expectedError != "" {
 				g.Expect(err).To(HaveOccurred())
-				g.Expect(err).To(MatchError(tc.expectedError))
+				g.Expect(err.Error()).To(ContainSubstring(tc.expectedError))
 			} else {
 				g.Expect(err).NotTo(HaveOccurred())
 			}

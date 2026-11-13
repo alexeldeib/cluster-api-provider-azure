@@ -2,20 +2,28 @@ name: Lint Documentation
 on:
   push:
     paths:
-      - "docs/**"
+      - "**.md"
     branches:
       - main
   pull_request:
-    paths: "docs/**"
+    paths: "**.md"
+permissions:
+  contents: read
+
 jobs:
-  lint_docs:
+  markdown-link-check:
+    name: Broken Links
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-node@v2
-        with:
-          node-version: "14"
-      - name: Install markdown-link-check
-        run: npm install -g markdown-link-check
-      - name: markdown-link-check
-        run: find . -name \*.md | xargs -I{} markdown-link-check -c .markdownlinkcheck.json {}
+    - name: Harden Runner
+      uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+      with:
+        egress-policy: audit
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - uses: tcort/github-action-markdown-link-check@e047c5b37f24ab722bbef1a27b6fab7f96bc4068 # v1.1.3
+      with:
+        use-quiet-mode: 'yes'
+        config-file: .markdownlinkcheck.json

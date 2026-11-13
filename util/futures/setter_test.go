@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	. "github.com/onsi/gomega"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 )
 
@@ -104,7 +105,7 @@ func TestDelete(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			g := NewWithT(t)
 
-			Delete(tt.to, tt.future, testService)
+			Delete(tt.to, tt.future, testService, fakeFutureType)
 
 			g.Expect(tt.to.GetFutures()).To(Equal(tt.want))
 		})

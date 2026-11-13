@@ -28,12 +28,13 @@ import (
 )
 
 type (
-	logEntryMactcher struct {
+	logEntryMatcher struct {
 		level   *int
 		logFunc *string
-		values  []interface{}
+		values  []any
 	}
 
+	// LogMatcher is a Gomega matcher for logs.
 	LogMatcher interface {
 		types.GomegaMatcher
 		WithLevel(int) LogMatcher
@@ -41,48 +42,55 @@ type (
 	}
 
 	cmpMatcher struct {
-		x    interface{}
+		x    any
 		diff string
 	}
 )
 
 // DiffEq will verify cmp.Diff(expected, actual) == "" using github.com/google/go-cmp/cmp.
-func DiffEq(x interface{}) types.GomegaMatcher {
+func DiffEq(x any) types.GomegaMatcher {
 	return &cmpMatcher{
 		x: x,
 	}
 }
 
-func (c *cmpMatcher) Match(actual interface{}) (bool, error) {
+// Match returns whether the actual value matches the expected value.
+func (c *cmpMatcher) Match(actual any) (bool, error) {
 	c.diff = cmp.Diff(actual, c.x)
 	return c.diff == "", nil
 }
 
-func (c *cmpMatcher) FailureMessage(_ interface{}) string {
+// FailWithMessage returns the matcher's diff as the failure message.
+func (c *cmpMatcher) FailureMessage(_ any) string {
 	return c.diff
 }
 
-func (c *cmpMatcher) NegatedFailureMessage(_ interface{}) string {
+// NegatedFailureMessage return the matcher's diff as the negated failure message.
+func (c *cmpMatcher) NegatedFailureMessage(_ any) string {
 	return c.diff
 }
 
-func LogContains(values ...interface{}) LogMatcher {
-	return &logEntryMactcher{
+// LogContains verifies that LogEntry matches the specified values.
+func LogContains(values ...any) LogMatcher {
+	return &logEntryMatcher{
 		values: values,
 	}
 }
 
-func (l *logEntryMactcher) WithLevel(level int) LogMatcher {
+// WithLevel sets the log level to that specified.
+func (l *logEntryMatcher) WithLevel(level int) LogMatcher {
 	l.level = &level
 	return l
 }
 
-func (l *logEntryMactcher) WithLogFunc(logFunc string) LogMatcher {
+// WithLogFunc sets the log function to that specified.
+func (l *logEntryMatcher) WithLogFunc(logFunc string) LogMatcher {
 	l.logFunc = &logFunc
 	return l
 }
 
-func (l *logEntryMactcher) Match(actual interface{}) (bool, error) {
+// Match returns whether the actual value matches the expected value.
+func (l *logEntryMatcher) Match(actual any) (bool, error) {
 	logEntry, ok := actual.(record.LogEntry)
 	if !ok {
 		return false, fmt.Errorf("LogContains matcher expects an record.LogEntry")
@@ -90,15 +98,17 @@ func (l *logEntryMactcher) Match(actual interface{}) (bool, error) {
 	return len(l.validate(logEntry)) == 0, nil
 }
 
-func (l *logEntryMactcher) FailureMessage(actual interface{}) string {
+// FailureMessage returns the specified value as a failure message.
+func (l *logEntryMatcher) FailureMessage(actual any) string {
 	return failMessage(l.validate(actual))
 }
 
-func (l *logEntryMactcher) NegatedFailureMessage(actual interface{}) string {
+// NegatedFailureMessage returns the specified value as a negated failure message.
+func (l *logEntryMatcher) NegatedFailureMessage(actual any) string {
 	return failMessage(l.validate(actual))
 }
 
-func (l *logEntryMactcher) validate(actual interface{}) []error {
+func (l *logEntryMatcher) validate(actual any) []error {
 	logEntry, ok := actual.(record.LogEntry)
 	if !ok {
 		return []error{fmt.Errorf("expected record.LogEntry, but got %T", actual)}
@@ -116,7 +126,7 @@ func (l *logEntryMactcher) validate(actual interface{}) []error {
 	}
 
 	if l.level != nil && *l.level != logEntry.Level {
-		errs = append(errs, fmt.Errorf("actual log level %q didn't match expected %q", logEntry.Level, *l.level))
+		errs = append(errs, fmt.Errorf("actual log level %d didn't match expected %d", logEntry.Level, *l.level))
 	}
 
 	return errs

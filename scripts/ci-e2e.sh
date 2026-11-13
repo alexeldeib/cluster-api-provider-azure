@@ -17,7 +17,7 @@
 ###############################################################################
 
 # This script is executed by presubmit `pull-cluster-api-provider-azure-e2e`
-# To run locally, set AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_SUBSCRIPTION_ID, AZURE_TENANT_ID
+# To run locally, set AZURE_CLIENT_ID, AZURE_SUBSCRIPTION_ID, AZURE_TENANT_ID
 
 set -o errexit
 set -o nounset
@@ -26,69 +26,78 @@ set -o pipefail
 # Install kubectl
 REPO_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
 KUBECTL="${REPO_ROOT}/hack/tools/bin/kubectl"
-cd "${REPO_ROOT}" && make "${KUBECTL##*/}"
+KIND="${REPO_ROOT}/hack/tools/bin/kind"
+make --directory="${REPO_ROOT}" "${KUBECTL##*/}" "${KIND##*/}"
 
 # shellcheck source=hack/ensure-go.sh
 source "${REPO_ROOT}/hack/ensure-go.sh"
-# shellcheck source=hack/ensure-kind.sh
-source "${REPO_ROOT}/hack/ensure-kind.sh"
 # shellcheck source=hack/ensure-tags.sh
 source "${REPO_ROOT}/hack/ensure-tags.sh"
-# shellcheck source=hack/parse-prow-creds.sh
-source "${REPO_ROOT}/hack/parse-prow-creds.sh"
+# shellcheck source=hack/util.sh
+source "${REPO_ROOT}/hack/util.sh"
 
 # Verify the required Environment Variables are present.
-: "${AZURE_SUBSCRIPTION_ID:?Environment variable empty or not defined.}"
-: "${AZURE_TENANT_ID:?Environment variable empty or not defined.}"
-: "${AZURE_CLIENT_ID:?Environment variable empty or not defined.}"
-: "${AZURE_CLIENT_SECRET:?Environment variable empty or not defined.}"
+capz::util::ensure_azure_envs
 
-get_random_region() {
-    local REGIONS=("eastus" "eastus2" "northcentralus" "northeurope" "uksouth" "westeurope" "westus2")
-    echo "${REGIONS[${RANDOM} % ${#REGIONS[@]}]}"
-}
+export USE_LOCAL_KIND_REGISTRY=${USE_LOCAL_KIND_REGISTRY:-"true"}
+export BUILD_MANAGER_IMAGE=${BUILD_MANAGER_IMAGE:-"true"}
 
-export LOCAL_ONLY=${LOCAL_ONLY:-"true"}
-
-if [[ "${LOCAL_ONLY}" == "false" ]]; then
+if [[ "${USE_LOCAL_KIND_REGISTRY}" == "false" ]]; then
   : "${REGISTRY:?Environment variable empty or not defined.}"
   "${REPO_ROOT}/hack/ensure-acr-login.sh"
 else
   export REGISTRY="localhost:5000/ci-e2e"
 fi
 
-defaultTag=$(date -u '+%Y%m%d%H%M%S')
-export TAG="${defaultTag:-dev}"
-export GINKGO_NODES=3
-
-export AZURE_LOCATION="${AZURE_LOCATION:-$(get_random_region)}"
-export AZURE_CONTROL_PLANE_MACHINE_TYPE="${AZURE_CONTROL_PLANE_MACHINE_TYPE:-"Standard_D2s_v3"}"
-export AZURE_NODE_MACHINE_TYPE="${AZURE_NODE_MACHINE_TYPE:-"Standard_D2s_v3"}"
-export KIND_EXPERIMENTAL_DOCKER_NETWORK="bridge"
-
-# Generate SSH key.
-AZURE_SSH_PUBLIC_KEY_FILE=${AZURE_SSH_PUBLIC_KEY_FILE:-""}
-if [ -z "${AZURE_SSH_PUBLIC_KEY_FILE}" ]; then
-    echo "generating sshkey for e2e"
-    SSH_KEY_FILE=.sshkey
-    rm -f "${SSH_KEY_FILE}" 2>/dev/null
-    ssh-keygen -t rsa -b 2048 -f "${SSH_KEY_FILE}" -N '' 1>/dev/null
-    AZURE_SSH_PUBLIC_KEY_FILE="${SSH_KEY_FILE}.pub"
+if [[ "${BUILD_MANAGER_IMAGE}" == "true" ]]; then
+  defaultTag=$(date -u '+%Y%m%d%H%M%S')
+  export TAG="${defaultTag:-dev}"
 fi
-AZURE_SSH_PUBLIC_KEY_B64=$(base64 "${AZURE_SSH_PUBLIC_KEY_FILE}" | tr -d '\r\n')
-export AZURE_SSH_PUBLIC_KEY_B64
-# Windows sets the public key via cloudbase-init which take the raw text as input
-AZURE_SSH_PUBLIC_KEY=$(tr -d '\r\n' < "${AZURE_SSH_PUBLIC_KEY_FILE}")
-export AZURE_SSH_PUBLIC_KEY
 
-cleanup() {
+if [[ "$(capz::util::should_build_ccm)" == "true" ]]; then
+  # shellcheck source=scripts/ci-build-azure-ccm.sh
+  source "${REPO_ROOT}/scripts/ci-build-azure-ccm.sh"
+  echo "Will use the ${IMAGE_REGISTRY}/${CCM_IMAGE_NAME}:${IMAGE_TAG_CCM} cloud-controller-manager image for external cloud-provider-cluster"
+  echo "Will use the ${IMAGE_REGISTRY}/${CNM_IMAGE_NAME}:${IMAGE_TAG_CNM} cloud-node-manager image for external cloud-provider-azure cluster"
+fi
+
+export GINKGO_NODES=10
+
+export AZURE_LOCATION="${AZURE_LOCATION:-$(capz::util::get_random_region)}"
+export AZURE_LOCATION_GPU="${AZURE_LOCATION_GPU:-$(capz::util::get_random_region_gpu)}"
+export AZURE_LOCATION_EDGEZONE="${AZURE_LOCATION_EDGEZONE:-$(capz::util::get_random_region_edgezone)}"
+export AZURE_CONTROL_PLANE_MACHINE_TYPE="${AZURE_CONTROL_PLANE_MACHINE_TYPE:-"Standard_D2s_v3"}"
+export AZURE_NODE_MACHINE_TYPE="${AZURE_NODE_MACHINE_TYPE:-"Standard_B2s"}"
+CALICO_VERSION=$(make get-calico-version)
+export CALICO_VERSION
+AZWI_RESOURCE_GROUP="${AZWI_RESOURCE_GROUP:-capz-wi-$(capz::util::random_suffix)}"
+export AZWI_RESOURCE_GROUP
+export WINDOWS_SERVER_VERSION="${WINDOWS_SERVER_VERSION:-windows-2022}"
+
+
+capz::util::generate_ssh_key
+
+capz::ci-e2e::cleanup() {
     "${REPO_ROOT}/hack/log/redact.sh" || true
+    make test-e2e-run-cleanup || true
 }
 
-trap cleanup EXIT
-
-if [[ "${LOCAL_ONLY}" == "true" ]]; then
-  make test-e2e-local
+trap capz::ci-e2e::cleanup EXIT
+# Image is configured as `${CONTROLLER_IMG}-${ARCH}:${TAG}` where `CONTROLLER_IMG` is defaulted to `${REGISTRY}/${IMAGE_NAME}`.
+if [[ "${BUILD_MANAGER_IMAGE}" == "false" ]]; then
+  # Load an existing image, skip docker-build and docker-push.
+  if [[ -n "${CUSTOM_MANAGER_IMAGE:-}" ]]; then
+    # Use custom image format when CUSTOM_MANAGER_IMAGE is set
+    export MANAGER_IMAGE="${CUSTOM_MANAGER_IMAGE}"
+    make test-e2e-custom-image
+  else
+    # Use default image format
+    make test-e2e-skip-build-and-push
+  fi
+elif [[ "${USE_LOCAL_KIND_REGISTRY}" == "true" ]]; then
+  # Build an image with kind local registry, skip docker-push. REGISTRY is set to `localhost:5000/ci-e2e`. TAG is set to `$(date -u '+%Y%m%d%H%M%S')`.
+  make test-e2e-skip-push
 else
+  # Build an image and push to the registry. TAG is set to `$(date -u '+%Y%m%d%H%M%S')`.
   make test-e2e
 fi

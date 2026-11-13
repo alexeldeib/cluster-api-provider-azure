@@ -17,15 +17,17 @@ limitations under the License.
 package resourceskus
 
 import (
+	"math"
 	"strconv"
 	"strings"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2021-04-01/compute"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
 	"github.com/pkg/errors"
+	"k8s.io/utils/ptr"
 )
 
 // SKU is a thin layer over the Azure resource SKU API to better introspect capabilities.
-type SKU compute.ResourceSku
+type SKU armcompute.ResourceSKU
 
 // ResourceType models available resource types as a set of known string constants.
 type ResourceType string
@@ -54,7 +56,7 @@ const (
 	EphemeralOSDisk = "EphemeralOSDiskSupported"
 	// AcceleratedNetworking identifies the capability for accelerated networking support.
 	AcceleratedNetworking = "AcceleratedNetworkingEnabled"
-	//VCPUs identifies the capability for the number of vCPUS.
+	// VCPUs identifies the capability for the number of vCPUS.
 	VCPUs = "vCPUs"
 	// MemoryGB identifies the capability for memory Size.
 	MemoryGB = "MemoryGB"
@@ -68,6 +70,12 @@ const (
 	MaximumPlatformFaultDomainCount = "MaximumPlatformFaultDomainCount"
 	// UltraSSDAvailable identifies the capability for the support of UltraSSD data disks.
 	UltraSSDAvailable = "UltraSSDAvailable"
+	// TrustedLaunchDisabled identifies the absence of the trusted launch capability.
+	TrustedLaunchDisabled = "TrustedLaunchDisabled"
+	// ConfidentialComputingType identifies the capability for confidentical computing.
+	ConfidentialComputingType = "ConfidentialComputingType"
+	// CPUArchitectureType identifies the capability for cpu architecture.
+	CPUArchitectureType = "CpuArchitectureType"
 )
 
 // HasCapability return true for a capability which can be either
@@ -76,7 +84,7 @@ const (
 // "AcceleratedNetworkingEnabled", and "RdmaEnabled".
 func (s SKU) HasCapability(name string) bool {
 	if s.Capabilities != nil {
-		for _, capability := range *s.Capabilities {
+		for _, capability := range s.Capabilities {
 			if capability.Name != nil && *capability.Name == name {
 				if capability.Value != nil && strings.EqualFold(*capability.Value, string(CapabilitySupported)) {
 					return true
@@ -100,15 +108,16 @@ func (s SKU) HasCapabilityWithCapacity(name string, value int64) (bool, error) {
 		return false, nil
 	}
 
-	for _, capability := range *s.Capabilities {
+	for _, capability := range s.Capabilities {
 		if capability.Name == nil || *capability.Name != name || capability.Value == nil {
 			continue
 		}
 
-		intVal, err := strconv.ParseInt(*capability.Value, 10, 64)
+		floatVal, err := strconv.ParseFloat(*capability.Value, 64)
 		if err != nil {
-			return false, errors.Wrapf(err, "failed to parse string '%s' as int64", *capability.Value)
+			return false, errors.Wrapf(err, "failed to parse string '%s' as float", *capability.Value)
 		}
+		intVal := int64(math.Round(floatVal))
 
 		if intVal >= value {
 			return true, nil
@@ -122,7 +131,7 @@ func (s SKU) HasCapabilityWithCapacity(name string, value int64) (bool, error) {
 // Eg. MaximumPlatformFaultDomainCount -> "3" will return "3" for the capability "MaximumPlatformFaultDomainCount".
 func (s SKU) GetCapability(name string) (string, bool) {
 	if s.Capabilities != nil {
-		for _, capability := range *s.Capabilities {
+		for _, capability := range s.Capabilities {
 			if capability.Name != nil && *capability.Name == name {
 				return *capability.Value, true
 			}
@@ -137,27 +146,30 @@ func (s SKU) HasLocationCapability(capabilityName, location, zone string) bool {
 		return false
 	}
 
-	for _, info := range *s.LocationInfo {
+	for _, info := range s.LocationInfo {
 		if info.Location == nil || *info.Location != location || info.ZoneDetails == nil {
 			continue
 		}
 
-		for _, zoneDetail := range *info.ZoneDetails {
+		for _, zoneDetail := range info.ZoneDetails {
 			if zoneDetail.Capabilities == nil {
 				continue
 			}
 
-			for _, capability := range *zoneDetail.Capabilities {
+			for _, capability := range zoneDetail.Capabilities {
 				if capability.Name != nil && *capability.Name == capabilityName {
+					// If capability is not limited to specific zones, return true
 					if zoneDetail.Name == nil {
-						return false
+						return true
 					}
 
-					for _, name := range *zoneDetail.Name {
-						if name == zone {
+					// Otherwise, we need to check listed zones to verify capability is available
+					for _, name := range zoneDetail.Name {
+						if ptr.Deref(name, "") == zone {
 							return true
 						}
 					}
+
 					return false
 				}
 			}

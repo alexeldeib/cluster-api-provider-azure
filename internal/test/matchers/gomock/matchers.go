@@ -20,14 +20,14 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/golang/mock/gomock"
 	"github.com/google/go-cmp/cmp"
 	"github.com/onsi/gomega/types"
+	"go.uber.org/mock/gomock"
 )
 
 type (
 	cmpMatcher struct {
-		x    interface{}
+		x    any
 		diff string
 	}
 
@@ -37,9 +37,10 @@ type (
 	}
 
 	contextMatcher struct {
-		actual interface{}
+		actual any
 	}
 
+	// LogMatcher is a Gomega matcher for logs.
 	LogMatcher interface {
 		types.GomegaMatcher
 		WithLevel(int) LogMatcher
@@ -47,20 +48,20 @@ type (
 	}
 
 	customMatcher struct {
-		state    map[string]interface{}
-		matcher  func(x interface{}, state map[string]interface{}) bool
-		stringer func(state map[string]interface{}) string
+		state    map[string]any
+		matcher  func(x any, state map[string]any) bool
+		stringer func(state map[string]any) string
 	}
 )
 
-// DiffEq will verify cmp.Diff(expected, actual) == "" using github.com/google/go-cmp/cmp
-func DiffEq(x interface{}) gomock.Matcher {
+// DiffEq will verify cmp.Diff(expected, actual) == "" using github.com/google/go-cmp/cmp.
+func DiffEq(x any) gomock.Matcher {
 	return &cmpMatcher{
 		x: x,
 	}
 }
 
-func (c *cmpMatcher) Matches(x interface{}) bool {
+func (c *cmpMatcher) Matches(x any) bool {
 	c.diff = cmp.Diff(x, c.x)
 	return c.diff == ""
 }
@@ -73,14 +74,14 @@ func (c *cmpMatcher) String() string {
 	return want
 }
 
-// ErrStrEq will verify the string matches error.Error()
+// ErrStrEq will verify the string matches error.Error().
 func ErrStrEq(expected string) gomock.Matcher {
 	return &errStrEq{
 		expected: expected,
 	}
 }
 
-func (e *errStrEq) Matches(y interface{}) bool {
+func (e *errStrEq) Matches(y any) bool {
 	err, ok := y.(error)
 	if !ok {
 		return false
@@ -93,11 +94,12 @@ func (e *errStrEq) String() string {
 	return fmt.Sprintf("error.Error() %q, but got %q", e.expected, e.actual)
 }
 
+// AContext returns a matcher that matches a context.Context.
 func AContext() gomock.Matcher {
 	return &contextMatcher{}
 }
 
-func (e *contextMatcher) Matches(y interface{}) bool {
+func (e *contextMatcher) Matches(y any) bool {
 	_, ok := y.(context.Context)
 	e.actual = y
 	return ok
@@ -107,16 +109,16 @@ func (e *contextMatcher) String() string {
 	return fmt.Sprintf("expected a context.Context, but got %T", e.actual)
 }
 
-// CustomMatcher creates a matcher from two funcs rather than having to make a new struct and implement Matcher
-func CustomMatcher(matcher func(x interface{}, state map[string]interface{}) bool, stringer func(state map[string]interface{}) string) gomock.Matcher {
+// CustomMatcher creates a matcher from two funcs rather than having to make a new struct and implement Matcher.
+func CustomMatcher(matcher func(x any, state map[string]any) bool, stringer func(state map[string]any) string) gomock.Matcher {
 	return &customMatcher{
-		state:    make(map[string]interface{}),
+		state:    make(map[string]any),
 		matcher:  matcher,
 		stringer: stringer,
 	}
 }
 
-func (c customMatcher) Matches(x interface{}) bool {
+func (c customMatcher) Matches(x any) bool {
 	return c.matcher(x, c.state)
 }
 

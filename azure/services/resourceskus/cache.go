@@ -24,8 +24,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2021-04-01/compute"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
 	"github.com/pkg/errors"
+	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/util/cache/ttllru"
@@ -45,13 +46,13 @@ type Cache struct {
 
 	// data is the cached sku information from Azure.
 	// synchronization required if data is cached across reconcile calls, (i.e., refreshed in background as Runnable via mgr.Add(...))
-	data []compute.ResourceSku
+	data []armcompute.ResourceSKU
 }
 
 // Cacher describes the ability to get and to add items to cache.
 type Cacher interface {
-	Get(key interface{}) (value interface{}, ok bool)
-	Add(key interface{}, value interface{}) bool
+	Get(key any) (value any, ok bool)
+	Add(key any, value any) bool
 }
 
 // NewCacheFunc allows for mocking out the underlying client.
@@ -64,11 +65,15 @@ var (
 )
 
 // newCache instantiates a cache and initializes its contents.
-func newCache(auth azure.Authorizer, location string) *Cache {
-	return &Cache{
-		client:   NewClient(auth),
-		location: location,
+func newCache(auth azure.Authorizer, location string) (*Cache, error) {
+	cli, err := NewClient(auth)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create resourceskus client")
 	}
+	return &Cache{
+		client:   cli,
+		location: location,
+	}, nil
 }
 
 // GetCache either creates a new SKUs cache or returns an existing one based on the location + Authorizer HashKey().
@@ -88,13 +93,16 @@ func GetCache(auth azure.Authorizer, location string) (*Cache, error) {
 		return c.(*Cache), nil
 	}
 
-	c = newCache(auth, location)
+	c, err = newCache(auth, location)
+	if err != nil {
+		return nil, err
+	}
 	_ = clientCache.Add(key, c)
 	return c.(*Cache), nil
 }
 
 // NewStaticCache initializes a cache with data and no ability to refresh. Used for testing.
-func NewStaticCache(data []compute.ResourceSku, location string) *Cache {
+func NewStaticCache(data []armcompute.ResourceSKU, location string) *Cache {
 	return &Cache{
 		data:     data,
 		location: location,
@@ -169,39 +177,40 @@ func (c *Cache) GetZones(ctx context.Context, location string) ([]string, error)
 		// Look for VMs only
 		if sku.ResourceType != nil && strings.EqualFold(*sku.ResourceType, string(VirtualMachines)) {
 			// find matching location
-			for _, locationInfo := range *sku.LocationInfo {
-				if strings.EqualFold(*locationInfo.Location, location) {
-					// Use map for easy deletion and iteration
-					availableZones := make(map[string]bool)
+			for _, locationInfo := range sku.LocationInfo {
+				if !strings.EqualFold(*locationInfo.Location, location) {
+					continue
+				}
+				// Use map for easy deletion and iteration
+				availableZones := make(map[string]bool)
 
-					// add all zones
-					for _, zone := range *locationInfo.Zones {
-						availableZones[zone] = true
-					}
+				// add all zones
+				for _, zone := range locationInfo.Zones {
+					availableZones[*zone] = true
+				}
 
-					if sku.Restrictions != nil {
-						for _, restriction := range *sku.Restrictions {
-							// Can't deploy anything in this subscription in this location. Bail out.
-							if restriction.Type == compute.ResourceSkuRestrictionsTypeLocation {
-								availableZones = nil
-								break
-							}
+				if sku.Restrictions != nil {
+					for _, restriction := range sku.Restrictions {
+						// Can't deploy anything in this subscription in this location. Bail out.
+						if ptr.Deref(restriction.Type, "") == armcompute.ResourceSKURestrictionsTypeLocation {
+							availableZones = nil
+							break
+						}
 
-							// remove restricted zones
-							for _, restrictedZone := range *restriction.RestrictionInfo.Zones {
-								delete(availableZones, restrictedZone)
-							}
+						// remove restricted zones
+						for _, restrictedZone := range restriction.RestrictionInfo.Zones {
+							delete(availableZones, *restrictedZone)
 						}
 					}
-
-					// add to global list, if any exist. it's okay for the final list to be empty.
-					// that means the region may not support AZ yet.
-					for zone := range availableZones {
-						allZones[zone] = true
-					}
-
-					break
 				}
+
+				// add to global list, if any exist. it's okay for the final list to be empty.
+				// that means the region may not support AZ yet.
+				for zone := range availableZones {
+					allZones[zone] = true
+				}
+
+				break
 			}
 		}
 	}
@@ -230,39 +239,40 @@ func (c *Cache) GetZonesWithVMSize(ctx context.Context, size, location string) (
 	mapFn := func(sku SKU) {
 		if sku.Name != nil && strings.EqualFold(*sku.Name, size) && sku.ResourceType != nil && strings.EqualFold(*sku.ResourceType, string(VirtualMachines)) {
 			// find matching location
-			for _, locationInfo := range *sku.LocationInfo {
-				if strings.EqualFold(*locationInfo.Location, location) {
-					// Use map for easy deletion and iteration
-					availableZones := make(map[string]bool)
+			for _, locationInfo := range sku.LocationInfo {
+				if !strings.EqualFold(*locationInfo.Location, location) {
+					continue
+				}
+				// Use map for easy deletion and iteration
+				availableZones := make(map[string]bool)
 
-					// add all zones
-					for _, zone := range *locationInfo.Zones {
-						availableZones[zone] = true
-					}
+				// add all zones
+				for _, zone := range locationInfo.Zones {
+					availableZones[*zone] = true
+				}
 
-					if sku.Restrictions != nil {
-						for _, restriction := range *sku.Restrictions {
-							// Can't deploy anything in this subscription in this location. Bail out.
-							if restriction.Type == compute.ResourceSkuRestrictionsTypeLocation {
-								availableZones = nil
-								break
-							}
+				if sku.Restrictions != nil {
+					for _, restriction := range sku.Restrictions {
+						// Can't deploy anything in this subscription in this location. Bail out.
+						if ptr.Deref(restriction.Type, "") == armcompute.ResourceSKURestrictionsTypeLocation {
+							availableZones = nil
+							break
+						}
 
-							// remove restricted zones
-							for _, restrictedZone := range *restriction.RestrictionInfo.Zones {
-								delete(availableZones, restrictedZone)
-							}
+						// remove restricted zones
+						for _, restrictedZone := range restriction.RestrictionInfo.Zones {
+							delete(availableZones, *restrictedZone)
 						}
 					}
-
-					// add to global list, if any exist. it's okay for the final list to be empty.
-					// that means the region may not support AZ yet.
-					for zone := range availableZones {
-						allZones[zone] = true
-					}
-
-					break
 				}
+
+				// add to global list, if any exist. it's okay for the final list to be empty.
+				// that means the region may not support AZ yet.
+				for zone := range availableZones {
+					allZones[zone] = true
+				}
+
+				break
 			}
 		}
 	}

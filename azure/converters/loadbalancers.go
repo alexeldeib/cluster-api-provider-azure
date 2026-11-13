@@ -17,15 +17,15 @@ limitations under the License.
 package converters
 
 import (
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-02-01/network"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v4"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 )
 
-// SKUtoSDK converts infrav1.SKU into a network.LoadBalancerSkuName.
-func SKUtoSDK(src infrav1.SKU) network.LoadBalancerSkuName {
-	switch src {
-	case infrav1.SKUStandard:
-		return network.LoadBalancerSkuNameStandard
+// SKUtoSDK converts infrav1.SKU into an armnetwork.LoadBalancerSKUName.
+func SKUtoSDK(src infrav1.SKU) armnetwork.LoadBalancerSKUName {
+	if src == infrav1.SKUStandard {
+		return armnetwork.LoadBalancerSKUNameStandard
 	}
 	return ""
 }

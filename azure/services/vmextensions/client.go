@@ -18,70 +18,105 @@ package vmextensions
 
 import (
 	"context"
+	"time"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2021-04-01/compute"
-	"github.com/Azure/go-autorest/autorest"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
+	"github.com/pkg/errors"
+
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/async"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
 )
 
-// client wraps go-sdk.
-type client interface {
-	Get(ctx context.Context, resourceGroupName, vmName, name string) (compute.VirtualMachineExtension, error)
-	CreateOrUpdateAsync(context.Context, string, string, string, compute.VirtualMachineExtension) error
-	Delete(context.Context, string, string, string) error
-}
-
 // azureClient contains the Azure go-sdk Client.
 type azureClient struct {
-	vmextensions compute.VirtualMachineExtensionsClient
+	vmextensions   *armcompute.VirtualMachineExtensionsClient
+	apiCallTimeout time.Duration
 }
 
-var _ client = (*azureClient)(nil)
-
-// newClient creates a new VM client from subscription ID.
-func newClient(auth azure.Authorizer) *azureClient {
-	c := newVirtualMachineExtensionsClient(auth.SubscriptionID(), auth.BaseURI(), auth.Authorizer())
-	return &azureClient{c}
-}
-
-// newVirtualMachineExtensionsClient creates a new vm extension client from subscription ID.
-func newVirtualMachineExtensionsClient(subscriptionID string, baseURI string, authorizer autorest.Authorizer) compute.VirtualMachineExtensionsClient {
-	vmextensionsClient := compute.NewVirtualMachineExtensionsClientWithBaseURI(baseURI, subscriptionID)
-	azure.SetAutoRestClientDefaults(&vmextensionsClient.Client, authorizer)
-	return vmextensionsClient
-}
-
-// Get the virtual machine extension.
-func (ac *azureClient) Get(ctx context.Context, resourceGroupName, vmName, name string) (compute.VirtualMachineExtension, error) {
-	ctx, _, done := tele.StartSpanWithLogger(ctx, "vmextensions.AzureClient.Get")
-	defer done()
-
-	return ac.vmextensions.Get(ctx, resourceGroupName, vmName, name, "")
-}
-
-// CreateOrUpdateAsync creates or updates the virtual machine extension.
-func (ac *azureClient) CreateOrUpdateAsync(ctx context.Context, resourceGroupName, vmName, name string, parameters compute.VirtualMachineExtension) error {
-	ctx, _, done := tele.StartSpanWithLogger(ctx, "vmextensions.AzureClient.CreateOrUpdate")
-	defer done()
-
-	_, err := ac.vmextensions.CreateOrUpdate(ctx, resourceGroupName, vmName, name, parameters)
-	return err
-}
-
-// Delete removes the virtual machine extension.
-func (ac *azureClient) Delete(ctx context.Context, resourceGroupName, vmName, name string) error {
-	ctx, _, done := tele.StartSpanWithLogger(ctx, "vmextensions.AzureClient.Delete")
-	defer done()
-
-	future, err := ac.vmextensions.Delete(ctx, resourceGroupName, vmName, name)
+// newClient creates a new vm extensions client from an authorizer.
+func newClient(auth azure.Authorizer, apiCallTimeout time.Duration) (*azureClient, error) {
+	opts, err := azure.ARMClientOptionsForAuth(auth)
 	if err != nil {
-		return err
+		return nil, errors.Wrap(err, "failed to create virtualmachineextensions client options")
 	}
-	err = future.WaitForCompletionRef(ctx, ac.vmextensions.Client)
+	factory, err := armcompute.NewClientFactory(auth.SubscriptionID(), auth.Token(), opts)
 	if err != nil {
-		return err
+		return nil, errors.Wrap(err, "failed to create armcompute client factory")
 	}
-	_, err = future.Result(ac.vmextensions)
-	return err
+	return &azureClient{factory.NewVirtualMachineExtensionsClient(), apiCallTimeout}, nil
+}
+
+// Get the specified virtual machine extension.
+func (ac *azureClient) Get(ctx context.Context, spec azure.ResourceSpecGetter) (result any, err error) {
+	ctx, _, done := tele.StartSpanWithLogger(ctx, "vmextensions.azureClient.Get")
+	defer done()
+
+	resp, err := ac.vmextensions.Get(ctx, spec.ResourceGroupName(), spec.OwnerResourceName(), spec.ResourceName(), nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp.VirtualMachineExtension, nil
+}
+
+// CreateOrUpdateAsync creates or updates a VM extension asynchronously.
+// It sends a PUT request to Azure and if accepted without error, the func will return a Poller which can be used to track the ongoing
+// progress of the operation.
+func (ac *azureClient) CreateOrUpdateAsync(ctx context.Context, spec azure.ResourceSpecGetter, resumeToken string, parameters any) (result any, poller *runtime.Poller[armcompute.VirtualMachineExtensionsClientCreateOrUpdateResponse], err error) {
+	ctx, _, done := tele.StartSpanWithLogger(ctx, "vmextensions.azureClient.CreateOrUpdateAsync")
+	defer done()
+
+	vmextension, ok := parameters.(armcompute.VirtualMachineExtension)
+	if !ok && parameters != nil {
+		return nil, nil, errors.Errorf("%T is not an armcompute.VirtualMachineExtension", parameters)
+	}
+
+	opts := &armcompute.VirtualMachineExtensionsClientBeginCreateOrUpdateOptions{ResumeToken: resumeToken}
+	poller, err = ac.vmextensions.BeginCreateOrUpdate(ctx, spec.ResourceGroupName(), spec.OwnerResourceName(), spec.ResourceName(), vmextension, opts)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, ac.apiCallTimeout)
+	defer cancel()
+
+	pollOpts := &runtime.PollUntilDoneOptions{Frequency: async.DefaultPollerFrequency}
+	resp, err := poller.PollUntilDone(ctx, pollOpts)
+	if err != nil {
+		// if an error occurs, return the poller.
+		// this means the long-running operation didn't finish in the specified timeout.
+		return nil, poller, err
+	}
+
+	// if the operation completed, return a nil poller
+	return resp.VirtualMachineExtension, nil, err
+}
+
+// DeleteAsync deletes a VM extension asynchronously. DeleteAsync sends a DELETE
+// request to Azure and if accepted without error, the func will return a Poller which can be used to track the ongoing
+// progress of the operation.
+func (ac *azureClient) DeleteAsync(ctx context.Context, spec azure.ResourceSpecGetter, resumeToken string) (poller *runtime.Poller[armcompute.VirtualMachineExtensionsClientDeleteResponse], err error) {
+	ctx, _, done := tele.StartSpanWithLogger(ctx, "vmextensions.azureClient.DeleteAsync")
+	defer done()
+
+	opts := &armcompute.VirtualMachineExtensionsClientBeginDeleteOptions{ResumeToken: resumeToken}
+	poller, err = ac.vmextensions.BeginDelete(ctx, spec.ResourceGroupName(), spec.OwnerResourceName(), spec.ResourceName(), opts)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, ac.apiCallTimeout)
+	defer cancel()
+
+	pollOpts := &runtime.PollUntilDoneOptions{Frequency: async.DefaultPollerFrequency}
+	_, err = poller.PollUntilDone(ctx, pollOpts)
+	if err != nil {
+		// if an error occurs, return the Poller.
+		// this means the long-running operation didn't finish in the specified timeout.
+		return poller, err
+	}
+
+	// if the operation completed, return a nil poller.
+	return nil, err
 }

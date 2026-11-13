@@ -20,11 +20,10 @@ import (
 	"context"
 	"testing"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/envtest/printer"
 
 	"sigs.k8s.io/cluster-api-provider-azure/internal/test/env"
 	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
@@ -34,32 +33,47 @@ import (
 // http://onsi.github.io/ginkgo/ to learn more about Ginkgo.
 
 var (
-	testEnv *env.TestEnvironment
+	testEnv       *env.TestEnvironment
+	testEnvCancel func()
 )
 
 func TestAPIs(t *testing.T) {
 	RegisterFailHandler(Fail)
-
-	RunSpecsWithDefaultAndCustomReporters(t,
-		"Controller Suite",
-		[]Reporter{printer.NewlineReporter{}})
+	RunSpecs(t, "Controller Suite")
 }
 
-var _ = BeforeSuite(func(done Done) {
+var _ = BeforeSuite(func() {
 	By("bootstrapping test environment")
 	testEnv = env.NewTestEnvironment()
-	Expect(NewAzureClusterReconciler(testEnv, testEnv.GetEventRecorderFor("azurecluster-reconciler"), reconciler.DefaultLoopTimeout, "").
+	Expect(NewAzureClusterReconciler(testEnv, testEnv.GetEventRecorderFor("azurecluster-reconciler"), reconciler.Timeouts{}, "", testEnv.CredentialCache).
 		SetupWithManager(context.Background(), testEnv.Manager, Options{Options: controller.Options{MaxConcurrentReconciles: 1}})).To(Succeed())
 
-	Expect(NewAzureMachineReconciler(testEnv, testEnv.GetEventRecorderFor("azuremachine-reconciler"), reconciler.DefaultLoopTimeout, "").
+	Expect(NewAzureMachineReconciler(testEnv, testEnv.GetEventRecorderFor("azuremachine-reconciler"), reconciler.Timeouts{}, "", testEnv.CredentialCache).
 		SetupWithManager(context.Background(), testEnv.Manager, Options{Options: controller.Options{MaxConcurrentReconciles: 1}})).To(Succeed())
+
+	Expect((&AzureManagedClusterReconciler{
+		Client:   testEnv,
+		Recorder: testEnv.GetEventRecorderFor("azuremanagedcluster-reconciler"),
+	}).SetupWithManager(context.Background(), testEnv.Manager, Options{Options: controller.Options{MaxConcurrentReconciles: 1}})).To(Succeed())
+
+	Expect((&AzureManagedControlPlaneReconciler{
+		Client:          testEnv,
+		Recorder:        testEnv.GetEventRecorderFor("azuremanagedcontrolplane-reconciler"),
+		CredentialCache: testEnv.CredentialCache,
+	}).SetupWithManager(context.Background(), testEnv.Manager, Options{Options: controller.Options{MaxConcurrentReconciles: 1}})).To(Succeed())
+
+	Expect(NewAzureManagedMachinePoolReconciler(testEnv, testEnv.GetEventRecorderFor("azuremanagedmachinepool-reconciler"),
+		reconciler.Timeouts{}, "", testEnv.CredentialCache).SetupWithManager(context.Background(), testEnv.Manager, Options{Options: controller.Options{MaxConcurrentReconciles: 1}})).To(Succeed())
 
 	// +kubebuilder:scaffold:scheme
+
+	ctx, cancel := context.WithCancel(context.Background())
+	testEnvCancel = cancel
 
 	By("starting the manager")
 	go func() {
 		defer GinkgoRecover()
-		Expect(testEnv.StartManager()).To(Succeed())
+		Expect(testEnv.StartManager(ctx)).To(Succeed())
 	}()
 
 	Eventually(func() bool {
@@ -69,11 +83,10 @@ var _ = BeforeSuite(func(done Done) {
 		}
 		return true
 	}).Should(BeTrue())
-
-	close(done)
-}, 60)
+})
 
 var _ = AfterSuite(func() {
+	testEnvCancel()
 	if testEnv != nil {
 		By("tearing down the test environment")
 		Expect(testEnv.Stop()).To(Succeed())

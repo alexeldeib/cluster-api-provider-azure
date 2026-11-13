@@ -17,12 +17,17 @@ limitations under the License.
 package networkinterfaces
 
 import (
+	"strings"
 	"testing"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2021-04-01/compute"
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-02-01/network"
-	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v4"
+	"github.com/go-logr/logr/funcr"
 	. "github.com/onsi/gomega"
+	"github.com/onsi/gomega/format"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/resourceskus"
 )
 
@@ -38,26 +43,30 @@ var (
 		VNetResourceGroup:     "my-rg",
 		PublicLBName:          "my-public-lb",
 		AcceleratedNetworking: nil,
+		ClusterName:           "my-cluster",
 	}
 	fakeSku = resourceskus.SKU{
-		Name: to.StringPtr("Standard_D2v2"),
-		Kind: to.StringPtr(string(resourceskus.VirtualMachines)),
-		Locations: &[]string{
-			"fake-location",
+		Name: ptr.To("Standard_D2v2"),
+		Kind: ptr.To(string(resourceskus.VirtualMachines)),
+		Locations: []*string{
+			ptr.To("fake-location"),
 		},
-		LocationInfo: &[]compute.ResourceSkuLocationInfo{
+		LocationInfo: []*armcompute.ResourceSKULocationInfo{
 			{
-				Location: to.StringPtr("fake-location"),
-				Zones:    &[]string{"1"},
+				Location: ptr.To("fake-location"),
+				Zones:    []*string{ptr.To("1")},
 			},
 		},
-		Capabilities: &[]compute.ResourceSkuCapabilities{
+		Capabilities: []*armcompute.ResourceSKUCapabilities{
 			{
-				Name:  to.StringPtr(resourceskus.AcceleratedNetworking),
-				Value: to.StringPtr(string(resourceskus.CapabilitySupported)),
+				Name:  ptr.To(resourceskus.AcceleratedNetworking),
+				Value: ptr.To(string(resourceskus.CapabilitySupported)),
 			},
 		},
 	}
+
+	fakeCustomDNSServers = []string{"123.123.123.123", "124.124.124.124"}
+
 	fakeStaticPrivateIPNICSpec = NICSpec{
 		Name:                    "my-net-interface",
 		ResourceGroup:           "my-rg",
@@ -72,6 +81,7 @@ var (
 		StaticIPAddress:         "fake.static.ip",
 		AcceleratedNetworking:   nil,
 		SKU:                     &fakeSku,
+		ClusterName:             "my-cluster",
 	}
 
 	fakeDynamicPrivateIPNICSpec = NICSpec{
@@ -87,6 +97,7 @@ var (
 		PublicLBAddressPoolName: "cluster-name-outboundBackendPool",
 		AcceleratedNetworking:   nil,
 		SKU:                     &fakeSku,
+		ClusterName:             "my-cluster",
 	}
 
 	fakeControlPlaneNICSpec = NICSpec{
@@ -105,6 +116,7 @@ var (
 		InternalLBAddressPoolName: "my-internal-lb-backendPool",
 		AcceleratedNetworking:     nil,
 		SKU:                       &fakeSku,
+		ClusterName:               "my-cluster",
 	}
 
 	fakeAcceleratedNetworkingNICSpec = NICSpec{
@@ -119,6 +131,7 @@ var (
 		PublicLBName:          "my-public-lb",
 		AcceleratedNetworking: nil,
 		SKU:                   &fakeSku,
+		ClusterName:           "my-cluster",
 	}
 
 	fakeNonAcceleratedNetworkingNICSpec = NICSpec{
@@ -131,7 +144,8 @@ var (
 		VNetName:              "my-vnet",
 		VNetResourceGroup:     "my-rg",
 		PublicLBName:          "my-public-lb",
-		AcceleratedNetworking: to.BoolPtr(false),
+		AcceleratedNetworking: ptr.To(false),
+		ClusterName:           "my-cluster",
 	}
 
 	fakeIpv6NICSpec = NICSpec{
@@ -148,6 +162,95 @@ var (
 		AcceleratedNetworking: nil,
 		SKU:                   &fakeSku,
 		EnableIPForwarding:    true,
+		ClusterName:           "my-cluster",
+	}
+
+	fakeControlPlaneCustomDNSSettingsNICSpec = NICSpec{
+		Name:                      "my-net-interface",
+		ResourceGroup:             "my-rg",
+		Location:                  "fake-location",
+		SubscriptionID:            "123",
+		MachineName:               "azure-test1",
+		SubnetName:                "my-subnet",
+		VNetName:                  "my-vnet",
+		VNetResourceGroup:         "my-rg",
+		PublicLBName:              "my-public-lb",
+		PublicLBAddressPoolName:   "my-public-lb-backendPool",
+		PublicLBNATRuleName:       "azure-test1",
+		InternalLBName:            "my-internal-lb",
+		InternalLBAddressPoolName: "my-internal-lb-backendPool",
+		AcceleratedNetworking:     nil,
+		SKU:                       &fakeSku,
+		DNSServers:                fakeCustomDNSServers,
+		ClusterName:               "my-cluster",
+	}
+	fakeDefaultIPconfigNICSpec = NICSpec{
+		Name:                  "my-net-interface",
+		ResourceGroup:         "my-rg",
+		Location:              "fake-location",
+		SubscriptionID:        "123",
+		MachineName:           "azure-test1",
+		SubnetName:            "my-subnet",
+		VNetName:              "my-vnet",
+		IPv6Enabled:           false,
+		VNetResourceGroup:     "my-rg",
+		PublicLBName:          "my-public-lb",
+		AcceleratedNetworking: nil,
+		SKU:                   &fakeSku,
+		EnableIPForwarding:    true,
+		IPConfigs:             []IPConfig{},
+		ClusterName:           "my-cluster",
+	}
+	fakeOneIPconfigNICSpec = NICSpec{
+		Name:                  "my-net-interface",
+		ResourceGroup:         "my-rg",
+		Location:              "fake-location",
+		SubscriptionID:        "123",
+		MachineName:           "azure-test1",
+		SubnetName:            "my-subnet",
+		VNetName:              "my-vnet",
+		IPv6Enabled:           false,
+		VNetResourceGroup:     "my-rg",
+		PublicLBName:          "my-public-lb",
+		AcceleratedNetworking: nil,
+		SKU:                   &fakeSku,
+		EnableIPForwarding:    true,
+		IPConfigs:             []IPConfig{{}},
+		ClusterName:           "my-cluster",
+	}
+	fakeTwoIPconfigNICSpec = NICSpec{
+		Name:                  "my-net-interface",
+		ResourceGroup:         "my-rg",
+		Location:              "fake-location",
+		SubscriptionID:        "123",
+		MachineName:           "azure-test1",
+		SubnetName:            "my-subnet",
+		VNetName:              "my-vnet",
+		IPv6Enabled:           false,
+		VNetResourceGroup:     "my-rg",
+		PublicLBName:          "my-public-lb",
+		AcceleratedNetworking: nil,
+		SKU:                   &fakeSku,
+		EnableIPForwarding:    true,
+		IPConfigs:             []IPConfig{{}, {}},
+		ClusterName:           "my-cluster",
+	}
+	fakeTwoIPconfigWithPublicNICSpec = NICSpec{
+		Name:                  "my-net-interface",
+		ResourceGroup:         "my-rg",
+		Location:              "fake-location",
+		SubscriptionID:        "123",
+		MachineName:           "azure-test1",
+		SubnetName:            "my-subnet",
+		VNetName:              "my-vnet",
+		IPv6Enabled:           false,
+		VNetResourceGroup:     "my-rg",
+		PublicIPName:          "pip-azure-test1",
+		AcceleratedNetworking: nil,
+		SKU:                   &fakeSku,
+		EnableIPForwarding:    true,
+		IPConfigs:             []IPConfig{{}, {}},
+		ClusterName:           "my-cluster",
 	}
 )
 
@@ -155,15 +258,15 @@ func TestParameters(t *testing.T) {
 	testcases := []struct {
 		name          string
 		spec          *NICSpec
-		existing      interface{}
-		expect        func(g *WithT, result interface{})
+		existing      any
+		expect        func(g *WithT, result any)
 		expectedError string
 	}{
 		{
 			name:     "error when accelerted networking is nil and no SKU is present",
 			spec:     &fakeMissingSKUNICSpec,
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
+			expect: func(g *WithT, result any) {
 				g.Expect(result).To(BeNil())
 			},
 			expectedError: "unable to get required network interface SKU from machine cache",
@@ -172,21 +275,28 @@ func TestParameters(t *testing.T) {
 			name:     "get parameters for network interface with static private IP",
 			spec:     &fakeStaticPrivateIPNICSpec,
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(network.Interface{}))
-				g.Expect(result.(network.Interface)).To(Equal(network.Interface{
-					Location: to.StringPtr("fake-location"),
-					InterfacePropertiesFormat: &network.InterfacePropertiesFormat{
-						EnableAcceleratedNetworking: to.BoolPtr(true),
-						EnableIPForwarding:          to.BoolPtr(false),
-						IPConfigurations: &[]network.InterfaceIPConfiguration{
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armnetwork.Interface{}))
+				g.Expect(result.(armnetwork.Interface)).To(Equal(armnetwork.Interface{
+					Tags: map[string]*string{
+						"Name": ptr.To("my-net-interface"),
+						"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": ptr.To("owned"),
+					},
+					Location: ptr.To("fake-location"),
+					Properties: &armnetwork.InterfacePropertiesFormat{
+						Primary:                     nil,
+						EnableAcceleratedNetworking: ptr.To(true),
+						EnableIPForwarding:          ptr.To(false),
+						DNSSettings:                 &armnetwork.InterfaceDNSSettings{},
+						IPConfigurations: []*armnetwork.InterfaceIPConfiguration{
 							{
-								Name: to.StringPtr("pipConfig"),
-								InterfaceIPConfigurationPropertiesFormat: &network.InterfaceIPConfigurationPropertiesFormat{
-									LoadBalancerBackendAddressPools: &[]network.BackendAddressPool{{ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-public-lb/backendAddressPools/cluster-name-outboundBackendPool")}},
-									PrivateIPAllocationMethod:       network.IPAllocationMethodStatic,
-									PrivateIPAddress:                to.StringPtr("fake.static.ip"),
-									Subnet:                          &network.Subnet{ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
+								Name: ptr.To("pipConfig"),
+								Properties: &armnetwork.InterfaceIPConfigurationPropertiesFormat{
+									Primary:                         ptr.To(true),
+									LoadBalancerBackendAddressPools: []*armnetwork.BackendAddressPool{{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-public-lb/backendAddressPools/cluster-name-outboundBackendPool")}},
+									PrivateIPAllocationMethod:       ptr.To(armnetwork.IPAllocationMethodStatic),
+									PrivateIPAddress:                ptr.To("fake.static.ip"),
+									Subnet:                          &armnetwork.Subnet{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
 								},
 							},
 						},
@@ -199,20 +309,27 @@ func TestParameters(t *testing.T) {
 			name:     "get parameters for network interface with dynamic private IP",
 			spec:     &fakeDynamicPrivateIPNICSpec,
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(network.Interface{}))
-				g.Expect(result.(network.Interface)).To(Equal(network.Interface{
-					Location: to.StringPtr("fake-location"),
-					InterfacePropertiesFormat: &network.InterfacePropertiesFormat{
-						EnableAcceleratedNetworking: to.BoolPtr(true),
-						EnableIPForwarding:          to.BoolPtr(false),
-						IPConfigurations: &[]network.InterfaceIPConfiguration{
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armnetwork.Interface{}))
+				g.Expect(result.(armnetwork.Interface)).To(Equal(armnetwork.Interface{
+					Tags: map[string]*string{
+						"Name": ptr.To("my-net-interface"),
+						"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": ptr.To("owned"),
+					},
+					Location: ptr.To("fake-location"),
+					Properties: &armnetwork.InterfacePropertiesFormat{
+						EnableAcceleratedNetworking: ptr.To(true),
+						EnableIPForwarding:          ptr.To(false),
+						DNSSettings:                 &armnetwork.InterfaceDNSSettings{},
+						Primary:                     nil,
+						IPConfigurations: []*armnetwork.InterfaceIPConfiguration{
 							{
-								Name: to.StringPtr("pipConfig"),
-								InterfaceIPConfigurationPropertiesFormat: &network.InterfaceIPConfigurationPropertiesFormat{
-									LoadBalancerBackendAddressPools: &[]network.BackendAddressPool{{ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-public-lb/backendAddressPools/cluster-name-outboundBackendPool")}},
-									PrivateIPAllocationMethod:       network.IPAllocationMethodDynamic,
-									Subnet:                          &network.Subnet{ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
+								Name: ptr.To("pipConfig"),
+								Properties: &armnetwork.InterfaceIPConfigurationPropertiesFormat{
+									Primary:                         ptr.To(true),
+									LoadBalancerBackendAddressPools: []*armnetwork.BackendAddressPool{{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-public-lb/backendAddressPools/cluster-name-outboundBackendPool")}},
+									PrivateIPAllocationMethod:       ptr.To(armnetwork.IPAllocationMethodDynamic),
+									Subnet:                          &armnetwork.Subnet{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
 								},
 							},
 						},
@@ -225,23 +342,30 @@ func TestParameters(t *testing.T) {
 			name:     "get parameters for control plane network interface",
 			spec:     &fakeControlPlaneNICSpec,
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(network.Interface{}))
-				g.Expect(result.(network.Interface)).To(Equal(network.Interface{
-					Location: to.StringPtr("fake-location"),
-					InterfacePropertiesFormat: &network.InterfacePropertiesFormat{
-						EnableAcceleratedNetworking: to.BoolPtr(true),
-						EnableIPForwarding:          to.BoolPtr(false),
-						IPConfigurations: &[]network.InterfaceIPConfiguration{
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armnetwork.Interface{}))
+				g.Expect(result.(armnetwork.Interface)).To(Equal(armnetwork.Interface{
+					Tags: map[string]*string{
+						"Name": ptr.To("my-net-interface"),
+						"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": ptr.To("owned"),
+					},
+					Location: ptr.To("fake-location"),
+					Properties: &armnetwork.InterfacePropertiesFormat{
+						EnableAcceleratedNetworking: ptr.To(true),
+						EnableIPForwarding:          ptr.To(false),
+						DNSSettings:                 &armnetwork.InterfaceDNSSettings{},
+						Primary:                     nil,
+						IPConfigurations: []*armnetwork.InterfaceIPConfiguration{
 							{
-								Name: to.StringPtr("pipConfig"),
-								InterfaceIPConfigurationPropertiesFormat: &network.InterfaceIPConfigurationPropertiesFormat{
-									Subnet:                      &network.Subnet{ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
-									PrivateIPAllocationMethod:   network.IPAllocationMethodDynamic,
-									LoadBalancerInboundNatRules: &[]network.InboundNatRule{{ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-public-lb/inboundNatRules/azure-test1")}},
-									LoadBalancerBackendAddressPools: &[]network.BackendAddressPool{
-										{ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-public-lb/backendAddressPools/my-public-lb-backendPool")},
-										{ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-internal-lb/backendAddressPools/my-internal-lb-backendPool")}},
+								Name: ptr.To("pipConfig"),
+								Properties: &armnetwork.InterfaceIPConfigurationPropertiesFormat{
+									Primary:                     ptr.To(true),
+									Subnet:                      &armnetwork.Subnet{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
+									PrivateIPAllocationMethod:   ptr.To(armnetwork.IPAllocationMethodDynamic),
+									LoadBalancerInboundNatRules: []*armnetwork.InboundNatRule{{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-public-lb/inboundNatRules/azure-test1")}},
+									LoadBalancerBackendAddressPools: []*armnetwork.BackendAddressPool{
+										{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-public-lb/backendAddressPools/my-public-lb-backendPool")},
+										{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-internal-lb/backendAddressPools/my-internal-lb-backendPool")}},
 								},
 							},
 						},
@@ -254,20 +378,27 @@ func TestParameters(t *testing.T) {
 			name:     "get parameters for network interface with accelerated networking",
 			spec:     &fakeAcceleratedNetworkingNICSpec,
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(network.Interface{}))
-				g.Expect(result.(network.Interface)).To(Equal(network.Interface{
-					Location: to.StringPtr("fake-location"),
-					InterfacePropertiesFormat: &network.InterfacePropertiesFormat{
-						EnableAcceleratedNetworking: to.BoolPtr(true),
-						EnableIPForwarding:          to.BoolPtr(false),
-						IPConfigurations: &[]network.InterfaceIPConfiguration{
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armnetwork.Interface{}))
+				g.Expect(result.(armnetwork.Interface)).To(Equal(armnetwork.Interface{
+					Tags: map[string]*string{
+						"Name": ptr.To("my-net-interface"),
+						"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": ptr.To("owned"),
+					},
+					Location: ptr.To("fake-location"),
+					Properties: &armnetwork.InterfacePropertiesFormat{
+						Primary:                     nil,
+						EnableAcceleratedNetworking: ptr.To(true),
+						EnableIPForwarding:          ptr.To(false),
+						DNSSettings:                 &armnetwork.InterfaceDNSSettings{},
+						IPConfigurations: []*armnetwork.InterfaceIPConfiguration{
 							{
-								Name: to.StringPtr("pipConfig"),
-								InterfaceIPConfigurationPropertiesFormat: &network.InterfaceIPConfigurationPropertiesFormat{
-									Subnet:                          &network.Subnet{ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
-									PrivateIPAllocationMethod:       network.IPAllocationMethodDynamic,
-									LoadBalancerBackendAddressPools: &[]network.BackendAddressPool{},
+								Name: ptr.To("pipConfig"),
+								Properties: &armnetwork.InterfaceIPConfigurationPropertiesFormat{
+									Primary:                         ptr.To(true),
+									Subnet:                          &armnetwork.Subnet{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
+									PrivateIPAllocationMethod:       ptr.To(armnetwork.IPAllocationMethodDynamic),
+									LoadBalancerBackendAddressPools: []*armnetwork.BackendAddressPool{},
 								},
 							},
 						},
@@ -280,20 +411,27 @@ func TestParameters(t *testing.T) {
 			name:     "get parameters for network interface without accelerated networking",
 			spec:     &fakeNonAcceleratedNetworkingNICSpec,
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(network.Interface{}))
-				g.Expect(result.(network.Interface)).To(Equal(network.Interface{
-					Location: to.StringPtr("fake-location"),
-					InterfacePropertiesFormat: &network.InterfacePropertiesFormat{
-						EnableAcceleratedNetworking: to.BoolPtr(false),
-						EnableIPForwarding:          to.BoolPtr(false),
-						IPConfigurations: &[]network.InterfaceIPConfiguration{
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armnetwork.Interface{}))
+				g.Expect(result.(armnetwork.Interface)).To(Equal(armnetwork.Interface{
+					Tags: map[string]*string{
+						"Name": ptr.To("my-net-interface"),
+						"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": ptr.To("owned"),
+					},
+					Location: ptr.To("fake-location"),
+					Properties: &armnetwork.InterfacePropertiesFormat{
+						Primary:                     nil,
+						EnableAcceleratedNetworking: ptr.To(false),
+						EnableIPForwarding:          ptr.To(false),
+						DNSSettings:                 &armnetwork.InterfaceDNSSettings{},
+						IPConfigurations: []*armnetwork.InterfaceIPConfiguration{
 							{
-								Name: to.StringPtr("pipConfig"),
-								InterfaceIPConfigurationPropertiesFormat: &network.InterfaceIPConfigurationPropertiesFormat{
-									Subnet:                          &network.Subnet{ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
-									PrivateIPAllocationMethod:       network.IPAllocationMethodDynamic,
-									LoadBalancerBackendAddressPools: &[]network.BackendAddressPool{},
+								Name: ptr.To("pipConfig"),
+								Properties: &armnetwork.InterfaceIPConfigurationPropertiesFormat{
+									Primary:                         ptr.To(true),
+									Subnet:                          &armnetwork.Subnet{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
+									PrivateIPAllocationMethod:       ptr.To(armnetwork.IPAllocationMethodDynamic),
+									LoadBalancerBackendAddressPools: []*armnetwork.BackendAddressPool{},
 								},
 							},
 						},
@@ -306,28 +444,372 @@ func TestParameters(t *testing.T) {
 			name:     "get parameters for network interface ipv6",
 			spec:     &fakeIpv6NICSpec,
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(network.Interface{}))
-				g.Expect(result.(network.Interface)).To(Equal(network.Interface{
-					Location: to.StringPtr("fake-location"),
-					InterfacePropertiesFormat: &network.InterfacePropertiesFormat{
-						EnableAcceleratedNetworking: to.BoolPtr(true),
-						EnableIPForwarding:          to.BoolPtr(true),
-						IPConfigurations: &[]network.InterfaceIPConfiguration{
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armnetwork.Interface{}))
+				g.Expect(result.(armnetwork.Interface)).To(Equal(armnetwork.Interface{
+					Tags: map[string]*string{
+						"Name": ptr.To("my-net-interface"),
+						"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": ptr.To("owned"),
+					},
+					Location: ptr.To("fake-location"),
+					Properties: &armnetwork.InterfacePropertiesFormat{
+						Primary:                     nil,
+						EnableAcceleratedNetworking: ptr.To(true),
+						EnableIPForwarding:          ptr.To(true),
+						DNSSettings:                 &armnetwork.InterfaceDNSSettings{},
+						IPConfigurations: []*armnetwork.InterfaceIPConfiguration{
 							{
-								Name: to.StringPtr("pipConfig"),
-								InterfaceIPConfigurationPropertiesFormat: &network.InterfaceIPConfigurationPropertiesFormat{
-									Subnet:                          &network.Subnet{ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
-									PrivateIPAllocationMethod:       network.IPAllocationMethodDynamic,
-									LoadBalancerBackendAddressPools: &[]network.BackendAddressPool{},
+								Name: ptr.To("pipConfig"),
+								Properties: &armnetwork.InterfaceIPConfigurationPropertiesFormat{
+									Primary:                         ptr.To(true),
+									Subnet:                          &armnetwork.Subnet{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
+									PrivateIPAllocationMethod:       ptr.To(armnetwork.IPAllocationMethodDynamic),
+									LoadBalancerBackendAddressPools: []*armnetwork.BackendAddressPool{},
 								},
 							},
 							{
-								Name: to.StringPtr("ipConfigv6"),
-								InterfaceIPConfigurationPropertiesFormat: &network.InterfaceIPConfigurationPropertiesFormat{
-									Subnet:                  &network.Subnet{ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
-									Primary:                 to.BoolPtr(false),
-									PrivateIPAddressVersion: "IPv6",
+								Name: ptr.To("ipConfigv6"),
+								Properties: &armnetwork.InterfaceIPConfigurationPropertiesFormat{
+									Subnet:                  &armnetwork.Subnet{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
+									Primary:                 ptr.To(false),
+									PrivateIPAddressVersion: ptr.To(armnetwork.IPVersionIPv6),
+								},
+							},
+						},
+					},
+				}))
+			},
+			expectedError: "",
+		},
+		{
+			name:     "get parameters for network interface default ipconfig",
+			spec:     &fakeDefaultIPconfigNICSpec,
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armnetwork.Interface{}))
+				g.Expect(result.(armnetwork.Interface)).To(Equal(armnetwork.Interface{
+					Tags: map[string]*string{
+						"Name": ptr.To("my-net-interface"),
+						"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": ptr.To("owned"),
+					},
+					Location: ptr.To("fake-location"),
+					Properties: &armnetwork.InterfacePropertiesFormat{
+						Primary:                     nil,
+						EnableAcceleratedNetworking: ptr.To(true),
+						EnableIPForwarding:          ptr.To(true),
+						DNSSettings:                 &armnetwork.InterfaceDNSSettings{},
+						IPConfigurations: []*armnetwork.InterfaceIPConfiguration{
+							{
+								Name: ptr.To("pipConfig"),
+								Properties: &armnetwork.InterfaceIPConfigurationPropertiesFormat{
+									Primary:                         ptr.To(true),
+									Subnet:                          &armnetwork.Subnet{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
+									PrivateIPAllocationMethod:       ptr.To(armnetwork.IPAllocationMethodDynamic),
+									LoadBalancerBackendAddressPools: []*armnetwork.BackendAddressPool{},
+								},
+							},
+						},
+					},
+				}))
+			},
+			expectedError: "",
+		},
+		{
+			name:     "get parameters for network interface with one ipconfig",
+			spec:     &fakeOneIPconfigNICSpec,
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armnetwork.Interface{}))
+				g.Expect(result.(armnetwork.Interface)).To(Equal(armnetwork.Interface{
+					Tags: map[string]*string{
+						"Name": ptr.To("my-net-interface"),
+						"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": ptr.To("owned"),
+					},
+					Location: ptr.To("fake-location"),
+					Properties: &armnetwork.InterfacePropertiesFormat{
+						Primary:                     nil,
+						EnableAcceleratedNetworking: ptr.To(true),
+						EnableIPForwarding:          ptr.To(true),
+						DNSSettings:                 &armnetwork.InterfaceDNSSettings{},
+						IPConfigurations: []*armnetwork.InterfaceIPConfiguration{
+							{
+								Name: ptr.To("pipConfig"),
+								Properties: &armnetwork.InterfaceIPConfigurationPropertiesFormat{
+									Primary:                         ptr.To(true),
+									Subnet:                          &armnetwork.Subnet{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
+									PrivateIPAllocationMethod:       ptr.To(armnetwork.IPAllocationMethodDynamic),
+									LoadBalancerBackendAddressPools: []*armnetwork.BackendAddressPool{},
+								},
+							},
+						},
+					},
+				}))
+			},
+			expectedError: "",
+		},
+		{
+			name:     "get parameters for network interface with two ipconfigs",
+			spec:     &fakeTwoIPconfigNICSpec,
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armnetwork.Interface{}))
+				g.Expect(result.(armnetwork.Interface)).To(Equal(armnetwork.Interface{
+					Tags: map[string]*string{
+						"Name": ptr.To("my-net-interface"),
+						"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": ptr.To("owned"),
+					},
+					Location: ptr.To("fake-location"),
+					Properties: &armnetwork.InterfacePropertiesFormat{
+						Primary:                     nil,
+						EnableAcceleratedNetworking: ptr.To(true),
+						EnableIPForwarding:          ptr.To(true),
+						DNSSettings:                 &armnetwork.InterfaceDNSSettings{},
+						IPConfigurations: []*armnetwork.InterfaceIPConfiguration{
+							{
+								Name: ptr.To("pipConfig"),
+								Properties: &armnetwork.InterfaceIPConfigurationPropertiesFormat{
+									Primary:                         ptr.To(true),
+									Subnet:                          &armnetwork.Subnet{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
+									PrivateIPAllocationMethod:       ptr.To(armnetwork.IPAllocationMethodDynamic),
+									LoadBalancerBackendAddressPools: []*armnetwork.BackendAddressPool{},
+								},
+							},
+							{
+								Name: ptr.To("my-net-interface-1"),
+								Properties: &armnetwork.InterfaceIPConfigurationPropertiesFormat{
+									Primary:                         ptr.To(false),
+									Subnet:                          &armnetwork.Subnet{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
+									PrivateIPAllocationMethod:       ptr.To(armnetwork.IPAllocationMethodDynamic),
+									LoadBalancerBackendAddressPools: nil,
+								},
+							},
+						},
+					},
+				}))
+			},
+			expectedError: "",
+		},
+		{
+			name:     "get parameters for network interface with two ipconfigs and a public ip",
+			spec:     &fakeTwoIPconfigWithPublicNICSpec,
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armnetwork.Interface{}))
+				g.Expect(result.(armnetwork.Interface)).To(Equal(armnetwork.Interface{
+					Tags: map[string]*string{
+						"Name": ptr.To("my-net-interface"),
+						"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": ptr.To("owned"),
+					},
+					Location: ptr.To("fake-location"),
+					Properties: &armnetwork.InterfacePropertiesFormat{
+						Primary:                     nil,
+						EnableAcceleratedNetworking: ptr.To(true),
+						EnableIPForwarding:          ptr.To(true),
+						DNSSettings:                 &armnetwork.InterfaceDNSSettings{},
+						IPConfigurations: []*armnetwork.InterfaceIPConfiguration{
+							{
+								Name: ptr.To("pipConfig"),
+								Properties: &armnetwork.InterfaceIPConfigurationPropertiesFormat{
+									Primary:                   ptr.To(true),
+									Subnet:                    &armnetwork.Subnet{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
+									PrivateIPAllocationMethod: ptr.To(armnetwork.IPAllocationMethodDynamic),
+									PublicIPAddress: &armnetwork.PublicIPAddress{
+										ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/publicIPAddresses/pip-azure-test1"),
+									},
+									LoadBalancerBackendAddressPools: []*armnetwork.BackendAddressPool{},
+								},
+							},
+							{
+								Name: ptr.To("my-net-interface-1"),
+								Properties: &armnetwork.InterfaceIPConfigurationPropertiesFormat{
+									Primary:                         ptr.To(false),
+									Subnet:                          &armnetwork.Subnet{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
+									PrivateIPAllocationMethod:       ptr.To(armnetwork.IPAllocationMethodDynamic),
+									LoadBalancerBackendAddressPools: nil,
+								},
+							},
+						},
+					},
+				}))
+			},
+			expectedError: "",
+		},
+		{
+			name:     "get parameters for control plane network interface with DNS servers",
+			spec:     &fakeControlPlaneCustomDNSSettingsNICSpec,
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armnetwork.Interface{}))
+				g.Expect(result.(armnetwork.Interface)).To(Equal(armnetwork.Interface{
+					Tags: map[string]*string{
+						"Name": ptr.To("my-net-interface"),
+						"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": ptr.To("owned"),
+					},
+					Location: ptr.To("fake-location"),
+					Properties: &armnetwork.InterfacePropertiesFormat{
+						EnableAcceleratedNetworking: ptr.To(true),
+						EnableIPForwarding:          ptr.To(false),
+						DNSSettings: &armnetwork.InterfaceDNSSettings{
+							DNSServers: []*string{ptr.To("123.123.123.123"), ptr.To("124.124.124.124")},
+						},
+						IPConfigurations: []*armnetwork.InterfaceIPConfiguration{
+							{
+								Name: ptr.To("pipConfig"),
+								Properties: &armnetwork.InterfaceIPConfigurationPropertiesFormat{
+									Subnet:                      &armnetwork.Subnet{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
+									Primary:                     ptr.To(true),
+									PrivateIPAllocationMethod:   ptr.To(armnetwork.IPAllocationMethodDynamic),
+									LoadBalancerInboundNatRules: []*armnetwork.InboundNatRule{{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-public-lb/inboundNatRules/azure-test1")}},
+									LoadBalancerBackendAddressPools: []*armnetwork.BackendAddressPool{
+										{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-public-lb/backendAddressPools/my-public-lb-backendPool")},
+										{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-internal-lb/backendAddressPools/my-internal-lb-backendPool")}},
+								},
+							},
+						},
+					},
+				}))
+			},
+			expectedError: "",
+		},
+		{
+			name: "recreate parameters for network interface when Azure provisioning state is Failed",
+			spec: func() *NICSpec {
+				s := fakeStaticPrivateIPNICSpec // value‑copy
+				return &s                       // pointer to the copy, not the global
+			}(),
+			existing: armnetwork.Interface{
+				ID:       ptr.To(""),
+				Name:     ptr.To("my-net-interface"),
+				Location: ptr.To("fake-location"),
+				Type:     ptr.To("Microsoft.Network/networkInterfaces"),
+				Properties: &armnetwork.InterfacePropertiesFormat{
+					ProvisioningState: ptr.To(armnetwork.ProvisioningStateFailed),
+				},
+			},
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armnetwork.Interface{}))
+				g.Expect(result.(armnetwork.Interface)).To(Equal(armnetwork.Interface{
+					Tags: map[string]*string{
+						"Name": ptr.To("my-net-interface"),
+						"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": ptr.To("owned"),
+					},
+					Location: ptr.To("fake-location"),
+					Properties: &armnetwork.InterfacePropertiesFormat{
+						Primary:                     nil,
+						EnableAcceleratedNetworking: ptr.To(true),
+						EnableIPForwarding:          ptr.To(false),
+						DNSSettings:                 &armnetwork.InterfaceDNSSettings{},
+						IPConfigurations: []*armnetwork.InterfaceIPConfiguration{
+							{
+								Name: ptr.To("pipConfig"),
+								Properties: &armnetwork.InterfaceIPConfigurationPropertiesFormat{
+									Primary:                         ptr.To(true),
+									LoadBalancerBackendAddressPools: []*armnetwork.BackendAddressPool{{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-public-lb/backendAddressPools/cluster-name-outboundBackendPool")}},
+									PrivateIPAllocationMethod:       ptr.To(armnetwork.IPAllocationMethodStatic),
+									PrivateIPAddress:                ptr.To("fake.static.ip"),
+									Subnet:                          &armnetwork.Subnet{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
+								},
+							},
+						},
+					},
+				}))
+			},
+			expectedError: "",
+		},
+		{
+			name: "do not recreate parameters for network interface when Azure provisioning state is Deleting",
+			spec: func() *NICSpec {
+				s := fakeStaticPrivateIPNICSpec // value‑copy
+				return &s                       // pointer to the copy, not the global
+			}(),
+			existing: armnetwork.Interface{
+				ID:       ptr.To(""),
+				Name:     ptr.To("my-net-interface"),
+				Location: ptr.To("fake-location"),
+				Type:     ptr.To("Microsoft.Network/networkInterfaces"),
+				Properties: &armnetwork.InterfacePropertiesFormat{
+					ProvisioningState: ptr.To(armnetwork.ProvisioningStateDeleting),
+				},
+			},
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeNil())
+			},
+			expectedError: "",
+		},
+		{
+			name: "do not recreate parameters for network interface when Azure provisioning state is Succeeded",
+			spec: func() *NICSpec {
+				s := fakeStaticPrivateIPNICSpec // value‑copy
+				return &s                       // pointer to the copy, not the global
+			}(),
+			existing: armnetwork.Interface{
+				ID:       ptr.To(""),
+				Name:     ptr.To("my-net-interface"),
+				Location: ptr.To("fake-location"),
+				Type:     ptr.To("Microsoft.Network/networkInterfaces"),
+				Properties: &armnetwork.InterfacePropertiesFormat{
+					ProvisioningState: ptr.To(armnetwork.ProvisioningStateSucceeded),
+				},
+			},
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeNil())
+			},
+			expectedError: "",
+		},
+		{
+			name: "do not recreate parameters for network interface when Azure provisioning state is Updating",
+			spec: func() *NICSpec {
+				s := fakeStaticPrivateIPNICSpec // value‑copy
+				return &s                       // pointer to the copy, not the global
+			}(),
+			existing: armnetwork.Interface{
+				ID:       ptr.To(""),
+				Name:     ptr.To("my-net-interface"),
+				Location: ptr.To("fake-location"),
+				Type:     ptr.To("Microsoft.Network/networkInterfaces"),
+				Properties: &armnetwork.InterfacePropertiesFormat{
+					ProvisioningState: ptr.To(armnetwork.ProvisioningStateUpdating),
+				},
+			},
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeNil())
+			},
+			expectedError: "",
+		},
+		{
+			name: "recreate parameters for network interface when Azure provisioning state nil",
+			spec: func() *NICSpec {
+				s := fakeStaticPrivateIPNICSpec // value‑copy
+				return &s                       // pointer to the copy, not the global
+			}(),
+			existing: armnetwork.Interface{
+				ID:       ptr.To(""),
+				Name:     ptr.To("my-net-interface"),
+				Location: ptr.To("fake-location"),
+				Type:     ptr.To("Microsoft.Network/networkInterfaces"),
+			},
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armnetwork.Interface{}))
+				g.Expect(result.(armnetwork.Interface)).To(Equal(armnetwork.Interface{
+					Tags: map[string]*string{
+						"Name": ptr.To("my-net-interface"),
+						"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": ptr.To("owned"),
+					},
+					Location: ptr.To("fake-location"),
+					Properties: &armnetwork.InterfacePropertiesFormat{
+						Primary:                     nil,
+						EnableAcceleratedNetworking: ptr.To(true),
+						EnableIPForwarding:          ptr.To(false),
+						DNSSettings:                 &armnetwork.InterfaceDNSSettings{},
+						IPConfigurations: []*armnetwork.InterfaceIPConfiguration{
+							{
+								Name: ptr.To("pipConfig"),
+								Properties: &armnetwork.InterfaceIPConfigurationPropertiesFormat{
+									Primary:                         ptr.To(true),
+									LoadBalancerBackendAddressPools: []*armnetwork.BackendAddressPool{{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-public-lb/backendAddressPools/cluster-name-outboundBackendPool")}},
+									PrivateIPAllocationMethod:       ptr.To(armnetwork.IPAllocationMethodStatic),
+									PrivateIPAddress:                ptr.To("fake.static.ip"),
+									Subnet:                          &armnetwork.Subnet{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-subnet")},
 								},
 							},
 						},
@@ -337,13 +819,13 @@ func TestParameters(t *testing.T) {
 			expectedError: "",
 		},
 	}
+	format.MaxLength = 10000
 	for _, tc := range testcases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 			t.Parallel()
 
-			result, err := tc.spec.Parameters(tc.existing)
+			result, err := tc.spec.Parameters(t.Context(), tc.existing)
 			if tc.expectedError != "" {
 				g.Expect(err).To(HaveOccurred())
 				g.Expect(err).To(MatchError(tc.expectedError))
@@ -351,6 +833,56 @@ func TestParameters(t *testing.T) {
 				g.Expect(err).NotTo(HaveOccurred())
 			}
 			tc.expect(g, result)
+		})
+	}
+}
+
+func TestParametersLogsUnsupportedAcceleratedNetworking(t *testing.T) {
+	// fakeSku has the AcceleratedNetworking capability, so use one without it.
+	unsupportedSku := resourceskus.SKU{
+		Name: ptr.To("Standard_D2_v2"),
+		Kind: ptr.To(string(resourceskus.VirtualMachines)),
+		Capabilities: []*armcompute.ResourceSKUCapabilities{
+			{
+				Name:  ptr.To(resourceskus.AcceleratedNetworking),
+				Value: ptr.To(string(resourceskus.CapabilityUnsupported)),
+			},
+		},
+	}
+
+	testcases := []struct {
+		name        string
+		accelerated *bool
+		expectLog   bool
+	}{
+		{name: "explicitly enabled on unsupported SKU", accelerated: ptr.To(true), expectLog: true},
+		{name: "explicitly disabled on unsupported SKU", accelerated: ptr.To(false), expectLog: false},
+		{name: "unset on unsupported SKU", accelerated: nil, expectLog: false},
+	}
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			var logged []string
+			logger := funcr.New(func(prefix, args string) {
+				logged = append(logged, args)
+			}, funcr.Options{})
+			ctx := log.IntoContext(t.Context(), logger)
+
+			spec := fakeNonAcceleratedNetworkingNICSpec
+			spec.AcceleratedNetworking = tc.accelerated
+			spec.SKU = &unsupportedSku
+
+			_, err := spec.Parameters(ctx, nil)
+			g.Expect(err).NotTo(HaveOccurred())
+
+			found := false
+			for _, l := range logged {
+				if strings.Contains(l, "accelerated networking is enabled but the VM size does not support it") {
+					found = true
+				}
+			}
+			g.Expect(found).To(Equal(tc.expectLog))
 		})
 	}
 }

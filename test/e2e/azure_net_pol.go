@@ -1,3 +1,4 @@
+//go:build e2e
 // +build e2e
 
 /*
@@ -21,29 +22,27 @@ package e2e
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
 	"os"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
-	deploymentBuilder "sigs.k8s.io/cluster-api-provider-azure/test/e2e/kubernetes/deployment"
-	e2e_namespace "sigs.k8s.io/cluster-api-provider-azure/test/e2e/kubernetes/namespace"
-	e2e_networkpolicy "sigs.k8s.io/cluster-api-provider-azure/test/e2e/kubernetes/networkpolicy"
-
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/cluster-api/test/framework"
+
+	deploymentBuilder "sigs.k8s.io/cluster-api-provider-azure/test/e2e/kubernetes/deployment"
+	e2e_namespace "sigs.k8s.io/cluster-api-provider-azure/test/e2e/kubernetes/namespace"
+	e2e_networkpolicy "sigs.k8s.io/cluster-api-provider-azure/test/e2e/kubernetes/networkpolicy"
 )
 
 const (
 	PolicyDir = "workloads/policies"
 )
 
-// AzureLBSpecInput is the input for AzureLBSpec.
+// AzureNetPolSpecInput is the input for AzureNetPolSpec.
 type AzureNetPolSpecInput struct {
 	BootstrapClusterProxy framework.ClusterProxy
 	Namespace             *corev1.Namespace
@@ -69,7 +68,7 @@ func AzureNetPolSpec(ctx context.Context, inputGetter func() AzureNetPolSpecInpu
 	Expect(clusterProxy).NotTo(BeNil())
 	clientset = clusterProxy.GetClientSet()
 	Expect(clientset).NotTo(BeNil())
-	testTmpDir, err := ioutil.TempDir("/tmp", "azure-test")
+	testTmpDir, err := os.MkdirTemp("/tmp", "azure-test")
 	defer os.RemoveAll(testTmpDir)
 	Expect(err).NotTo(HaveOccurred())
 	config = createRestConfig(ctx, testTmpDir, input.Namespace.Name, input.ClusterName)
@@ -87,6 +86,8 @@ func AzureNetPolSpec(ctx context.Context, inputGetter func() AzureNetPolSpecInpu
 	Expect(err).NotTo(HaveOccurred())
 
 	By("Creating frontendProd, backend and network-policy pod deployments")
+	//nolint:gosec // This is only generating one random number which is used to
+	// name resources, so using crypto/rand isn't necessary here.
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	randInt := r.Intn(99999)
 
@@ -263,5 +264,4 @@ func AzureNetPolSpec(ctx context.Context, inputGetter func() AzureNetPolSpecInpu
 
 	By("Ensuring we have ingress access from role:frontend pods in development namespace")
 	e2e_networkpolicy.EnsureConnectivityResultBetweenPods(clientset, config, frontendDevPods, backendPods, true)
-
 }

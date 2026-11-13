@@ -19,67 +19,37 @@ package bastionhosts
 import (
 	"context"
 
+	asonetworkv1 "github.com/Azure/azure-service-operator/v2/api/network/v1api20220701"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
-	"sigs.k8s.io/cluster-api-provider-azure/azure/services/async"
-	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
-	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/aso"
+	"sigs.k8s.io/cluster-api-provider-azure/util/slice"
 )
 
 const serviceName = "bastionhosts"
 
 // BastionScope defines the scope interface for a bastion host service.
 type BastionScope interface {
-	azure.ClusterScoper
-	azure.AsyncStatusUpdater
-	AzureBastionSpec() azure.ResourceSpecGetter
-}
-
-// Service provides operations on Azure resources.
-type Service struct {
-	Scope BastionScope
-	async.Reconciler
+	aso.Scope
+	AzureBastionSpec() azure.ASOResourceSpecGetter[*asonetworkv1.BastionHost]
 }
 
 // New creates a new service.
-func New(scope BastionScope) *Service {
-	client := newClient(scope)
-	return &Service{
-		Scope:      scope,
-		Reconciler: async.New(scope, client, client),
+func New(scope BastionScope) *aso.Service[*asonetworkv1.BastionHost, BastionScope] {
+	svc := aso.NewService[*asonetworkv1.BastionHost, BastionScope](serviceName, scope)
+	spec := scope.AzureBastionSpec()
+	if spec != nil {
+		svc.Specs = []azure.ASOResourceSpecGetter[*asonetworkv1.BastionHost]{spec}
 	}
+	svc.ListFunc = list
+	svc.ConditionType = infrav1.BastionHostReadyCondition
+	return svc
 }
 
-// Reconcile gets/creates/updates a bastion host.
-func (s *Service) Reconcile(ctx context.Context) error {
-	ctx, _, done := tele.StartSpanWithLogger(ctx, "bastionhosts.Service.Reconcile")
-	defer done()
-
-	ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultAzureServiceReconcileTimeout)
-	defer cancel()
-
-	var resultingErr error
-	if bastionSpec := s.Scope.AzureBastionSpec(); bastionSpec != nil {
-		_, resultingErr = s.CreateResource(ctx, bastionSpec, serviceName)
-	}
-
-	s.Scope.UpdatePutStatus(infrav1.BastionHostReadyCondition, serviceName, resultingErr)
-	return resultingErr
-}
-
-// Delete deletes the bastion host with the provided scope.
-func (s *Service) Delete(ctx context.Context) error {
-	ctx, _, done := tele.StartSpanWithLogger(ctx, "bastionhosts.Service.Delete")
-	defer done()
-
-	ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultAzureServiceReconcileTimeout)
-	defer cancel()
-
-	var resultingErr error
-	if bastionSpec := s.Scope.AzureBastionSpec(); bastionSpec != nil {
-		resultingErr = s.DeleteResource(ctx, bastionSpec, serviceName)
-	}
-
-	s.Scope.UpdateDeleteStatus(infrav1.BastionHostReadyCondition, serviceName, resultingErr)
-	return resultingErr
+func list(ctx context.Context, client client.Client, opts ...client.ListOption) ([]*asonetworkv1.BastionHost, error) {
+	list := &asonetworkv1.BastionHostList{}
+	err := client.List(ctx, list, opts...)
+	return slice.ToPtrs(list.Items), err
 }

@@ -19,10 +19,11 @@ package disks
 import (
 	"context"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/async"
-	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
 )
 
@@ -41,13 +42,22 @@ type Service struct {
 	async.Reconciler
 }
 
-// New creates a new disks service.
-func New(scope DiskScope) *Service {
-	client := newClient(scope)
-	return &Service{
-		Scope:      scope,
-		Reconciler: async.New(scope, nil, client),
+// New creates a disks service.
+func New(scope DiskScope) (*Service, error) {
+	client, err := newClient(scope, scope.DefaultedAzureCallTimeout())
+	if err != nil {
+		return nil, err
 	}
+	return &Service{
+		Scope: scope,
+		Reconciler: async.New[armcompute.DisksClientCreateOrUpdateResponse,
+			armcompute.DisksClientDeleteResponse](scope, nil, client),
+	}, nil
+}
+
+// Name returns the service name.
+func (s *Service) Name() string {
+	return serviceName
 }
 
 // Reconcile on disk is currently no-op. OS disks should only be deleted and will create with the VM automatically.
@@ -64,21 +74,13 @@ func (s *Service) Delete(ctx context.Context) error {
 	ctx, _, done := tele.StartSpanWithLogger(ctx, "disks.Service.Delete")
 	defer done()
 
-	ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultAzureServiceReconcileTimeout)
+	ctx, cancel := context.WithTimeout(ctx, s.Scope.DefaultedAzureServiceReconcileTimeout())
 	defer cancel()
 
-	var result error
+	return azure.DeleteAll(ctx, s.Reconciler, s.Scope, s.Scope.DiskSpecs(), serviceName, infrav1.DisksReadyCondition)
+}
 
-	// We go through the list of DiskSpecs to delete each one, independently of the result of the previous one.
-	// If multiple errors occur, we return the most pressing one.
-	//  Order of precedence (highest -> lowest) is: error that is not an operationNotDoneError (ie. error creating) -> operationNotDoneError (ie. creating in progress) -> no error (ie. created)
-	for _, diskSpec := range s.Scope.DiskSpecs() {
-		if err := s.DeleteResource(ctx, diskSpec, serviceName); err != nil {
-			if !azure.IsOperationNotDoneError(err) || result == nil {
-				result = err
-			}
-		}
-	}
-	s.Scope.UpdateDeleteStatus(infrav1.DisksReadyCondition, serviceName, result)
-	return result
+// IsManaged returns always returns true as CAPZ does not support BYO disk.
+func (s *Service) IsManaged(_ context.Context) (bool, error) {
+	return true, nil
 }

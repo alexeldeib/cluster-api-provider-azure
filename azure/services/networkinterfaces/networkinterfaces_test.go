@@ -17,20 +17,23 @@ limitations under the License.
 package networkinterfaces
 
 import (
-	"context"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"testing"
 
-	"github.com/Azure/go-autorest/autorest"
-	"github.com/golang/mock/gomock"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/google/go-cmp/cmp"
 	. "github.com/onsi/gomega"
+	"go.uber.org/mock/gomock"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/async/mock_async"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/networkinterfaces/mock_networkinterfaces"
 	gomockinternal "sigs.k8s.io/cluster-api-provider-azure/internal/test/matchers/gomock"
+	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
 )
 
 var (
@@ -58,7 +61,24 @@ var (
 		AcceleratedNetworking: nil,
 		SKU:                   &fakeSku,
 	}
-	internalError = autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 500}, "Internal Server Error")
+	fakeNICSpec3 = NICSpec{
+		Name:                  "nic-3",
+		ResourceGroup:         "my-rg",
+		Location:              "fake-location",
+		SubscriptionID:        "123",
+		MachineName:           "azure-test1",
+		VNetName:              "my-vnet",
+		VNetResourceGroup:     "my-rg",
+		AcceleratedNetworking: nil,
+		SKU:                   &fakeSku,
+		IPConfigs:             []IPConfig{{}, {}},
+	}
+	internalError = &azcore.ResponseError{
+		RawResponse: &http.Response{
+			Body:       io.NopCloser(strings.NewReader("#: Internal Server Error: StatusCode=500")),
+			StatusCode: http.StatusInternalServerError,
+		},
+	}
 )
 
 func TestReconcileNetworkInterface(t *testing.T) {
@@ -68,11 +88,30 @@ func TestReconcileNetworkInterface(t *testing.T) {
 		expect        func(s *mock_networkinterfaces.MockNICScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder)
 	}{
 		{
+			name:          "noop if no network interface specs are found",
+			expectedError: "",
+			expect: func(s *mock_networkinterfaces.MockNICScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
+				s.NICSpecs().Return([]azure.ResourceSpecGetter{})
+			},
+		},
+		{
 			name:          "successfully create a network interface",
 			expectedError: "",
 			expect: func(s *mock_networkinterfaces.MockNICScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
 				s.NICSpecs().Return([]azure.ResourceSpecGetter{&fakeNICSpec1})
-				r.CreateResource(gomockinternal.AContext(), &fakeNICSpec1, serviceName).Return(nil, nil)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakeNICSpec1, serviceName).Return(nil, nil)
+				s.UpdatePutStatus(infrav1.NetworkInterfaceReadyCondition, serviceName, nil)
+			},
+		},
+		{
+			name:          "successfully create a network interface with multiple IPConfigs",
+			expectedError: "",
+			expect: func(s *mock_networkinterfaces.MockNICScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
+				s.NICSpecs().Return([]azure.ResourceSpecGetter{&fakeNICSpec3})
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakeNICSpec3, serviceName).Return(nil, nil)
 				s.UpdatePutStatus(infrav1.NetworkInterfaceReadyCondition, serviceName, nil)
 			},
 		},
@@ -80,9 +119,10 @@ func TestReconcileNetworkInterface(t *testing.T) {
 			name:          "successfully create multiple network interfaces",
 			expectedError: "",
 			expect: func(s *mock_networkinterfaces.MockNICScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
 				s.NICSpecs().Return([]azure.ResourceSpecGetter{&fakeNICSpec1, &fakeNICSpec2})
-				r.CreateResource(gomockinternal.AContext(), &fakeNICSpec1, serviceName).Return(nil, nil)
-				r.CreateResource(gomockinternal.AContext(), &fakeNICSpec2, serviceName).Return(nil, nil)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakeNICSpec1, serviceName).Return(nil, nil)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakeNICSpec2, serviceName).Return(nil, nil)
 				s.UpdatePutStatus(infrav1.NetworkInterfaceReadyCondition, serviceName, nil)
 			},
 		},
@@ -90,16 +130,16 @@ func TestReconcileNetworkInterface(t *testing.T) {
 			name:          "network interface create fails",
 			expectedError: internalError.Error(),
 			expect: func(s *mock_networkinterfaces.MockNICScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
 				s.NICSpecs().Return([]azure.ResourceSpecGetter{&fakeNICSpec1, &fakeNICSpec2})
-				r.CreateResource(gomockinternal.AContext(), &fakeNICSpec1, serviceName).Return(nil, internalError)
-				r.CreateResource(gomockinternal.AContext(), &fakeNICSpec2, serviceName).Return(nil, nil)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakeNICSpec1, serviceName).Return(nil, internalError)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakeNICSpec2, serviceName).Return(nil, nil)
 				s.UpdatePutStatus(infrav1.NetworkInterfaceReadyCondition, serviceName, internalError)
 			},
 		},
 	}
 
 	for _, tc := range testcases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 			t.Parallel()
@@ -115,7 +155,7 @@ func TestReconcileNetworkInterface(t *testing.T) {
 				Reconciler: asyncMock,
 			}
 
-			err := s.Reconcile(context.TODO())
+			err := s.Reconcile(t.Context())
 			if tc.expectedError != "" {
 				g.Expect(err).To(HaveOccurred())
 				fmt.Print(cmp.Diff(err.Error(), tc.expectedError))
@@ -135,9 +175,18 @@ func TestDeleteNetworkInterface(t *testing.T) {
 		expect        func(s *mock_networkinterfaces.MockNICScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder)
 	}{
 		{
+			name:          "noop if no network interface specs are found",
+			expectedError: "",
+			expect: func(s *mock_networkinterfaces.MockNICScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
+				s.NICSpecs().Return([]azure.ResourceSpecGetter{})
+			},
+		},
+		{
 			name:          "successfully delete an existing network interface",
 			expectedError: "",
 			expect: func(s *mock_networkinterfaces.MockNICScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
 				s.NICSpecs().Return([]azure.ResourceSpecGetter{&fakeNICSpec1})
 				r.DeleteResource(gomockinternal.AContext(), &fakeNICSpec1, serviceName).Return(nil)
 				s.UpdateDeleteStatus(infrav1.NetworkInterfaceReadyCondition, serviceName, nil)
@@ -147,6 +196,7 @@ func TestDeleteNetworkInterface(t *testing.T) {
 			name:          "successfully delete multiple existing network interfaces",
 			expectedError: "",
 			expect: func(s *mock_networkinterfaces.MockNICScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
 				s.NICSpecs().Return([]azure.ResourceSpecGetter{&fakeNICSpec1, &fakeNICSpec2})
 				r.DeleteResource(gomockinternal.AContext(), &fakeNICSpec1, serviceName).Return(nil)
 				r.DeleteResource(gomockinternal.AContext(), &fakeNICSpec2, serviceName).Return(nil)
@@ -157,6 +207,7 @@ func TestDeleteNetworkInterface(t *testing.T) {
 			name:          "network interface deletion fails",
 			expectedError: internalError.Error(),
 			expect: func(s *mock_networkinterfaces.MockNICScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
 				s.NICSpecs().Return([]azure.ResourceSpecGetter{&fakeNICSpec1, &fakeNICSpec2})
 				r.DeleteResource(gomockinternal.AContext(), &fakeNICSpec1, serviceName).Return(nil)
 				r.DeleteResource(gomockinternal.AContext(), &fakeNICSpec2, serviceName).Return(internalError)
@@ -166,7 +217,6 @@ func TestDeleteNetworkInterface(t *testing.T) {
 	}
 
 	for _, tc := range testcases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 			t.Parallel()
@@ -182,7 +232,7 @@ func TestDeleteNetworkInterface(t *testing.T) {
 				Reconciler: asyncMock,
 			}
 
-			err := s.Delete(context.TODO())
+			err := s.Delete(t.Context())
 			if tc.expectedError != "" {
 				g.Expect(err).To(HaveOccurred())
 				g.Expect(err).To(MatchError(tc.expectedError))

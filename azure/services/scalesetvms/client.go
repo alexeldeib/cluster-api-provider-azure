@@ -18,135 +18,89 @@ package scalesetvms
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2021-04-01/compute"
-	"github.com/Azure/go-autorest/autorest"
-	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
 	"github.com/pkg/errors"
 
-	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
-	"sigs.k8s.io/cluster-api-provider-azure/azure/converters"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/async"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
 )
 
 // client wraps go-sdk.
 type client interface {
-	Get(context.Context, string, string, string) (compute.VirtualMachineScaleSetVM, error)
-	GetResultIfDone(ctx context.Context, future *infrav1.Future) (compute.VirtualMachineScaleSetVM, error)
-	DeleteAsync(context.Context, string, string, string) (*infrav1.Future, error)
+	Get(context.Context, azure.ResourceSpecGetter) (any, error)
+	CreateOrUpdateAsync(context.Context, azure.ResourceSpecGetter, string, any) (any, *runtime.Poller[armcompute.VirtualMachineScaleSetVMsClientUpdateResponse], error)
+	DeleteAsync(context.Context, azure.ResourceSpecGetter, string) (*runtime.Poller[armcompute.VirtualMachineScaleSetVMsClientDeleteResponse], error)
 }
 
-type (
-	// azureClient contains the Azure go-sdk Client.
-	azureClient struct {
-		scalesetvms compute.VirtualMachineScaleSetVMsClient
-	}
-
-	genericScaleSetVMFuture interface {
-		DoneWithContext(ctx context.Context, sender autorest.Sender) (done bool, err error)
-		Result(client compute.VirtualMachineScaleSetVMsClient) (vmss compute.VirtualMachineScaleSetVM, err error)
-	}
-
-	deleteFutureAdapter struct {
-		compute.VirtualMachineScaleSetVMsDeleteFuture
-	}
-)
+// azureClient contains the Azure go-sdk Client.
+type azureClient struct {
+	scalesetvms    *armcompute.VirtualMachineScaleSetVMsClient
+	apiCallTimeout time.Duration
+}
 
 var _ client = &azureClient{}
 
-// newClient creates a new VMSS client from subscription ID.
-func newClient(auth azure.Authorizer) *azureClient {
-	return &azureClient{
-		scalesetvms: newVirtualMachineScaleSetVMsClient(auth.SubscriptionID(), auth.BaseURI(), auth.Authorizer()),
+// newClient creates a VMSS client from an authorizer.
+func newClient(auth azure.Authorizer, apiCallTimeout time.Duration) (*azureClient, error) {
+	opts, err := azure.ARMClientOptionsForAuth(auth)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create scalesetvms client options")
 	}
-}
-
-// newVirtualMachineScaleSetVMsClient creates a new vmss VM client from subscription ID.
-func newVirtualMachineScaleSetVMsClient(subscriptionID string, baseURI string, authorizer autorest.Authorizer) compute.VirtualMachineScaleSetVMsClient {
-	c := compute.NewVirtualMachineScaleSetVMsClientWithBaseURI(baseURI, subscriptionID)
-	c.Authorizer = authorizer
-	c.RetryAttempts = 1
-	_ = c.AddToUserAgent(azure.UserAgent()) // intentionally ignore error as it doesn't matter
-	return c
+	factory, err := armcompute.NewClientFactory(auth.SubscriptionID(), auth.Token(), opts)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create armcompute client factory")
+	}
+	return &azureClient{factory.NewVirtualMachineScaleSetVMsClient(), apiCallTimeout}, nil
 }
 
 // Get retrieves the Virtual Machine Scale Set Virtual Machine.
-func (ac *azureClient) Get(ctx context.Context, resourceGroupName, vmssName, instanceID string) (compute.VirtualMachineScaleSetVM, error) {
+func (ac *azureClient) Get(ctx context.Context, spec azure.ResourceSpecGetter) (any, error) {
 	ctx, _, done := tele.StartSpanWithLogger(ctx, "scalesetvms.azureClient.Get")
 	defer done()
 
-	return ac.scalesetvms.Get(ctx, resourceGroupName, vmssName, instanceID, "")
+	resp, err := ac.scalesetvms.Get(ctx, spec.ResourceGroupName(), spec.OwnerResourceName(), spec.ResourceName(), nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp.VirtualMachineScaleSetVM, nil
 }
 
-// GetResultIfDone fetches the result of a long-running operation future if it is done.
-func (ac *azureClient) GetResultIfDone(ctx context.Context, future *infrav1.Future) (compute.VirtualMachineScaleSetVM, error) {
-	ctx, _, spanDone := tele.StartSpanWithLogger(ctx, "scalesetvms.azureClient.GetResultIfDone")
-	defer spanDone()
-
-	var genericFuture genericScaleSetVMFuture
-	futureData, err := base64.URLEncoding.DecodeString(future.Data)
-	if err != nil {
-		return compute.VirtualMachineScaleSetVM{}, errors.Wrapf(err, "failed to base64 decode future data")
-	}
-
-	switch future.Type {
-	case infrav1.DeleteFuture:
-		var future compute.VirtualMachineScaleSetVMsDeleteFuture
-		if err := json.Unmarshal(futureData, &future); err != nil {
-			return compute.VirtualMachineScaleSetVM{}, errors.Wrap(err, "failed to unmarshal future data")
-		}
-
-		genericFuture = &deleteFutureAdapter{
-			VirtualMachineScaleSetVMsDeleteFuture: future,
-		}
-	default:
-		return compute.VirtualMachineScaleSetVM{}, errors.Errorf("unknown furture type %q", future.Type)
-	}
-
-	done, err := genericFuture.DoneWithContext(ctx, ac.scalesetvms)
-	if err != nil {
-		return compute.VirtualMachineScaleSetVM{}, errors.Wrapf(err, "failed checking if the operation was complete")
-	}
-
-	if !done {
-		return compute.VirtualMachineScaleSetVM{}, azure.WithTransientError(azure.NewOperationNotDoneError(future), 15*time.Second)
-	}
-
-	vm, err := genericFuture.Result(ac.scalesetvms)
-	if err != nil {
-		return vm, errors.Wrapf(err, "failed fetching the result of operation for vmss")
-	}
-
-	return vm, nil
-}
-
-// DeleteAsync is the operation to delete a virtual machine scale set instance asynchronously. DeleteAsync sends a DELETE
-// request to Azure and if accepted without error, the func will return a Future which can be used to track the ongoing
-// progress of the operation.
-//
-// Parameters:
-//   resourceGroupName - the name of the resource group.
-//   vmssName - the name of the VM scale set to create or update. parameters - the scale set object.
-//   instanceID - the ID of the VM scale set VM.
-func (ac *azureClient) DeleteAsync(ctx context.Context, resourceGroupName, vmssName, instanceID string) (*infrav1.Future, error) {
-	ctx, _, done := tele.StartSpanWithLogger(ctx, "scalesetvms.azureClient.DeleteAsync")
+// CreateOrUpdateAsync is a dummy implementation to fulfill the async.Reconciler interface.
+func (ac *azureClient) CreateOrUpdateAsync(ctx context.Context, _ azure.ResourceSpecGetter, _ string, _ any) (result any, poller *runtime.Poller[armcompute.VirtualMachineScaleSetVMsClientUpdateResponse], err error) {
+	_, _, done := tele.StartSpanWithLogger(ctx, "scalesets.AzureClient.CreateOrUpdateAsync")
 	defer done()
 
-	future, err := ac.scalesetvms.Delete(ctx, resourceGroupName, vmssName, instanceID, to.BoolPtr(false))
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed deleting vmss named %q", vmssName)
-	}
-
-	return converters.SDKToFuture(&future, infrav1.DeleteFuture, serviceName, instanceID, resourceGroupName)
+	return nil, nil, nil
 }
 
-// Result wraps the delete result so that we can treat it generically. The only thing we care about is if the delete
-// was successful. If it wasn't, an error will be returned.
-func (da *deleteFutureAdapter) Result(client compute.VirtualMachineScaleSetVMsClient) (compute.VirtualMachineScaleSetVM, error) {
-	_, err := da.VirtualMachineScaleSetVMsDeleteFuture.Result(client)
-	return compute.VirtualMachineScaleSetVM{}, err
+// DeleteAsync deletes a virtual machine scale set instance asynchronously. DeleteAsync sends a DELETE
+// request to Azure and if accepted without error, the func will return a Poller which can be used to track the ongoing
+// progress of the operation.
+func (ac *azureClient) DeleteAsync(ctx context.Context, spec azure.ResourceSpecGetter, resumeToken string) (poller *runtime.Poller[armcompute.VirtualMachineScaleSetVMsClientDeleteResponse], err error) {
+	ctx, _, done := tele.StartSpanWithLogger(ctx, "scalesetvms.AzureClient.DeleteAsync")
+	defer done()
+
+	opts := &armcompute.VirtualMachineScaleSetVMsClientBeginDeleteOptions{ResumeToken: resumeToken}
+	poller, err = ac.scalesetvms.BeginDelete(ctx, spec.ResourceGroupName(), spec.OwnerResourceName(), spec.ResourceName(), opts)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, ac.apiCallTimeout)
+	defer cancel()
+
+	pollOpts := &runtime.PollUntilDoneOptions{Frequency: async.DefaultPollerFrequency}
+	_, err = poller.PollUntilDone(ctx, pollOpts)
+	if err != nil {
+		// if an error occurs, return the Poller.
+		// this means the long-running operation didn't finish in the specified timeout.
+		return poller, err
+	}
+
+	// if the operation completed, return a nil poller.
+	return nil, err
 }

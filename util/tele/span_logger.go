@@ -32,21 +32,21 @@ import (
 type spanLogSink struct {
 	trace.Span
 	name string
-	vals []interface{}
+	vals []any
 }
 
-func (*spanLogSink) Init(info logr.RuntimeInfo) {
+func (*spanLogSink) Init(_ logr.RuntimeInfo) {
 }
 
 func (s *spanLogSink) End(opts ...trace.SpanEndOption) {
 	s.Span.End(opts...)
 }
 
-func (*spanLogSink) Enabled(v int) bool {
+func (*spanLogSink) Enabled(_ int) bool {
 	return true
 }
 
-func (s *spanLogSink) kvsToAttrs(keysAndValues ...interface{}) []attribute.KeyValue {
+func (s *spanLogSink) kvsToAttrs(keysAndValues ...any) []attribute.KeyValue {
 	var ret []attribute.KeyValue
 	for i := 0; i < len(keysAndValues); i += 2 {
 		kv1 := fmt.Sprintf("%s", keysAndValues[i])
@@ -70,7 +70,7 @@ func (s *spanLogSink) evtStr(evtType, msg string) string {
 	)
 }
 
-func (s *spanLogSink) Info(level int, msg string, keysAndValues ...interface{}) {
+func (s *spanLogSink) Info(_ int, msg string, keysAndValues ...any) {
 	attrs := s.kvsToAttrs(keysAndValues...)
 	s.AddEvent(
 		s.evtStr("INFO", msg),
@@ -79,7 +79,7 @@ func (s *spanLogSink) Info(level int, msg string, keysAndValues ...interface{}) 
 	)
 }
 
-func (s *spanLogSink) Error(err error, msg string, keysAndValues ...interface{}) {
+func (s *spanLogSink) Error(err error, msg string, keysAndValues ...any) {
 	attrs := s.kvsToAttrs(keysAndValues...)
 	s.AddEvent(
 		s.evtStr("ERROR", fmt.Sprintf("%s (%s)", msg, err)),
@@ -88,14 +88,18 @@ func (s *spanLogSink) Error(err error, msg string, keysAndValues ...interface{})
 	)
 }
 
-func (s *spanLogSink) WithValues(keysAndValues ...interface{}) logr.LogSink {
-	s.vals = append(s.vals, keysAndValues...)
-	return s
+func (s spanLogSink) WithValues(keysAndValues ...any) logr.LogSink {
+	// always create a new slice to avoid multiple loggers writing to the same backing array
+	vals := make([]any, len(s.vals)+len(keysAndValues))
+	copy(vals, s.vals)
+	copy(vals[len(s.vals):], keysAndValues)
+	s.vals = vals
+	return &s
 }
 
-func (s *spanLogSink) WithName(name string) logr.LogSink {
+func (s spanLogSink) WithName(name string) logr.LogSink {
 	s.name = name
-	return s
+	return &s
 }
 
 // NewSpanLogSink is the main entry-point to this implementation.
@@ -128,7 +132,7 @@ func (c Config) teleKeyValues() []attribute.KeyValue {
 // built-in functions (like KVP) that create them.
 type Option func(*Config)
 
-// KVP returns a new Option function that adds a the given
+// KVP returns a new Option function that adds the given
 // key-value pair.
 func KVP(key, value string) Option {
 	return func(cfg *Config) {
@@ -165,7 +169,7 @@ func StartSpanWithLogger(
 		span.End()
 	}
 
-	kvs := make([]interface{}, 0, 2*len(cfg.KVPs))
+	kvs := make([]any, 0, 2*len(cfg.KVPs))
 	for k, v := range cfg.KVPs {
 		kvs = append(kvs, k, v)
 	}

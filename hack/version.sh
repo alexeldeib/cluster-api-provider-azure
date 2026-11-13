@@ -17,6 +17,8 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
+set -o xtrace
+
 version::get_version_vars() {
     # shellcheck disable=SC1083
     GIT_COMMIT="$(git rev-parse HEAD^{commit})"
@@ -26,6 +28,11 @@ version::get_version_vars() {
     else
         GIT_TREE_STATE="dirty"
     fi
+
+    # Initialize version variables with defaults
+    GIT_VERSION=""
+    GIT_MAJOR=""
+    GIT_MINOR=""
 
     # borrowed from k8s.io/hack/lib/version.sh
     # Use git describe to find the version based on tags.
@@ -43,6 +50,8 @@ version::get_version_vars() {
             # We have distance to base tag (v1.1.0-1-gCommitHash)
             # shellcheck disable=SC2001
             GIT_VERSION=$(echo "${GIT_VERSION}" | sed "s/-g\([0-9a-f]\{14\}\)$/-\1/")
+            # TODO: What should the output of this command look like?
+            # For example, v1.1.0-32-gfeb4736460af8f maps to v1.1.0-32-f, do we want the trailing "-f" or not?
         fi
         if [[ "${GIT_TREE_STATE}" == "dirty" ]]; then
             # git describe --dirty only considers changes to existing files, but
@@ -86,9 +95,9 @@ version::ldflags() {
     add_ldflag "buildDate" "$(date ${SOURCE_DATE_EPOCH:+"--date=@${SOURCE_DATE_EPOCH}"} -u +'%Y-%m-%dT%H:%M:%SZ')"
     add_ldflag "gitCommit" "${GIT_COMMIT}"
     add_ldflag "gitTreeState" "${GIT_TREE_STATE}"
-    add_ldflag "gitMajor" "${GIT_MAJOR}"
-    add_ldflag "gitMinor" "${GIT_MINOR}"
-    add_ldflag "gitVersion" "${GIT_VERSION}"
+    add_ldflag "gitMajor" "${GIT_MAJOR:-0}"
+    add_ldflag "gitMinor" "${GIT_MINOR:-0}"
+    add_ldflag "gitVersion" "${GIT_VERSION:-$(git rev-parse --short HEAD)}"
 
   # The -ldflags parameter takes a single string, so join the output.
   echo "${ldflags[*]-}"

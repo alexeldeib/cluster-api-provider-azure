@@ -2,14 +2,18 @@ apiVersion: cluster.x-k8s.io/v1beta1
 kind: Cluster
 metadata:
   labels:
-    cni: ${CLUSTER_NAME}-flannel
+    cloud-provider: ${CLOUD_PROVIDER_AZURE_LABEL:=azure}
+    cni: calico
+    cni-windows: ${CLUSTER_NAME}-calico
+    containerd-logger: enabled
+    csi-proxy: enabled
   name: ${CLUSTER_NAME}
   namespace: default
 spec:
   clusterNetwork:
     pods:
       cidrBlocks:
-      - 10.244.0.0/16
+      - 192.168.0.0/16
   controlPlaneRef:
     apiVersion: controlplane.cluster.x-k8s.io/v1beta1
     kind: KubeadmControlPlane
@@ -39,8 +43,6 @@ spec:
     - name: control-plane-subnet
       role: control-plane
     - name: node-subnet
-      natGateway:
-        name: node-natgateway
       role: node
     vnet:
       name: ${AZURE_VNET_NAME:=${CLUSTER_NAME}-vnet}
@@ -57,27 +59,15 @@ spec:
     clusterConfiguration:
       apiServer:
         extraArgs:
-          cloud-config: /etc/kubernetes/azure.json
-          cloud-provider: azure
-        extraVolumes:
-        - hostPath: /etc/kubernetes/azure.json
-          mountPath: /etc/kubernetes/azure.json
-          name: cloud-config
-          readOnly: true
+          feature-gates: ${K8S_FEATURE_GATES:-""}
+          service-account-issuer: ${SERVICE_ACCOUNT_ISSUER:-https://kubernetes.default.svc.cluster.local}
         timeoutForControlPlane: 20m
       controllerManager:
         extraArgs:
-          allocate-node-cidrs: "true"
-          cloud-config: /etc/kubernetes/azure.json
-          cloud-provider: azure
+          allocate-node-cidrs: "false"
+          cloud-provider: external
           cluster-name: ${CLUSTER_NAME}
-          configure-cloud-routes: "false"
           v: "4"
-        extraVolumes:
-        - hostPath: /etc/kubernetes/azure.json
-          mountPath: /etc/kubernetes/azure.json
-          name: cloud-config
-          readOnly: true
       etcd:
         local:
           dataDir: /var/lib/etcddisk/etcd
@@ -101,18 +91,6 @@ spec:
         overwrite: false
         tableType: gpt
     files:
-    - content: |
-        network:
-          version: 2
-          ethernets:
-            eth0:
-              mtu: 1400
-              match:
-                macaddress: MACADDRESS
-              set-name: eth0
-      owner: root:root
-      path: /etc/netplan/60-eth0.yaml
-      permissions: "0644"
     - contentFrom:
         secret:
           key: control-plane-azure.json
@@ -123,31 +101,25 @@ spec:
     initConfiguration:
       nodeRegistration:
         kubeletExtraArgs:
-          azure-container-registry-config: /etc/kubernetes/azure.json
-          cloud-config: /etc/kubernetes/azure.json
-          cloud-provider: azure
+          cloud-provider: external
         name: '{{ ds.meta_data["local_hostname"] }}'
     joinConfiguration:
       nodeRegistration:
         kubeletExtraArgs:
-          azure-container-registry-config: /etc/kubernetes/azure.json
-          cloud-config: /etc/kubernetes/azure.json
-          cloud-provider: azure
+          cloud-provider: external
         name: '{{ ds.meta_data["local_hostname"] }}'
     mounts:
     - - LABEL=etcd_disk
       - /var/lib/etcddisk
-    postKubeadmCommands:
-    - mac=$(ip -o link | grep eth0 | grep ether | awk '{ print $17 }')
-    - sed -i -e "s/MACADDRESS/$${mac}/g" /etc/netplan/60-eth0.yaml
-    - netplan apply
+    postKubeadmCommands: []
     preKubeadmCommands: []
+    verbosity: 10
   machineTemplate:
     infrastructureRef:
       apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
       kind: AzureMachineTemplate
       name: ${CLUSTER_NAME}-control-plane
-  replicas: ${CONTROL_PLANE_MACHINE_COUNT}
+  replicas: ${CONTROL_PLANE_MACHINE_COUNT:=1}
   version: ${KUBERNETES_VERSION}
 ---
 apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
@@ -158,14 +130,19 @@ metadata:
 spec:
   template:
     spec:
+      additionalTags:
+        monitoring: virtualmachine
       dataDisks:
       - diskSizeGB: 256
         lun: 0
         nameSuffix: etcddisk
+      identity: UserAssigned
       osDisk:
         diskSizeGB: 128
         osType: Linux
       sshPublicKey: ${AZURE_SSH_PUBLIC_KEY_B64:=""}
+      userAssignedIdentities:
+      - providerID: azure:///subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${CI_RG:=capz-ci}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/${USER_IDENTITY:=cloud-provider-user-identity}
       vmSize: ${AZURE_CONTROL_PLANE_MACHINE_TYPE}
 ---
 apiVersion: cluster.x-k8s.io/v1beta1
@@ -175,9 +152,12 @@ metadata:
   namespace: default
 spec:
   clusterName: ${CLUSTER_NAME}
-  replicas: ${WORKER_MACHINE_COUNT:-1}
+  replicas: ${WORKER_MACHINE_COUNT:=2}
   selector: {}
   template:
+    metadata:
+      labels:
+        nodepool: pool1
     spec:
       bootstrap:
         configRef:
@@ -199,12 +179,24 @@ metadata:
 spec:
   template:
     spec:
+      additionalTags:
+        monitoring: virtualmachine
+      identity: UserAssigned
       osDisk:
         diskSizeGB: 128
-        managedDisk:
-          storageAccountType: Premium_LRS
         osType: Linux
       sshPublicKey: ${AZURE_SSH_PUBLIC_KEY_B64:=""}
+      userAssignedIdentities:
+      - providerID: azure:///subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${CI_RG:=capz-ci}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/${USER_IDENTITY:=cloud-provider-user-identity}
+      vmExtensions:
+      - name: CustomScript
+        protectedSettings:
+          commandToExecute: |
+            #!/bin/sh
+            echo "This script is a no-op used for extension testing purposes ..."
+            touch test_file
+        publisher: Microsoft.Azure.Extensions
+        version: "2.1"
       vmSize: ${AZURE_NODE_MACHINE_TYPE}
 ---
 apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
@@ -223,31 +215,12 @@ spec:
         owner: root:root
         path: /etc/kubernetes/azure.json
         permissions: "0644"
-      - content: |
-          network:
-            version: 2
-            ethernets:
-              eth0:
-                mtu: 1400
-                match:
-                  macaddress: MACADDRESS
-                set-name: eth0
-        owner: root:root
-        path: /etc/netplan/60-eth0.yaml
-        permissions: "0644"
       joinConfiguration:
         nodeRegistration:
           kubeletExtraArgs:
-            azure-container-registry-config: /etc/kubernetes/azure.json
-            cloud-config: /etc/kubernetes/azure.json
-            cloud-provider: azure
+            cloud-provider: external
           name: '{{ ds.meta_data["local_hostname"] }}'
-      postKubeadmCommands:
-      - mac=$(ip -o link | grep eth0 | grep ether | awk '{ print $17 }')
-      - sed -i -e "s/MACADDRESS/$${mac}/g" /etc/netplan/60-eth0.yaml
-      - netplan apply
       preKubeadmCommands: []
-      useExperimentalRetryJoin: true
 ---
 apiVersion: cluster.x-k8s.io/v1beta1
 kind: MachineDeployment
@@ -256,7 +229,7 @@ metadata:
   namespace: default
 spec:
   clusterName: ${CLUSTER_NAME}
-  replicas: ${WINDOWS_WORKER_MACHINE_COUNT:-2}
+  replicas: ${WINDOWS_WORKER_MACHINE_COUNT:-0}
   selector: {}
   template:
     spec:
@@ -276,21 +249,25 @@ apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
 kind: AzureMachineTemplate
 metadata:
   annotations:
-    runtime: dockershim
+    runtime: containerd
   name: ${CLUSTER_NAME}-md-win
   namespace: default
 spec:
   template:
     metadata:
       annotations:
-        runtime: dockershim
+        runtime: containerd
+        windowsServerVersion: ${WINDOWS_SERVER_VERSION:=""}
     spec:
+      identity: UserAssigned
       osDisk:
         diskSizeGB: 128
         managedDisk:
           storageAccountType: Premium_LRS
         osType: Windows
       sshPublicKey: ${AZURE_SSH_PUBLIC_KEY_B64:=""}
+      userAssignedIdentities:
+      - providerID: azure:///subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${CI_RG:=capz-ci}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/${USER_IDENTITY:=cloud-provider-user-identity}
       vmSize: ${AZURE_NODE_MACHINE_TYPE}
 ---
 apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
@@ -309,36 +286,119 @@ spec:
         owner: root:root
         path: c:/k/azure.json
         permissions: "0644"
-      - content: |
-          # required as a work around for Flannel and Wins bugs
-          # https://github.com/coreos/flannel/issues/1359
-          # https://github.com/kubernetes-sigs/sig-windows-tools/issues/103#issuecomment-709426828
-          ipmo C:\k\debug\hns.psm1;
-          New-HnsNetwork -Type Overlay -AddressPrefix "192.168.255.0/30" -Gateway "192.168.255.1" -Name "External" -AdapterName "Ethernet 2" -SubnetPolicies @(@{Type = "VSID"; VSID = 9999; })
-        path: C:/create-external-network.ps1
+      - content: |-
+          Add-MpPreference -ExclusionProcess C:/opt/cni/bin/calico.exe
+          Add-MpPreference -ExclusionProcess C:/opt/cni/bin/calico-ipam.exe
+        path: C:/defender-exclude-calico.ps1
         permissions: "0744"
       - content: |
           # /tmp is assumed created and required for upstream e2e tests to pass
           New-Item -ItemType Directory -Force -Path C:\tmp\
         path: C:/create-temp-folder.ps1
         permissions: "0744"
+      - content: |
+          $ErrorActionPreference = 'Stop'
+
+          $$CONTAINERD_URL="${WINDOWS_CONTAINERD_URL}"
+          if($$CONTAINERD_URL -ne ""){
+            # Kubelet service depends on contianerd service so make a best effort attempt to stop it
+            Stop-Service kubelet -Force -ErrorAction SilentlyContinue
+            Stop-Service containerd -Force
+            echo "downloading containerd: $$CONTAINERD_URL"
+            curl.exe --retry 10 --retry-delay 5 -L "$$CONTAINERD_URL" --output "c:/k/containerd.tar.gz"
+            tar.exe -zxvf c:/k/containerd.tar.gz -C "c:/Program Files/containerd" --strip-components 1
+
+            Start-Service containerd
+          }
+
+          containerd.exe --version
+          containerd-shim-runhcs-v1.exe --version
+        path: C:/replace-containerd.ps1
+        permissions: "0744"
+      - content: |
+          mkdir -Force c:/localdumps
+          reg.exe add "HKLM\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps" /V DumpCount /t REG_DWORD /d 50 /f
+          reg.exe add "HKLM\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps" /V DumpType /t REG_DWORD /d 2 /f
+          reg.exe add "HKLM\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps" /V DumpFolder /t REG_EXPAND_SZ /d "c:/LocalDumps" /f
+          # Enable sftp so we can copy crash dump files during log collection of stfp
+          $sshd_config = "$env:ProgramData\ssh\sshd_config"
+          if (-not (Test-Path $sshd_config)) { mkdir -Force $sshd_config }
+          Add-Content -Path $sshd_config "Subsystem sftp              sftp-server.exe"
+          sc.exe stop sshd
+          sc.exe start sshd
+        path: C:/collect-hns-crashes.ps1
+        permissions: "0744"
       joinConfiguration:
         nodeRegistration:
+          criSocket: npipe:////./pipe/containerd-containerd
           kubeletExtraArgs:
-            azure-container-registry-config: c:/k/azure.json
-            cloud-config: c:/k/azure.json
-            cloud-provider: azure
+            cloud-provider: external
+            feature-gates: ${NODE_FEATURE_GATES:-""}
+            register-with-taints: node.cloudprovider.kubernetes.io/uninitialized=true:NoSchedule
+            v: "2"
+            windows-priorityclass: ABOVE_NORMAL_PRIORITY_CLASS
           name: '{{ ds.meta_data["local_hostname"] }}'
       postKubeadmCommands:
       - nssm set kubelet start SERVICE_AUTO_START
+      - powershell C:/defender-exclude-calico.ps1
       preKubeadmCommands:
-      - powershell c:/create-external-network.ps1
       - powershell C:/create-temp-folder.ps1
+      - powershell C:/replace-containerd.ps1
+      - powershell C:/collect-hns-crashes.ps1
       users:
       - groups: Administrators
         name: capi
         sshAuthorizedKeys:
         - ${AZURE_SSH_PUBLIC_KEY:=""}
+---
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineHealthCheck
+metadata:
+  name: ${CLUSTER_NAME}-control-plane
+  namespace: default
+spec:
+  clusterName: ${CLUSTER_NAME}
+  maxUnhealthy: 100%
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/control-plane: ""
+  unhealthyConditions:
+  - status: Unknown
+    timeout: 300s
+    type: Ready
+  - status: "False"
+    timeout: 300s
+    type: Ready
+---
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineHealthCheck
+metadata:
+  name: ${CLUSTER_NAME}-mhc-0
+  namespace: default
+spec:
+  clusterName: ${CLUSTER_NAME}
+  maxUnhealthy: 100%
+  selector:
+    matchLabels:
+      nodepool: pool1
+  unhealthyConditions:
+  - status: "True"
+    timeout: 30s
+    type: E2ENodeUnhealthy
+---
+apiVersion: addons.cluster.x-k8s.io/v1beta1
+kind: ClusterResourceSet
+metadata:
+  name: ${CLUSTER_NAME}-calico-windows
+  namespace: default
+spec:
+  clusterSelector:
+    matchLabels:
+      cni-windows: ${CLUSTER_NAME}-calico
+  resources:
+  - kind: ConfigMap
+    name: cni-${CLUSTER_NAME}-calico-windows
+  strategy: ApplyOnce
 ---
 apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
 kind: AzureClusterIdentity
@@ -349,829 +409,204 @@ metadata:
   namespace: default
 spec:
   allowedNamespaces: {}
-  clientID: ${AZURE_CLIENT_ID}
-  clientSecret:
-    name: ${AZURE_CLUSTER_IDENTITY_SECRET_NAME}
-    namespace: ${AZURE_CLUSTER_IDENTITY_SECRET_NAMESPACE}
+  clientID: ${AZURE_CLIENT_ID_USER_ASSIGNED_IDENTITY}
   tenantID: ${AZURE_TENANT_ID}
-  type: ServicePrincipal
+  type: ${CLUSTER_IDENTITY_TYPE:=WorkloadIdentity}
 ---
 apiVersion: addons.cluster.x-k8s.io/v1beta1
 kind: ClusterResourceSet
 metadata:
-  name: ${CLUSTER_NAME}-flannel
+  name: csi-proxy
   namespace: default
 spec:
   clusterSelector:
     matchLabels:
-      cni: ${CLUSTER_NAME}-flannel
+      csi-proxy: enabled
   resources:
   - kind: ConfigMap
-    name: cni-${CLUSTER_NAME}-flannel
+    name: csi-proxy-addon
   strategy: ApplyOnce
+---
+apiVersion: addons.cluster.x-k8s.io/v1beta1
+kind: ClusterResourceSet
+metadata:
+  name: containerd-logger-${CLUSTER_NAME}
+  namespace: default
+spec:
+  clusterSelector:
+    matchLabels:
+      containerd-logger: enabled
+  resources:
+  - kind: ConfigMap
+    name: containerd-logger-${CLUSTER_NAME}
+  strategy: ApplyOnce
+---
+apiVersion: addons.cluster.x-k8s.io/v1alpha1
+kind: HelmChartProxy
+metadata:
+  name: calico
+  namespace: default
+spec:
+  chartName: tigera-operator
+  clusterSelector:
+    matchLabels:
+      cni: calico
+  namespace: tigera-operator
+  releaseName: projectcalico
+  repoURL: https://docs.tigera.io/calico/charts
+  valuesTemplate: |
+    installation:
+      cni:
+        type: Calico
+        ipam:
+          type: Calico
+      calicoNetwork:
+        bgp: Disabled
+        windowsDataplane: HNS
+        mtu: 1350
+        ipPools:{{range $i, $cidr := .Cluster.spec.clusterNetwork.pods.cidrBlocks }}
+        - cidr: {{ $cidr }}
+          encapsulation: VXLAN{{end}}
+      typhaDeployment:
+        spec:
+          template:
+            spec:
+              # By default, typha tolerates all NoSchedule taints. This breaks
+              # scale-ins when it continuously gets scheduled onto an
+              # out-of-date Node that is being deleted. Tolerate only the
+              # NoSchedule taints that are expected.
+              tolerations:
+                - effect: NoExecute
+                  operator: Exists
+                - effect: NoSchedule
+                  key: node-role.kubernetes.io/control-plane
+                  operator: Exists
+                - effect: NoSchedule
+                  key: node.kubernetes.io/not-ready
+                  operator: Exists
+              affinity:
+                nodeAffinity:
+                  preferredDuringSchedulingIgnoredDuringExecution:
+                  - weight: 50
+                    preference:
+                      matchExpressions:
+                      - key: node-role.kubernetes.io/control-plane
+                        operator: Exists
+      registry: capzcicommunity.azurecr.io
+      serviceCIDRs:
+        - 10.96.0.0/12 # must match cluster service CIDR (this is the default)
+    # Image and registry configuration for the tigera/operator pod
+    tigeraOperator:
+      image: tigera/operator
+      registry: capzcicommunity.azurecr.io
+    calicoctl:
+      image: capzcicommunity.azurecr.io/calico/ctl
+    # when kubernetesServiceEndpoint (required for windows) is added
+    # DNS configuration is needed to look up the api server name properly
+    # https://github.com/projectcalico/calico/issues/9536
+    dnsConfig:
+      nameservers:
+        - 127.0.0.53
+      options:
+        - name: edns0
+        - name: trust-ad
+    # Only set kubernetesServiceEndpoint once both parts of the control plane
+    # endpoint are populated. If rendered before infrastructure is ready, the
+    # host/port resolve to empty or "<no value>" and get baked into the
+    # kubernetes-services-endpoint ConfigMap, crash-looping the tigera-operator
+    # with "KUBERNETES_SERVICE_HOST ... must be defined". Omitting the block lets
+    # the operator use in-cluster config.
+    {{- if and .Cluster.spec.controlPlaneEndpoint.host .Cluster.spec.controlPlaneEndpoint.port }}
+    kubernetesServiceEndpoint:
+      host: "{{ .Cluster.spec.controlPlaneEndpoint.host }}"
+      port: "{{ .Cluster.spec.controlPlaneEndpoint.port }}"
+    {{- end }}
+    # By default, tigera tolerates all NoSchedule taints. This breaks upgrades
+    # when it continuously gets scheduled onto an out-of-date Node that is being
+    # deleted. Tolerate only the NoSchedule taints that are expected.
+    tolerations:
+      - effect: NoExecute
+        operator: Exists
+      - effect: NoSchedule
+        key: node-role.kubernetes.io/control-plane
+        operator: Exists
+      - effect: NoSchedule
+        key: node.kubernetes.io/not-ready
+        operator: Exists
+  version: ${CALICO_VERSION}
+---
+apiVersion: addons.cluster.x-k8s.io/v1alpha1
+kind: HelmChartProxy
+metadata:
+  name: azuredisk-csi-driver-chart
+  namespace: default
+spec:
+  chartName: azuredisk-csi-driver
+  clusterSelector:
+    matchLabels:
+      azuredisk-csi: "true"
+  namespace: kube-system
+  releaseName: azuredisk-csi-driver-oot
+  repoURL: https://raw.githubusercontent.com/kubernetes-sigs/azuredisk-csi-driver/master/charts
+  valuesTemplate: |-
+    controller:
+      replicas: 1
+      runOnControlPlane: true
+    windows:
+      useHostProcessContainers: {{ hasKey .Cluster.metadata.labels "cni-windows" }}
+---
+apiVersion: addons.cluster.x-k8s.io/v1alpha1
+kind: HelmChartProxy
+metadata:
+  name: cloud-provider-azure-chart
+  namespace: default
+spec:
+  chartName: cloud-provider-azure
+  clusterSelector:
+    matchLabels:
+      cloud-provider: azure
+  releaseName: cloud-provider-azure-oot
+  repoURL: https://raw.githubusercontent.com/kubernetes-sigs/cloud-provider-azure/master/helm/repo
+  valuesTemplate: |
+    infra:
+      clusterName: {{ .Cluster.metadata.name }}
+    cloudControllerManager:
+      clusterCIDR: {{ .Cluster.spec.clusterNetwork.pods.cidrBlocks | join "," }}
+      logVerbosity: 4
+---
+apiVersion: addons.cluster.x-k8s.io/v1alpha1
+kind: HelmChartProxy
+metadata:
+  name: cloud-provider-azure-chart-ci
+  namespace: default
+spec:
+  chartName: cloud-provider-azure
+  clusterSelector:
+    matchLabels:
+      cloud-provider: azure-ci
+  releaseName: cloud-provider-azure-oot
+  repoURL: https://raw.githubusercontent.com/kubernetes-sigs/cloud-provider-azure/master/helm/repo
+  valuesTemplate: |
+    infra:
+      clusterName: {{ .Cluster.metadata.name }}
+    cloudControllerManager:
+      cloudConfig: ${CLOUD_CONFIG:-"/etc/kubernetes/azure.json"}
+      cloudConfigSecretName: ${CONFIG_SECRET_NAME:-""}
+      clusterCIDR: {{ .Cluster.spec.clusterNetwork.pods.cidrBlocks | join "," }}
+      imageName: "${CCM_IMAGE_NAME:-""}"
+      imageRepository: "${IMAGE_REGISTRY:-""}"
+      imageTag: "${IMAGE_TAG_CCM:-""}"
+      logVerbosity: ${CCM_LOG_VERBOSITY:-4}
+      replicas: ${CCM_COUNT:-1}
+      enableDynamicReloading: ${ENABLE_DYNAMIC_RELOADING:-false}
+    cloudNodeManager:
+      imageName: "${CNM_IMAGE_NAME:-""}"
+      imageRepository: "${IMAGE_REGISTRY:-""}"
+      imageTag: "${IMAGE_TAG_CNM:-""}"
 ---
 apiVersion: v1
 data:
-  cni: |+
-    ---
-    apiVersion: policy/v1beta1
-    kind: PodSecurityPolicy
-    metadata:
-      name: psp.flannel.unprivileged
-      annotations:
-        seccomp.security.alpha.kubernetes.io/allowedProfileNames: docker/default
-        seccomp.security.alpha.kubernetes.io/defaultProfileName: docker/default
-        apparmor.security.beta.kubernetes.io/allowedProfileNames: runtime/default
-        apparmor.security.beta.kubernetes.io/defaultProfileName: runtime/default
-    spec:
-      privileged: false
-      volumes:
-        - configMap
-        - secret
-        - emptyDir
-        - hostPath
-      allowedHostPaths:
-        - pathPrefix: "/etc/cni/net.d"
-        - pathPrefix: "/etc/kube-flannel"
-        - pathPrefix: "/run/flannel"
-      readOnlyRootFilesystem: false
-      # Users and groups
-      runAsUser:
-        rule: RunAsAny
-      supplementalGroups:
-        rule: RunAsAny
-      fsGroup:
-        rule: RunAsAny
-      # Privilege Escalation
-      allowPrivilegeEscalation: false
-      defaultAllowPrivilegeEscalation: false
-      # Capabilities
-      allowedCapabilities: ['NET_ADMIN']
-      defaultAddCapabilities: []
-      requiredDropCapabilities: []
-      # Host namespaces
-      hostPID: false
-      hostIPC: false
-      hostNetwork: true
-      hostPorts:
-      - min: 0
-        max: 65535
-      # SELinux
-      seLinux:
-        # SELinux is unused in CaaSP
-        rule: 'RunAsAny'
-    ---
-    kind: ClusterRole
-    apiVersion: rbac.authorization.k8s.io/v1
-    metadata:
-      name: flannel
-    rules:
-      - apiGroups: ['extensions']
-        resources: ['podsecuritypolicies']
-        verbs: ['use']
-        resourceNames: ['psp.flannel.unprivileged']
-      - apiGroups:
-          - ""
-        resources:
-          - pods
-        verbs:
-          - get
-      - apiGroups:
-          - ""
-        resources:
-          - nodes
-        verbs:
-          - list
-          - watch
-      - apiGroups:
-          - ""
-        resources:
-          - nodes/status
-        verbs:
-          - patch
-    ---
-    kind: ClusterRoleBinding
-    apiVersion: rbac.authorization.k8s.io/v1
-    metadata:
-      name: flannel
-    roleRef:
-      apiGroup: rbac.authorization.k8s.io
-      kind: ClusterRole
-      name: flannel
-    subjects:
-    - kind: ServiceAccount
-      name: flannel
-      namespace: kube-system
-    ---
-    apiVersion: v1
-    kind: ServiceAccount
-    metadata:
-      name: flannel
-      namespace: kube-system
-    ---
-    kind: ConfigMap
-    apiVersion: v1
-    metadata:
-      name: kube-flannel-cfg
-      namespace: kube-system
-      labels:
-        tier: node
-        app: flannel
-    data:
-      cni-conf.json: |
-        {
-          "name": "cbr0",
-          "cniVersion": "0.3.1",
-          "plugins": [
-            {
-              "type": "flannel",
-              "delegate": {
-                "hairpinMode": true,
-                "isDefaultGateway": true
-              }
-            },
-            {
-              "type": "portmap",
-              "capabilities": {
-                "portMappings": true
-              }
-            }
-          ]
-        }
-      net-conf.json: |
-        {
-          "Network": "10.244.0.0/16",
-          "Backend": {
-            "Type": "vxlan",
-            "VNI" : 4096,
-            "Port": 4789
-          }
-        }
-    ---
-    apiVersion: apps/v1
-    kind: DaemonSet
-    metadata:
-      name: kube-flannel-ds-amd64
-      namespace: kube-system
-      labels:
-        tier: node
-        app: flannel
-    spec:
-      selector:
-        matchLabels:
-          app: flannel
-      template:
-        metadata:
-          labels:
-            tier: node
-            app: flannel
-        spec:
-          affinity:
-            nodeAffinity:
-              requiredDuringSchedulingIgnoredDuringExecution:
-                nodeSelectorTerms:
-                  - matchExpressions:
-                      - key: beta.kubernetes.io/os
-                        operator: In
-                        values:
-                          - linux
-                      - key: beta.kubernetes.io/arch
-                        operator: In
-                        values:
-                          - amd64
-          hostNetwork: true
-          tolerations:
-          - operator: Exists
-            effect: NoSchedule
-          serviceAccountName: flannel
-          initContainers:
-          - name: install-cni
-            image: quay.io/coreos/flannel:v0.12.0-amd64
-            command:
-            - cp
-            args:
-            - -f
-            - /etc/kube-flannel/cni-conf.json
-            - /etc/cni/net.d/10-flannel.conflist
-            volumeMounts:
-            - name: cni
-              mountPath: /etc/cni/net.d
-            - name: flannel-cfg
-              mountPath: /etc/kube-flannel/
-          containers:
-          - name: kube-flannel
-            image: quay.io/coreos/flannel:v0.12.0-amd64
-            command:
-            - /opt/bin/flanneld
-            args:
-            - --ip-masq
-            - --kube-subnet-mgr
-            resources:
-              requests:
-                cpu: "100m"
-                memory: "50Mi"
-              limits:
-                cpu: "100m"
-                memory: "50Mi"
-            securityContext:
-              privileged: false
-              capabilities:
-                add: ["NET_ADMIN"]
-            env:
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
-            volumeMounts:
-            - name: run
-              mountPath: /run/flannel
-            - name: flannel-cfg
-              mountPath: /etc/kube-flannel/
-          volumes:
-            - name: run
-              hostPath:
-                path: /run/flannel
-            - name: cni
-              hostPath:
-                path: /etc/cni/net.d
-            - name: flannel-cfg
-              configMap:
-                name: kube-flannel-cfg
-    ---
-    apiVersion: apps/v1
-    kind: DaemonSet
-    metadata:
-      name: kube-flannel-ds-arm64
-      namespace: kube-system
-      labels:
-        tier: node
-        app: flannel
-    spec:
-      selector:
-        matchLabels:
-          app: flannel
-      template:
-        metadata:
-          labels:
-            tier: node
-            app: flannel
-        spec:
-          affinity:
-            nodeAffinity:
-              requiredDuringSchedulingIgnoredDuringExecution:
-                nodeSelectorTerms:
-                  - matchExpressions:
-                      - key: beta.kubernetes.io/os
-                        operator: In
-                        values:
-                          - linux
-                      - key: beta.kubernetes.io/arch
-                        operator: In
-                        values:
-                          - arm64
-          hostNetwork: true
-          tolerations:
-          - operator: Exists
-            effect: NoSchedule
-          serviceAccountName: flannel
-          initContainers:
-          - name: install-cni
-            image: quay.io/coreos/flannel:v0.12.0-arm64
-            command:
-            - cp
-            args:
-            - -f
-            - /etc/kube-flannel/cni-conf.json
-            - /etc/cni/net.d/10-flannel.conflist
-            volumeMounts:
-            - name: cni
-              mountPath: /etc/cni/net.d
-            - name: flannel-cfg
-              mountPath: /etc/kube-flannel/
-          containers:
-          - name: kube-flannel
-            image: quay.io/coreos/flannel:v0.12.0-arm64
-            command:
-            - /opt/bin/flanneld
-            args:
-            - --ip-masq
-            - --kube-subnet-mgr
-            resources:
-              requests:
-                cpu: "100m"
-                memory: "50Mi"
-              limits:
-                cpu: "100m"
-                memory: "50Mi"
-            securityContext:
-              privileged: false
-              capabilities:
-                 add: ["NET_ADMIN"]
-            env:
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
-            volumeMounts:
-            - name: run
-              mountPath: /run/flannel
-            - name: flannel-cfg
-              mountPath: /etc/kube-flannel/
-          volumes:
-            - name: run
-              hostPath:
-                path: /run/flannel
-            - name: cni
-              hostPath:
-                path: /etc/cni/net.d
-            - name: flannel-cfg
-              configMap:
-                name: kube-flannel-cfg
-    ---
-    apiVersion: apps/v1
-    kind: DaemonSet
-    metadata:
-      name: kube-flannel-ds-arm
-      namespace: kube-system
-      labels:
-        tier: node
-        app: flannel
-    spec:
-      selector:
-        matchLabels:
-          app: flannel
-      template:
-        metadata:
-          labels:
-            tier: node
-            app: flannel
-        spec:
-          affinity:
-            nodeAffinity:
-              requiredDuringSchedulingIgnoredDuringExecution:
-                nodeSelectorTerms:
-                  - matchExpressions:
-                      - key: beta.kubernetes.io/os
-                        operator: In
-                        values:
-                          - linux
-                      - key: beta.kubernetes.io/arch
-                        operator: In
-                        values:
-                          - arm
-          hostNetwork: true
-          tolerations:
-          - operator: Exists
-            effect: NoSchedule
-          serviceAccountName: flannel
-          initContainers:
-          - name: install-cni
-            image: quay.io/coreos/flannel:v0.12.0-arm
-            command:
-            - cp
-            args:
-            - -f
-            - /etc/kube-flannel/cni-conf.json
-            - /etc/cni/net.d/10-flannel.conflist
-            volumeMounts:
-            - name: cni
-              mountPath: /etc/cni/net.d
-            - name: flannel-cfg
-              mountPath: /etc/kube-flannel/
-          containers:
-          - name: kube-flannel
-            image: quay.io/coreos/flannel:v0.12.0-arm
-            command:
-            - /opt/bin/flanneld
-            args:
-            - --ip-masq
-            - --kube-subnet-mgr
-            resources:
-              requests:
-                cpu: "100m"
-                memory: "50Mi"
-              limits:
-                cpu: "100m"
-                memory: "50Mi"
-            securityContext:
-              privileged: false
-              capabilities:
-                 add: ["NET_ADMIN"]
-            env:
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
-            volumeMounts:
-            - name: run
-              mountPath: /run/flannel
-            - name: flannel-cfg
-              mountPath: /etc/kube-flannel/
-          volumes:
-            - name: run
-              hostPath:
-                path: /run/flannel
-            - name: cni
-              hostPath:
-                path: /etc/cni/net.d
-            - name: flannel-cfg
-              configMap:
-                name: kube-flannel-cfg
-    ---
-    apiVersion: apps/v1
-    kind: DaemonSet
-    metadata:
-      name: kube-flannel-ds-ppc64le
-      namespace: kube-system
-      labels:
-        tier: node
-        app: flannel
-    spec:
-      selector:
-        matchLabels:
-          app: flannel
-      template:
-        metadata:
-          labels:
-            tier: node
-            app: flannel
-        spec:
-          affinity:
-            nodeAffinity:
-              requiredDuringSchedulingIgnoredDuringExecution:
-                nodeSelectorTerms:
-                  - matchExpressions:
-                      - key: beta.kubernetes.io/os
-                        operator: In
-                        values:
-                          - linux
-                      - key: beta.kubernetes.io/arch
-                        operator: In
-                        values:
-                          - ppc64le
-          hostNetwork: true
-          tolerations:
-          - operator: Exists
-            effect: NoSchedule
-          serviceAccountName: flannel
-          initContainers:
-          - name: install-cni
-            image: quay.io/coreos/flannel:v0.12.0-ppc64le
-            command:
-            - cp
-            args:
-            - -f
-            - /etc/kube-flannel/cni-conf.json
-            - /etc/cni/net.d/10-flannel.conflist
-            volumeMounts:
-            - name: cni
-              mountPath: /etc/cni/net.d
-            - name: flannel-cfg
-              mountPath: /etc/kube-flannel/
-          containers:
-          - name: kube-flannel
-            image: quay.io/coreos/flannel:v0.12.0-ppc64le
-            command:
-            - /opt/bin/flanneld
-            args:
-            - --ip-masq
-            - --kube-subnet-mgr
-            resources:
-              requests:
-                cpu: "100m"
-                memory: "50Mi"
-              limits:
-                cpu: "100m"
-                memory: "50Mi"
-            securityContext:
-              privileged: false
-              capabilities:
-                 add: ["NET_ADMIN"]
-            env:
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
-            volumeMounts:
-            - name: run
-              mountPath: /run/flannel
-            - name: flannel-cfg
-              mountPath: /etc/kube-flannel/
-          volumes:
-            - name: run
-              hostPath:
-                path: /run/flannel
-            - name: cni
-              hostPath:
-                path: /etc/cni/net.d
-            - name: flannel-cfg
-              configMap:
-                name: kube-flannel-cfg
-    ---
-    apiVersion: apps/v1
-    kind: DaemonSet
-    metadata:
-      name: kube-flannel-ds-s390x
-      namespace: kube-system
-      labels:
-        tier: node
-        app: flannel
-    spec:
-      selector:
-        matchLabels:
-          app: flannel
-      template:
-        metadata:
-          labels:
-            tier: node
-            app: flannel
-        spec:
-          affinity:
-            nodeAffinity:
-              requiredDuringSchedulingIgnoredDuringExecution:
-                nodeSelectorTerms:
-                  - matchExpressions:
-                      - key: beta.kubernetes.io/os
-                        operator: In
-                        values:
-                          - linux
-                      - key: beta.kubernetes.io/arch
-                        operator: In
-                        values:
-                          - s390x
-          hostNetwork: true
-          tolerations:
-          - operator: Exists
-            effect: NoSchedule
-          serviceAccountName: flannel
-          initContainers:
-          - name: install-cni
-            image: quay.io/coreos/flannel:v0.12.0-s390x
-            command:
-            - cp
-            args:
-            - -f
-            - /etc/kube-flannel/cni-conf.json
-            - /etc/cni/net.d/10-flannel.conflist
-            volumeMounts:
-            - name: cni
-              mountPath: /etc/cni/net.d
-            - name: flannel-cfg
-              mountPath: /etc/kube-flannel/
-          containers:
-          - name: kube-flannel
-            image: quay.io/coreos/flannel:v0.12.0-s390x
-            command:
-            - /opt/bin/flanneld
-            args:
-            - --ip-masq
-            - --kube-subnet-mgr
-            resources:
-              requests:
-                cpu: "100m"
-                memory: "50Mi"
-              limits:
-                cpu: "100m"
-                memory: "50Mi"
-            securityContext:
-              privileged: false
-              capabilities:
-                 add: ["NET_ADMIN"]
-            env:
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
-            volumeMounts:
-            - name: run
-              mountPath: /run/flannel
-            - name: flannel-cfg
-              mountPath: /etc/kube-flannel/
-          volumes:
-            - name: run
-              hostPath:
-                path: /run/flannel
-            - name: cni
-              hostPath:
-                path: /etc/cni/net.d
-            - name: flannel-cfg
-              configMap:
-                name: kube-flannel-cfg
-    ---
-    kind: ConfigMap
-    apiVersion: v1
-    metadata:
-      name: kube-flannel-windows-cfg
-      namespace: kube-system
-      labels:
-        tier: node
-        app: flannel
-    data:
-      run.ps1: |
-        $ErrorActionPreference = "Stop";
-
-        mkdir -force /host/etc/cni/net.d
-        mkdir -force /host/etc/kube-flannel
-        mkdir -force /host/opt/cni/bin
-        mkdir -force /host/k/flannel
-        mkdir -force /host/k/flannel/var/run/secrets/kubernetes.io/serviceaccount
-
-        $cniJson = get-content /etc/kube-flannel-windows/cni-conf.json | ConvertFrom-Json
-        $serviceSubnet = yq r /etc/kubeadm-config/ClusterConfiguration networking.serviceSubnet
-        $podSubnet = yq r /etc/kubeadm-config/ClusterConfiguration networking.podSubnet
-        $networkJson = wins cli net get | convertfrom-json
-
-        $cniJson.delegate.policies[0].Value.ExceptionList = $serviceSubnet, $podSubnet
-        $cniJson.delegate.policies[1].Value.DestinationPrefix = $serviceSubnet
-        Set-Content -Path /host/etc/cni/net.d/10-flannel.conf ($cniJson | ConvertTo-Json -depth 100)
-
-        cp -force /etc/kube-flannel/net-conf.json /host/etc/kube-flannel
-        cp -force -recurse /cni/* /host/opt/cni/bin
-        cp -force /k/flannel/* /host/k/flannel/
-        cp -force /kube-proxy/kubeconfig.conf /host/k/flannel/kubeconfig.yml
-        cp -force /var/run/secrets/kubernetes.io/serviceaccount/* /host/k/flannel/var/run/secrets/kubernetes.io/serviceaccount/
-        wins cli process run --path /k/flannel/setup.exe --args "--mode=overlay --interface=Ethernet 2"
-        wins cli route add --addresses 169.254.169.254
-        wins cli process run --path /k/flannel/flanneld.exe --args "--kube-subnet-mgr --kubeconfig-file /k/flannel/kubeconfig.yml" --envs "POD_NAME=$env:POD_NAME POD_NAMESPACE=$env:POD_NAMESPACE"
-      cni-conf.json: |
-        {
-          "name": "flannel.4096",
-          "cniVersion": "0.3.0",
-          "type": "flannel",
-          "capabilities": {
-            "dns": true
-          },
-          "delegate": {
-            "type": "win-overlay",
-            "policies": [
-              {
-                "Name": "EndpointPolicy",
-                "Value": {
-                  "Type": "OutBoundNAT",
-                  "ExceptionList": []
-                }
-              },
-              {
-                "Name": "EndpointPolicy",
-                "Value": {
-                  "Type": "ROUTE",
-                  "DestinationPrefix": "",
-                  "NeedEncap": true
-                }
-              }
-            ]
-          }
-        }
-    ---
-    apiVersion: apps/v1
-    kind: DaemonSet
-    metadata:
-      name: kube-flannel-ds-windows-amd64
-      labels:
-        tier: node
-        app: flannel
-      namespace: kube-system
-    spec:
-      selector:
-        matchLabels:
-          app: flannel
-      template:
-        metadata:
-          labels:
-            tier: node
-            app: flannel
-        spec:
-          affinity:
-            nodeAffinity:
-              requiredDuringSchedulingIgnoredDuringExecution:
-                nodeSelectorTerms:
-                  - matchExpressions:
-                      - key: kubernetes.io/os
-                        operator: In
-                        values:
-                          - windows
-                      - key: kubernetes.io/arch
-                        operator: In
-                        values:
-                          - amd64
-          hostNetwork: true
-          serviceAccountName: flannel
-          tolerations:
-          - operator: Exists
-            effect: NoSchedule
-          containers:
-          - name: kube-flannel
-            image: sigwindowstools/flannel:v0.13.0-nanoserver
-            command:
-            - pwsh
-            args:
-            - -file
-            - /etc/kube-flannel-windows/run.ps1
-            volumeMounts:
-            - name: wins
-              mountPath: \\.\pipe\rancher_wins
-            - name: host
-              mountPath: /host
-            - name: kube-proxy
-              mountPath: /kube-proxy
-            - name: cni
-              mountPath: /etc/cni/net.d
-            - name: flannel-cfg
-              mountPath: /etc/kube-flannel/
-            - name: flannel-windows-cfg
-              mountPath: /etc/kube-flannel-windows/
-            - name: kubeadm-config
-              mountPath: /etc/kubeadm-config/
-            env:
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  apiVersion: v1
-                  fieldPath: metadata.name
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  apiVersion: v1
-                  fieldPath: metadata.namespace
-          volumes:
-          - name: wins
-            hostPath:
-              path: \\.\pipe\rancher_wins
-              type: null
-          - name: opt
-            hostPath:
-              path: /opt
-          - name: host
-            hostPath:
-              path: /
-          - name: cni
-            hostPath:
-              path: /etc
-          - name: flannel-cfg
-            configMap:
-              name: kube-flannel-cfg
-          - name: flannel-windows-cfg
-            configMap:
-              name: kube-flannel-windows-cfg
-          - name: kube-proxy
-            configMap:
-              name: kube-proxy
-          - name: kubeadm-config
-            configMap:
-              name: kubeadm-config
-
   proxy: |
-    apiVersion: v1
-    data:
-      run-script.ps1: |-
-        $ErrorActionPreference = "Stop";
-        mkdir -force /host/var/lib/kube-proxy/var/run/secrets/kubernetes.io/serviceaccount
-        mkdir -force /host/k/kube-proxy
-
-        $$CI_VERSION="${CI_VERSION:-}"
-        if($$CI_VERSION -ne "" -And (Test-Path -Path "/host/k/kube-proxy.exe"))
-        {
-          cp -force /host/k/kube-proxy.exe /k/kube-proxy/kube-proxy.exe
-        }
-
-        cp -force /k/kube-proxy/* /host/k/kube-proxy
-        cp -force /var/lib/kube-proxy/* /host/var/lib/kube-proxy
-        cp -force /var/run/secrets/kubernetes.io/serviceaccount/* /host/var/lib/kube-proxy/var/run/secrets/kubernetes.io/serviceaccount #FIXME?
-
-        $networkName = (Get-Content /host/etc/cni/net.d/* | ConvertFrom-Json).name
-        $sourceVip = ($env:POD_IP -split "\.")[0..2] + 0 -join "."
-        yq w -i /host/var/lib/kube-proxy/config.conf winkernel.sourceVip $sourceVip
-        yq w -i /host/var/lib/kube-proxy/config.conf winkernel.networkName $networkName
-        yq w -i /host/var/lib/kube-proxy/config.conf featureGates.WinOverlay true
-        yq w -i /host/var/lib/kube-proxy/config.conf mode "kernelspace"
-        wins cli process run --path /k/kube-proxy/kube-proxy.exe --args "--v=6 --config=/var/lib/kube-proxy/config.conf --hostname-override=$env:NODE_NAME --feature-gates=WinOverlay=true"
-    kind: ConfigMap
-    metadata:
-      labels:
-        app: kube-proxy
-      name: kube-proxy-windows
-      namespace: kube-system
-    ---
     apiVersion: apps/v1
     kind: DaemonSet
     metadata:
@@ -1189,12 +624,17 @@ data:
             k8s-app: kube-proxy-windows
         spec:
           serviceAccountName: kube-proxy
+          securityContext:
+            windowsOptions:
+              hostProcess: true
+              runAsUserName: "NT AUTHORITY\\system"
+          hostNetwork: true
+          priorityClassName: system-node-critical
           containers:
-          - command:
-            - pwsh
-            args:
-            - -file
-            - /var/lib/kube-proxy-windows/run-script.ps1
+          - image: sigwindowstools/kube-proxy:${KUBERNETES_VERSION/+/_}-calico-hostprocess
+            args: ["$env:CONTAINER_SANDBOX_MOUNT_POINT/kube-proxy/start.ps1"]
+            workingDir: "$env:CONTAINER_SANDBOX_MOUNT_POINT/kube-proxy/"
+            name: kube-proxy
             env:
             - name: NODE_NAME
               valueFrom:
@@ -1205,17 +645,15 @@ data:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
-            image: sigwindowstools/kube-proxy:${KUBERNETES_VERSION/+/_}-nanoserver
-            name: kube-proxy
+            - name: KUBEPROXY_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: windows-kubeproxy-ci
+                  key: KUBEPROXY_PATH
+                  optional: true
             volumeMounts:
-            - name: wins
-              mountPath: \\.\pipe\rancher_wins
-            - name: host
-              mountPath: /host
             - mountPath: /var/lib/kube-proxy
               name: kube-proxy
-            - mountPath: /var/lib/kube-proxy-windows
-              name: kube-proxy-windows
           nodeSelector:
             kubernetes.io/os: windows
           tolerations:
@@ -1223,27 +661,185 @@ data:
             operator: Exists
           - operator: Exists
           volumes:
-          - name: wins
-            hostPath:
-              path: \\.\pipe\rancher_wins
-              type: null
-          - configMap:
-              defaultMode: 420
-              name: kube-proxy-windows
-            name: kube-proxy-windows
           - configMap:
               name: kube-proxy
             name: kube-proxy
-          - hostPath:
-              path: /
-            name: host
       updateStrategy:
         type: RollingUpdate
+  windows-cni: "# strictAffinity required for windows\napiVersion: crd.projectcalico.org/v1\nkind:
+    IPAMConfig\nmetadata:\n  name: default\nspec:\n  autoAllocateBlocks: true\n  strictAffinity:
+    true\n---\nkind: ConfigMap\napiVersion: v1\nmetadata:\n  name: calico-static-rules\n
+    \ namespace: calico-system\n  labels:\n    tier: node\n    app: calico\ndata:\n
+    \ static-rules.json: |\n    {\n      \"Provider\": \"azure\",\n      \"Version\":
+    \"0.1\",\n      \"Rules\": [\n        {\n          \"Name\": \"EndpointPolicy\",\n
+    \         \"Rule\": {\n              \"Id\": \"wireserver\",\n              \"Type\":
+    \"ACL\",\n              \"Protocol\": 6,\n              \"Action\": \"Block\",\n
+    \             \"Direction\": \"Out\",\n              \"RemoteAddresses\": \"168.63.129.16/32\",\n
+    \             \"RemotePorts\": \"80\",\n              \"Priority\": 200,\n              \"RuleType\":
+    \"Switch\"\n            }\n          }\n      ]\n    } \n---\n"
 kind: ConfigMap
 metadata:
   annotations:
     note: generated
   labels:
     type: generated
-  name: cni-${CLUSTER_NAME}-flannel
+  name: cni-${CLUSTER_NAME}-calico-windows
+  namespace: default
+---
+apiVersion: v1
+data:
+  csi-proxy: |
+    apiVersion: apps/v1
+    kind: DaemonSet
+    metadata:
+      labels:
+        k8s-app: csi-proxy
+      name: csi-proxy
+      namespace: kube-system
+    spec:
+      selector:
+        matchLabels:
+          k8s-app: csi-proxy
+      template:
+        metadata:
+          labels:
+            k8s-app: csi-proxy
+        spec:
+          nodeSelector:
+            "kubernetes.io/os": windows
+          securityContext:
+            windowsOptions:
+              hostProcess: true
+              runAsUserName: "NT AUTHORITY\\SYSTEM"
+          hostNetwork: true
+          containers:
+            - name: csi-proxy
+              image: ghcr.io/kubernetes-sigs/sig-windows/csi-proxy:v1.0.2
+kind: ConfigMap
+metadata:
+  annotations:
+    note: generated
+  labels:
+    type: generated
+  name: csi-proxy-addon
+  namespace: default
+---
+apiVersion: v1
+data:
+  containerd-windows-logger: |
+    apiVersion: apps/v1
+    kind: DaemonSet
+    metadata:
+      labels:
+        k8s-app: containerd-logger
+      name: containerd-logger
+      namespace: kube-system
+    spec:
+      selector:
+        matchLabels:
+          k8s-app: containerd-logger
+      template:
+        metadata:
+          labels:
+            k8s-app: containerd-logger
+        spec:
+          securityContext:
+            windowsOptions:
+              hostProcess: true
+              runAsUserName: "NT AUTHORITY\\system"
+          hostNetwork: true
+          containers:
+          - image: ghcr.io/kubernetes-sigs/sig-windows/eventflow-logger:v0.1.0
+            args: [ "config.json" ]
+            name: containerd-logger
+            imagePullPolicy: Always
+            volumeMounts:
+            - name: containerd-logger-config
+              mountPath: /config.json
+              subPath: config.json
+          nodeSelector:
+            kubernetes.io/os: windows
+          tolerations:
+          - key: CriticalAddonsOnly
+            operator: Exists
+          - operator: Exists
+          volumes:
+          - configMap:
+              name: containerd-logger-config
+            name: containerd-logger-config
+      updateStrategy:
+        type: RollingUpdate
+    ---
+    kind: ConfigMap
+    apiVersion: v1
+    metadata:
+      name: containerd-logger-config
+      namespace: kube-system
+    data:
+      config.json: |
+        {
+          "inputs": [
+            {
+              "type": "ETW",
+              "sessionNamePrefix": "containerd",
+              "cleanupOldSessions": true,
+              "reuseExistingSession": true,
+              "providers": [
+                {
+                  "providerName": "Microsoft.Virtualization.RunHCS",
+                  "providerGuid": "0B52781F-B24D-5685-DDF6-69830ED40EC3",
+                  "level": "Verbose"
+                },
+                {
+                  "providerName": "ContainerD",
+                  "providerGuid": "2acb92c0-eb9b-571a-69cf-8f3410f383ad",
+                  "level": "Verbose"
+                }
+              ]
+            }
+          ],
+          "filters": [
+            {
+                "type": "drop",
+                "include": "ProviderName == Microsoft.Virtualization.RunHCS && name == Stats && hasnoproperty error"
+            },
+            {
+                "type": "drop",
+                "include": "ProviderName == Microsoft.Virtualization.RunHCS && name == hcsshim::LayerID && hasnoproperty error"
+            },
+            {
+                "type": "drop",
+                "include": "ProviderName == Microsoft.Virtualization.RunHCS && name == hcsshim::NameToGuid && hasnoproperty error"
+            },
+            {
+                "type": "drop",
+                "include": "ProviderName == Microsoft.Virtualization.RunHCS && name == containerd.task.v2.Task.Stats && hasnoproperty error"
+            },
+            {
+                "type": "drop",
+                "include": "ProviderName == Microsoft.Virtualization.RunHCS && name == containerd.task.v2.Task.State && hasnoproperty error"
+            },
+            {
+                "type": "drop",
+                "include": "ProviderName == Microsoft.Virtualization.RunHCS && name == HcsGetProcessProperties && hasnoproperty error"
+            },
+            {
+                "type": "drop",
+                "include": "ProviderName == Microsoft.Virtualization.RunHCS && name == HcsGetComputeSystemProperties && hasnoproperty error"
+            }
+          ],
+          "outputs": [
+            {
+              "type": "StdOutput"
+            }
+          ],
+          "schemaVersion": "2016-08-11"
+        }
+kind: ConfigMap
+metadata:
+  annotations:
+    note: generated
+  labels:
+    type: generated
+  name: containerd-logger-${CLUSTER_NAME}
   namespace: default

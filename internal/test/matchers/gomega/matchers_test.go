@@ -26,7 +26,7 @@ import (
 
 var (
 	defaultLogEntry = record.LogEntry{
-		Values: []interface{}{
+		Values: []any{
 			"foo",
 			"bin",
 			"bax",
@@ -79,7 +79,6 @@ func TestLogContains(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		c := c
 		t.Run(c.Name, func(t *testing.T) {
 			t.Parallel()
 			g := gomega.NewWithT(t)
@@ -94,7 +93,7 @@ func TestLogContainsEntries(t *testing.T) {
 	entries := []record.LogEntry{
 		defaultLogEntry,
 		{
-			Values: []interface{}{
+			Values: []any{
 				"controller",
 				"AzureCluster",
 				"predicate",

@@ -18,13 +18,18 @@ package scalesetvms
 
 import (
 	"context"
+	"fmt"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
 	"github.com/pkg/errors"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/converters"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/async"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/virtualmachines"
+	azureutil "sigs.k8s.io/cluster-api-provider-azure/util/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
 )
 
@@ -35,111 +40,138 @@ type (
 	ScaleSetVMScope interface {
 		azure.ClusterDescriber
 		azure.AsyncStatusUpdater
-		InstanceID() string
-		ScaleSetName() string
+		ScaleSetVMSpec() azure.ResourceSpecGetter
 		SetVMSSVM(vmssvm *azure.VMSSVM)
+		SetVMSSVMState(state infrav1.ProvisioningState)
 	}
 
 	// Service provides operations on Azure resources.
 	Service struct {
-		Client client
-		Scope  ScaleSetVMScope
+		Scope ScaleSetVMScope
+		async.Reconciler
+		VMReconciler async.Reconciler
 	}
 )
 
 // NewService creates a new service.
-func NewService(scope ScaleSetVMScope) *Service {
-	return &Service{
-		Client: newClient(scope),
-		Scope:  scope,
+func NewService(scope ScaleSetVMScope) (*Service, error) {
+	client, err := newClient(scope, scope.DefaultedAzureCallTimeout())
+	if err != nil {
+		return nil, err
 	}
+	vmClient, err := virtualmachines.NewClient(scope, scope.DefaultedAzureCallTimeout())
+	if err != nil {
+		return nil, err
+	}
+	return &Service{
+		Reconciler: async.New[armcompute.VirtualMachineScaleSetVMsClientUpdateResponse,
+			armcompute.VirtualMachineScaleSetVMsClientDeleteResponse](scope, client, client),
+		VMReconciler: async.New[armcompute.VirtualMachinesClientCreateOrUpdateResponse,
+			armcompute.VirtualMachinesClientDeleteResponse](scope, vmClient, vmClient),
+		Scope: scope,
+	}, nil
+}
+
+// Name returns the service name.
+func (s *Service) Name() string {
+	return serviceName
 }
 
 // Reconcile idempotently gets, creates, and updates a scale set.
 func (s *Service) Reconcile(ctx context.Context) error {
-	ctx, _, done := tele.StartSpanWithLogger(ctx, "scalesetvms.Service.Reconcile")
+	ctx, log, done := tele.StartSpanWithLogger(ctx, "scalesetvms.Service.Reconcile")
 	defer done()
 
-	var (
-		resourceGroup = s.Scope.ResourceGroup()
-		vmssName      = s.Scope.ScaleSetName()
-		instanceID    = s.Scope.InstanceID()
-	)
-
-	// fetch the latest data about the instance -- model mutations are handled by the AzureMachinePoolReconciler
-	instance, err := s.Client.Get(ctx, resourceGroup, vmssName, instanceID)
-	if err != nil {
-		if azure.ResourceNotFound(err) {
-			return azure.WithTransientError(errors.New("instance does not exist yet"), 30*time.Second)
-		}
-		return errors.Wrap(err, "failed getting instance")
+	spec := s.Scope.ScaleSetVMSpec()
+	scaleSetVMSpec, ok := spec.(*ScaleSetVMSpec)
+	if !ok {
+		return errors.Errorf("%T is not of type ScaleSetVMSpec", spec)
 	}
 
-	s.Scope.SetVMSSVM(converters.SDKToVMSSVM(instance))
+	reconciler := s.Reconciler
+	var getter azure.ResourceSpecGetter = scaleSetVMSpec
+	var result any
+	var err error
+	// Fetch the latest instance or VM data. AzureMachinePoolReconciler handles model mutations.
+	if scaleSetVMSpec.IsFlex {
+		log.V(4).Info("VMSS is flex", "vmssName", scaleSetVMSpec.Name, "providerID", scaleSetVMSpec.ProviderID, "resourceID", scaleSetVMSpec.ResourceID)
+		getter, err = scaleSetVMSpecToVMSpec(*scaleSetVMSpec)
+		if err != nil {
+			return errors.Wrap(err, "failed to convert scaleSetVMSpec to vmSpec")
+		}
+		reconciler = s.VMReconciler
+	} else {
+		log.V(4).Info("VMSS is uniform", "vmssName", scaleSetVMSpec.Name, "providerID", scaleSetVMSpec.ProviderID, "instanceID", scaleSetVMSpec.InstanceID)
+	}
+
+	// We only want to get the resource if it exists and handle the not found error.
+	// We're using CreateOrUpdateResource() to do so but it doesn't actually create or update anything since getter.Parameters() always returns nil.
+	result, err = reconciler.CreateOrUpdateResource(ctx, getter, serviceName)
+	if err != nil {
+		return err
+	} else if result == nil {
+		return azure.WithTransientError(fmt.Errorf("instance does not exist yet"), time.Second*30)
+	}
+
+	if scaleSetVMSpec.IsFlex {
+		vm, ok := result.(armcompute.VirtualMachine)
+		if !ok {
+			return errors.Errorf("%T is not of type armcompute.VirtualMachine", result)
+		}
+		s.Scope.SetVMSSVM(converters.SDKVMToVMSSVM(vm, infrav1.FlexibleOrchestrationMode))
+	} else {
+		instance, ok := result.(armcompute.VirtualMachineScaleSetVM)
+		if !ok {
+			return errors.Errorf("%T is not of type armcompute.VirtualMachineScaleSetVM", result)
+		}
+		s.Scope.SetVMSSVM(converters.SDKToVMSSVM(instance))
+	}
+
 	return nil
 }
 
 // Delete deletes a scaleset instance asynchronously returning a future which encapsulates the long-running operation.
 func (s *Service) Delete(ctx context.Context) error {
-	var (
-		resourceGroup = s.Scope.ResourceGroup()
-		vmssName      = s.Scope.ScaleSetName()
-		instanceID    = s.Scope.InstanceID()
-	)
+	ctx, _, done := tele.StartSpanWithLogger(ctx, "scalesetvms.Service.Delete")
 
-	ctx, log, done := tele.StartSpanWithLogger(
-		ctx,
-		"scalesetvms.Service.Delete",
-		tele.KVP("resourceGroup", resourceGroup),
-		tele.KVP("scaleset", vmssName),
-		tele.KVP("instanceID", instanceID),
-	)
 	defer done()
 
-	defer func() {
-		if instance, err := s.Client.Get(ctx, resourceGroup, vmssName, instanceID); err == nil && instance.VirtualMachineScaleSetVMProperties != nil {
-			log.V(4).Info("updating vmss vm state", "state", instance.ProvisioningState)
-			s.Scope.SetVMSSVM(converters.SDKToVMSSVM(instance))
-		}
-	}()
-
-	log.V(4).Info("entering delete")
-	future := s.Scope.GetLongRunningOperationState(instanceID, serviceName)
-	if future != nil {
-		if future.Type != infrav1.DeleteFuture {
-			return azure.WithTransientError(errors.New("attempting to delete, non-delete operation in progress"), 30*time.Second)
-		}
-
-		log.V(4).Info("checking if the instance is done deleting")
-		if _, err := s.Client.GetResultIfDone(ctx, future); err != nil {
-			// fetch instance to update status
-			return errors.Wrap(err, "failed to get result of long running operation")
-		}
-
-		// there was no error in fetching the result, the future has been completed
-		log.V(4).Info("successfully deleted the instance")
-		s.Scope.DeleteLongRunningOperationState(instanceID, serviceName)
-		return nil
+	spec := s.Scope.ScaleSetVMSpec()
+	scaleSetVMSpec, ok := spec.(*ScaleSetVMSpec)
+	if !ok {
+		return errors.Errorf("%T is not of type ScaleSetVMSpec", spec)
 	}
 
-	// since the future was nil, there is no ongoing activity; start deleting the instance
-	future, err := s.Client.DeleteAsync(ctx, resourceGroup, vmssName, instanceID)
+	reconciler := s.Reconciler
+	var getter azure.ResourceSpecGetter = scaleSetVMSpec
+	var err error
+	if scaleSetVMSpec.IsFlex {
+		getter, err = scaleSetVMSpecToVMSpec(*scaleSetVMSpec)
+		if err != nil {
+			return errors.Wrap(err, "failed to convert scaleSetVMSpec to vmSpec")
+		}
+		reconciler = s.VMReconciler
+	}
+
+	err = reconciler.DeleteResource(ctx, getter, serviceName)
 	if err != nil {
-		if azure.ResourceNotFound(err) {
-			// already deleted
-			return nil
-		}
-		return errors.Wrapf(err, "failed to delete instance %s/%s", vmssName, instanceID)
+		s.Scope.SetVMSSVMState(infrav1.Deleting)
+	} else {
+		s.Scope.SetVMSSVMState(infrav1.Deleted)
 	}
 
-	s.Scope.SetLongRunningOperationState(future)
+	return err
+}
 
-	log.V(4).Info("checking if the instance is done deleting")
-	if _, err := s.Client.GetResultIfDone(ctx, future); err != nil {
-		// fetch instance to update status
-		return errors.Wrap(err, "failed to get result of long running operation")
+func scaleSetVMSpecToVMSpec(scaleSetVMSpec ScaleSetVMSpec) (*VMSSFlexGetter, error) {
+	parsed, err := azureutil.ParseResourceID(scaleSetVMSpec.ResourceID)
+	if err != nil {
+		return nil, errors.Wrap(err, fmt.Sprintf("failed to parse resource id %q", scaleSetVMSpec.ResourceID))
 	}
+	resourceGroup, resourceName := parsed.ResourceGroupName, parsed.Name
 
-	s.Scope.DeleteLongRunningOperationState(instanceID, serviceName)
-	return nil
+	return &VMSSFlexGetter{
+		Name:          resourceName,
+		ResourceGroup: resourceGroup,
+	}, nil
 }

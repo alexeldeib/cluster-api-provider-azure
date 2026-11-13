@@ -19,205 +19,173 @@ package privatedns
 import (
 	"context"
 
-	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
-
-	"github.com/Azure/azure-sdk-for-go/services/privatedns/mgmt/2018-09-01/privatedns"
-	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/privatedns/armprivatedns"
 	"github.com/pkg/errors"
 
+	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/converters"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/async"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/tags"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
 )
+
+// ServiceName is the name of this service.
+const ServiceName = "privatedns"
 
 // Scope defines the scope interface for a private dns service.
 type Scope interface {
 	azure.ClusterDescriber
-	PrivateDNSSpec() *azure.PrivateDNSSpec
+	azure.Authorizer
+	azure.AsyncStatusUpdater
+	PrivateDNSSpec() (zoneSpec azure.ResourceSpecGetter, linksSpec, recordsSpec []azure.ResourceSpecGetter)
 }
 
 // Service provides operations on Azure resources.
 type Service struct {
-	Scope Scope
-	client
+	Scope              Scope
+	TagsGetter         async.TagsGetter
+	zoneReconciler     async.Reconciler
+	vnetLinkReconciler async.Reconciler
+	recordReconciler   async.Reconciler
 }
 
 // New creates a new private dns service.
-func New(scope Scope) *Service {
-	return &Service{
-		Scope:  scope,
-		client: newClient(scope),
+func New(scope Scope) (*Service, error) {
+	zoneClient, err := newPrivateZonesClient(scope, scope.DefaultedAzureCallTimeout())
+	if err != nil {
+		return nil, err
 	}
+	vnetLinkClient, err := newVirtualNetworkLinksClient(scope, scope.DefaultedAzureCallTimeout())
+	if err != nil {
+		return nil, err
+	}
+	recordSetsClient, err := newRecordSetsClient(scope)
+	if err != nil {
+		return nil, err
+	}
+	tagsClient, err := tags.NewClient(scope)
+	if err != nil {
+		return nil, err
+	}
+	return &Service{
+		Scope:      scope,
+		TagsGetter: tagsClient,
+		zoneReconciler: async.New[armprivatedns.PrivateZonesClientCreateOrUpdateResponse,
+			armprivatedns.PrivateZonesClientDeleteResponse](scope, zoneClient, zoneClient),
+		vnetLinkReconciler: async.New[armprivatedns.VirtualNetworkLinksClientCreateOrUpdateResponse,
+			armprivatedns.VirtualNetworkLinksClientDeleteResponse](scope, vnetLinkClient, vnetLinkClient),
+		recordReconciler: async.New[armprivatedns.RecordSetsClientCreateOrUpdateResponse,
+			armprivatedns.RecordSetsClientDeleteResponse](scope, recordSetsClient, recordSetsClient),
+	}, nil
+}
+
+// Name returns the service name.
+func (s *Service) Name() string {
+	return ServiceName
 }
 
 // Reconcile creates or updates the private zone, links it to the vnet, and creates DNS records.
 func (s *Service) Reconcile(ctx context.Context) error {
-	ctx, log, done := tele.StartSpanWithLogger(ctx, "privatedns.Service.Reconcile")
+	ctx, _, done := tele.StartSpanWithLogger(ctx, "privatedns.Service.Reconcile")
 	defer done()
 
-	zoneSpec := s.Scope.PrivateDNSSpec()
-	if zoneSpec != nil {
-		// Skip the reconciliation of private DNS zone which is not managed by capz.
-		isManaged, err := s.isPrivateDNSManaged(ctx, s.Scope.ResourceGroup(), zoneSpec.ZoneName)
-		if err != nil && !azure.ResourceNotFound(err) {
-			return errors.Wrapf(err, "could not get private DNS zone state of %s in resource group %s", zoneSpec.ZoneName, s.Scope.ResourceGroup())
-		}
-		// If resource is not found, it means it should be created and hence setting isVnetLinkManaged to true
-		// will allow the reconciliation to continue
-		if err != nil && azure.ResourceNotFound(err) {
-			isManaged = true
-		}
-		if !isManaged {
-			log.V(1).Info("Skipping reconciliation of unmanaged private DNS zone", "private DNS", zoneSpec.ZoneName)
-			log.V(1).Info("Tag the DNS manually from azure to manage it with capz."+
-				"Please see https://capz.sigs.k8s.io/topics/custom-dns.html#manage-dns-via-capz-tool", "private DNS", zoneSpec.ZoneName)
-			return nil
-		}
-		// Create the private DNS zone.
-		log.V(2).Info("creating private DNS zone", "private dns zone", zoneSpec.ZoneName)
-		pDNS := privatedns.PrivateZone{
-			Location: to.StringPtr(azure.Global),
-			Tags: converters.TagsToMap(infrav1.Build(infrav1.BuildParams{
-				ClusterName: s.Scope.ClusterName(),
-				Lifecycle:   infrav1.ResourceLifecycleOwned,
-				Additional:  s.Scope.AdditionalTags(),
-			})),
-		}
-		err = s.client.CreateOrUpdateZone(ctx, s.Scope.ResourceGroup(), zoneSpec.ZoneName, pDNS)
-		if err != nil {
-			return errors.Wrapf(err, "failed to create private DNS zone %s", zoneSpec.ZoneName)
-		}
-		log.V(2).Info("successfully created private DNS zone", "private dns zone", zoneSpec.ZoneName)
-		for _, linkSpec := range zoneSpec.Links {
-			// If the virtual network link is not managed by capz, skip its reconciliation
-			isVnetLinkManaged, err := s.isVnetLinkManaged(ctx, s.Scope.ResourceGroup(), zoneSpec.ZoneName, linkSpec.LinkName)
-			if err != nil && !azure.ResourceNotFound(err) {
-				return errors.Wrapf(err, "could not get vnet link state of %s in resource group %s", zoneSpec.ZoneName, s.Scope.ResourceGroup())
-			}
-			// If resource is not found, it means it should be created and hence setting isVnetLinkManaged to true
-			// will allow the reconciliation to continue
-			if err != nil && azure.ResourceNotFound(err) {
-				isVnetLinkManaged = true
-			}
-			if !isVnetLinkManaged {
-				log.V(2).Info("Skipping vnet link reconciliation for unmanaged vnet link", "vnet link", linkSpec.LinkName, "private dns zone", zoneSpec.ZoneName)
-				continue
-			}
-			// Link each virtual network.
-			log.V(2).Info("creating a virtual network link", "virtual network", linkSpec.VNetName, "private dns zone", zoneSpec.ZoneName)
-			link := privatedns.VirtualNetworkLink{
-				VirtualNetworkLinkProperties: &privatedns.VirtualNetworkLinkProperties{
-					VirtualNetwork: &privatedns.SubResource{
-						ID: to.StringPtr(azure.VNetID(s.Scope.SubscriptionID(), linkSpec.VNetResourceGroup, linkSpec.VNetName)),
-					},
-					RegistrationEnabled: to.BoolPtr(false),
-				},
-				Location: to.StringPtr(azure.Global),
-				Tags: converters.TagsToMap(infrav1.Build(infrav1.BuildParams{
-					ClusterName: s.Scope.ClusterName(),
-					Lifecycle:   infrav1.ResourceLifecycleOwned,
-					Additional:  s.Scope.AdditionalTags(),
-				})),
-			}
-			err = s.client.CreateOrUpdateLink(ctx, s.Scope.ResourceGroup(), zoneSpec.ZoneName, linkSpec.LinkName, link)
-			if err != nil {
-				return errors.Wrapf(err, "failed to create virtual network link %s", linkSpec.LinkName)
-			}
-			log.V(2).Info("successfully created virtual network link", "virtual network", linkSpec.VNetName, "private dns zone", zoneSpec.ZoneName)
-		}
-		// Create the record(s).
-		for _, record := range zoneSpec.Records {
-			log.V(2).Info("creating record set", "private dns zone", zoneSpec.ZoneName, "record", record.Hostname)
-			set := privatedns.RecordSet{
-				RecordSetProperties: &privatedns.RecordSetProperties{
-					TTL: to.Int64Ptr(300),
-				},
-			}
-			recordType := converters.GetRecordType(record.IP)
-			if recordType == privatedns.A {
-				set.RecordSetProperties.ARecords = &[]privatedns.ARecord{{
-					Ipv4Address: &record.IP,
-				}}
-			} else if recordType == privatedns.AAAA {
-				set.RecordSetProperties.AaaaRecords = &[]privatedns.AaaaRecord{{
-					Ipv6Address: &record.IP,
-				}}
-			}
-			err := s.client.CreateOrUpdateRecordSet(ctx, s.Scope.ResourceGroup(), zoneSpec.ZoneName, recordType, record.Hostname, set)
-			if err != nil {
-				return errors.Wrapf(err, "failed to create record %s in private DNS zone %s", record.Hostname, zoneSpec.ZoneName)
-			}
-			log.V(2).Info("successfully created record set", "private dns zone", zoneSpec.ZoneName, "record", record.Hostname)
-		}
+	ctx, cancel := context.WithTimeout(ctx, s.Scope.DefaultedAzureServiceReconcileTimeout())
+	defer cancel()
+
+	zoneSpec, links, records := s.Scope.PrivateDNSSpec()
+	if zoneSpec == nil {
+		return nil
 	}
-	return nil
+
+	managed, err := s.reconcileZone(ctx, zoneSpec)
+	if managed {
+		s.Scope.UpdatePutStatus(infrav1.PrivateDNSZoneReadyCondition, ServiceName, err)
+	}
+	if err != nil {
+		return err
+	}
+
+	managed, err = s.reconcileLinks(ctx, links)
+	if managed {
+		s.Scope.UpdatePutStatus(infrav1.PrivateDNSLinkReadyCondition, ServiceName, err)
+	}
+	if err != nil {
+		return err
+	}
+
+	err = s.reconcileRecords(ctx, records)
+	s.Scope.UpdatePutStatus(infrav1.PrivateDNSRecordReadyCondition, ServiceName, err)
+	return err
 }
 
 // Delete deletes the private zone and vnet links.
 func (s *Service) Delete(ctx context.Context) error {
-	ctx, log, done := tele.StartSpanWithLogger(ctx, "privatedns.Service.Delete")
+	ctx, _, done := tele.StartSpanWithLogger(ctx, "privatedns.Service.Delete")
 	defer done()
 
-	zoneSpec := s.Scope.PrivateDNSSpec()
-	if zoneSpec != nil {
-		for _, linkSpec := range zoneSpec.Links {
-			// If the virtual network link is not managed by capz, skip its removal
-			isVnetLinkManaged, err := s.isVnetLinkManaged(ctx, s.Scope.ResourceGroup(), zoneSpec.ZoneName, linkSpec.LinkName)
-			if err != nil && !azure.ResourceNotFound(err) {
-				return errors.Wrapf(err, "could not get vnet link state of %s in resource group %s", zoneSpec.ZoneName, s.Scope.ResourceGroup())
-			}
-			if !isVnetLinkManaged {
-				log.V(2).Info("Skipping vnet link deletion for unmanaged vnet link", "vnet link", linkSpec.LinkName, "private dns zone", zoneSpec.ZoneName)
-				continue
-			}
-			log.V(2).Info("removing virtual network link", "virtual network", linkSpec.VNetName, "private dns zone", zoneSpec.ZoneName)
-			err = s.client.DeleteLink(ctx, s.Scope.ResourceGroup(), zoneSpec.ZoneName, linkSpec.LinkName)
-			if err != nil && !azure.ResourceNotFound(err) {
-				return errors.Wrapf(err, "failed to delete virtual network link %s with zone %s in resource group %s", linkSpec.VNetName, zoneSpec.ZoneName, s.Scope.ResourceGroup())
-			}
-		}
-		// Skip the deletion of private DNS zone which is not managed by capz.
-		isManaged, err := s.isPrivateDNSManaged(ctx, s.Scope.ResourceGroup(), zoneSpec.ZoneName)
-		if err != nil && !azure.ResourceNotFound(err) {
-			return errors.Wrapf(err, "could not get private DNS zone state of %s in resource group %s", zoneSpec.ZoneName, s.Scope.ResourceGroup())
-		}
-		if !isManaged {
-			log.V(1).Info("Skipping private DNS zone deletion for unmanaged private DNS zone", "private DNS", zoneSpec.ZoneName)
-			return nil
-		}
-		// Delete the private DNS zone, which also deletes all records.
-		log.V(2).Info("deleting private dns zone", "private dns zone", zoneSpec.ZoneName)
-		err = s.client.DeleteZone(ctx, s.Scope.ResourceGroup(), zoneSpec.ZoneName)
-		if err != nil && azure.ResourceNotFound(err) {
-			// already deleted
-			return nil
-		}
-		if err != nil && !azure.ResourceNotFound(err) {
-			return errors.Wrapf(err, "failed to delete private dns zone %s in resource group %s", zoneSpec.ZoneName, s.Scope.ResourceGroup())
-		}
-		log.V(2).Info("successfully deleted private dns zone", "private dns zone", zoneSpec.ZoneName)
-	}
-	return nil
-}
+	ctx, cancel := context.WithTimeout(ctx, s.Scope.DefaultedAzureServiceReconcileTimeout())
+	defer cancel()
 
-// isPrivateDNSManaged returns true if the private DNS has an owned tag with the cluster name as value,
-// meaning that the DNS lifecycle is managed.
-func (s *Service) isPrivateDNSManaged(ctx context.Context, resourceGroup, zoneName string) (bool, error) {
-	zone, err := s.client.GetZone(ctx, resourceGroup, zoneName)
-	if err != nil {
-		return false, err
+	zoneSpec, links, _ := s.Scope.PrivateDNSSpec()
+	if zoneSpec == nil {
+		return nil
 	}
-	tags := converters.MapToTags(zone.Tags)
-	return tags.HasOwned(s.Scope.ClusterName()), nil
+
+	managed, err := s.deleteLinks(ctx, links)
+	if managed {
+		s.Scope.UpdateDeleteStatus(infrav1.PrivateDNSLinkReadyCondition, ServiceName, err)
+	}
+	if err != nil {
+		return err
+	}
+
+	managed, err = s.deleteZone(ctx, zoneSpec)
+	if managed {
+		s.Scope.UpdateDeleteStatus(infrav1.PrivateDNSZoneReadyCondition, ServiceName, err)
+		s.Scope.UpdateDeleteStatus(infrav1.PrivateDNSRecordReadyCondition, ServiceName, err)
+	}
+
+	return err
 }
 
 // isVnetLinkManaged returns true if the vnet link has an owned tag with the cluster name as value,
 // meaning that the vnet link lifecycle is managed.
-func (s *Service) isVnetLinkManaged(ctx context.Context, resourceGroupName, zoneName, vnetLinkName string) (bool, error) {
-	zone, err := s.client.GetLink(ctx, resourceGroupName, zoneName, vnetLinkName)
+func (s *Service) isVnetLinkManaged(ctx context.Context, spec azure.ResourceSpecGetter) (bool, error) {
+	scope := azure.VirtualNetworkLinkID(s.Scope.SubscriptionID(), spec.ResourceGroupName(), spec.OwnerResourceName(), spec.ResourceName())
+	result, err := s.TagsGetter.GetAtScope(ctx, scope)
 	if err != nil {
 		return false, err
 	}
-	tags := converters.MapToTags(zone.Tags)
+
+	tagsMap := make(map[string]*string)
+	if result.Properties != nil && result.Properties.Tags != nil {
+		tagsMap = result.Properties.Tags
+	}
+
+	tags := converters.MapToTags(tagsMap)
+	return tags.HasOwned(s.Scope.ClusterName()), nil
+}
+
+// IsManaged returns true if the private DNS has an owned tag with the cluster name as value,
+// meaning that the DNS lifecycle is managed.
+func (s *Service) IsManaged(ctx context.Context) (bool, error) {
+	zoneSpec, _, _ := s.Scope.PrivateDNSSpec()
+	if zoneSpec == nil {
+		return false, errors.Errorf("no private dns zone spec available")
+	}
+
+	scope := azure.PrivateDNSZoneID(s.Scope.SubscriptionID(), zoneSpec.ResourceGroupName(), zoneSpec.ResourceName())
+	result, err := s.TagsGetter.GetAtScope(ctx, scope)
+	if err != nil {
+		return false, err
+	}
+
+	tagsMap := make(map[string]*string)
+	if result.Properties != nil && result.Properties.Tags != nil {
+		tagsMap = result.Properties.Tags
+	}
+
+	tags := converters.MapToTags(tagsMap)
 	return tags.HasOwned(s.Scope.ClusterName()), nil
 }

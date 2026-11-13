@@ -38,7 +38,7 @@ The status of VM bootstrap operations (cloud-init, kubeadm) is opaque from the p
 
 ### Option 1: Enable VM boot diagnostics
 Azure VM and VMSS support a boot diagnostics feature which streams cloud init logs and boot time output into a storage account. This would allow log collection for some aspects of bootstrapping (at least cloud init logs).
-See https://docs.microsoft.com/azure/virtual-machines/boot-diagnostics and https://github.com/kubernetes-sigs/cluster-api-provider-azure/issues/606
+See https://learn.microsoft.com/azure/virtual-machines/boot-diagnostics and https://github.com/kubernetes-sigs/cluster-api-provider-azure/issues/606
 
 #### Enable VM Boot Diagnostics Pros:
 - Low effort (this VM feature gets us basic logs for free once we enable it)
@@ -54,7 +54,7 @@ See https://docs.microsoft.com/azure/virtual-machines/boot-diagnostics and https
 
 ### Option 2: Pub/Sub model using Azure Service Bus
 Similar to the "Simple Notification Service & Simple Queue Service" solution for AWS above.
-For more info see https://docs.microsoft.com/en-us/azure/service-bus-messaging/ and https://github.com/Azure/azure-service-bus-go
+For more info see https://learn.microsoft.com/azure/service-bus-messaging/ and https://github.com/Azure/azure-service-bus-go
 
 #### Pub Sub Pros:
 - Extensible, can support lots of client patterns, e.g.:
@@ -63,13 +63,13 @@ For more info see https://docs.microsoft.com/en-us/azure/service-bus-messaging/ 
 
 #### Pub Sub Cons:
 - Complicated, lots of additional moving pieces:
-- Might have to write our own OS-specific tools to consume bootstrap logs and publish them, and those tools would be installed by additional VM Extentions, or add'l cloud-init configuration
+- Might have to write our own OS-specific tools to consume bootstrap logs and publish them, and those tools would be installed by additional VM Extensions, or add'l cloud-init configuration
 - Add’l IaaS cost
 
 ### Option 3: Azure Custom Script Extensions
 The Custom Script Extension downloads and executes scripts on Azure virtual machines (and VMSS instances). We could leverage extensions to either 1) run kubeadm init/join commands (ie. move the "runcmd" content from cloud init to   a custom script extension). This is useful because you can control the exit code for VM Extensions which allows for better error reporting than cloud init. The max script size is also 256 KB (vs 64 KB for user data). This does not collect logs, but part of the extension could be to export the logs externally (to a storage account for example). The extension could also be used purely for checking bootstrapping status (ie. cloud init runcmd still runs the init/join) and exporting logs.
-https://docs.microsoft.com/en-us/azure/virtual-machines/extensions/custom-script-linux
-https://docs.microsoft.com/en-us/azure/virtual-machines/extensions/custom-script-windows
+https://learn.microsoft.com/azure/virtual-machines/extensions/custom-script-linux
+https://learn.microsoft.com/azure/virtual-machines/extensions/custom-script-windows
 
 #### Custom Script Extension Pros:
 - Generic and flexible for both Linux and Windows, can basically execute any arbitrary code (so long as it’s under the size limits defined above)
@@ -78,7 +78,7 @@ https://docs.microsoft.com/en-us/azure/virtual-machines/extensions/custom-script
 - You may only have one Custom Script Extension per VM, so using this interface to implement bootstrap failure detection means we are not able to expose the Custom Script Extension VM feature to users as a “general purpose” script interface
 
 ### Option 4: VM run command
-https://docs.microsoft.com/en-us/azure/virtual-machines/linux/run-command
+https://learn.microsoft.com/azure/virtual-machines/linux/run-command
 This is similar to the above idea of using a custom script extension but instead of deploying an additional VM extension resource, the Run Command feature uses the virtual machine (VM) agent to run shell scripts within an Azure VM. This works without requiring RDP/SSH access to the VM.
 
 #### VM runcmd Pros:
@@ -119,7 +119,7 @@ A few conclusions surfaced when exploring these options:
 2. The actual implementation that determines “did I bootstrap successfully?” should be defined by each bootstrap provider, as each provider has its own files/operational conditions to validate. The validation on the Azure side should be as minimal as possible and delegate all responsibility of running checks to the bootstrap provider.
 3. We need to support Linux and Windows, and though there is one convenience (VM Boot Diagnostics) that may allow us to get a common result across both OSes “for free”, in practice there is enough heterogeneity at all layers (VM, OS, potentially even capi) that we should expect to have to maintain a discrete set of implementations for each platform. So we want to choose a solution that makes supporting both Linux and Windows distinctly natural.
 
-The most sensible solution would be to re-use the existing CustomScriptExtension interface that can be attached to both Windows and Linux VMs. But the fact that VMs may only support a single CustomScriptExtension is a non-trivial problem, as it removes that configuration vector for users. That vector can be a powerful configuration option — paired with custom OS images — to deliver regular runtime functionality to the underlying Azure VM running as a Kubernetes node. In particular during emergency scenarios being able to “patch” your node’s Azure VM implementation quickly using this interface can save a user many hours if he/she had to otherwise wait for a new OS image, or worse, a new VHD publication.
+The most sensible solution would be to reuse the existing CustomScriptExtension interface that can be attached to both Windows and Linux VMs. But the fact that VMs may only support a single CustomScriptExtension is a non-trivial problem, as it removes that configuration vector for users. That vector can be a powerful configuration option — paired with custom OS images — to deliver regular runtime functionality to the underlying Azure VM running as a Kubernetes node. In particular during emergency scenarios being able to “patch” your node’s Azure VM implementation quickly using this interface can save a user many hours if he/she had to otherwise wait for a new OS image, or worse, a new VHD publication.
 
 So, given that we don’t want to “reserve” the CustomScriptExtension VM interface for capz, thus preventing users from using it more generically and flexibly (as it’s intended to be used), we want to propose curating a capz-specific Azure VM Extension dedicated to running on the VM during provisioning and evaluating the success/fail state of its bootstrap operation(s) towards joining a capz-enabled Kubernetes cluster.
 
@@ -133,7 +133,7 @@ At a very high level, this is what we want our capz-named Azure VM Extension to 
   - Again, we assume using a common exit code for all failure states is acceptable for the initial scope of this work
 - Set appropriate AzureMachine (and possibly Machine?) conditions
 
-VM Boot Diagnostics should be used in conjunction with the extension. The VM extension provides a simple pass/fail signal that can be used by CAPZ to set conditions and indicate bootstrap status. Boot Diagnostics can provide a quick look at what went wrong to the user by displaying cloud-init logs without needing to SSH into the VM. In the future, boot diagnostics might even used to stream logs programatically at the AzureMachine level.
+VM Boot Diagnostics should be used in conjunction with the extension. The VM extension provides a simple pass/fail signal that can be used by CAPZ to set conditions and indicate bootstrap status. Boot Diagnostics can provide a quick look at what went wrong to the user by displaying cloud-init logs without needing to SSH into the VM. In the future, boot diagnostics might even used to stream logs programmatically at the AzureMachine level.
 
 
 ## Questions

@@ -1,3 +1,4 @@
+//go:build e2e
 // +build e2e
 
 /*
@@ -22,13 +23,12 @@ import (
 	"context"
 	"os"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	apimachinerytypes "k8s.io/apimachinery/pkg/types"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/test/framework"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // AzureFailureDomainsSpecInput is the input for AzureFailureDomainSpec.
@@ -62,29 +62,28 @@ func AzureFailureDomainsSpec(ctx context.Context, inputGetter func() AzureFailur
 		By("Ensuring zones match CAPI failure domains")
 
 		// fetch updated cluster object to ensure Status.FailureDomains is up-to-date
-		err := input.BootstrapClusterProxy.GetClient().Get(ctx,
-			apimachinerytypes.NamespacedName{
-				Namespace: input.Namespace.Name,
-				Name:      input.ClusterName,
-			}, input.Cluster)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(len(input.Cluster.Status.FailureDomains)).To(Equal(len(zones)))
-		for _, z := range zones {
-			Expect(input.Cluster.Status.FailureDomains[z]).NotTo(BeNil())
-		}
+		Eventually(func(g Gomega) {
+			err := input.BootstrapClusterProxy.GetClient().Get(ctx,
+				apimachinerytypes.NamespacedName{
+					Namespace: input.Namespace.Name,
+					Name:      input.ClusterName,
+				}, input.Cluster)
+			if err != nil {
+				LogWarning(err.Error())
+			}
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(input.Cluster.Status.FailureDomains).To(HaveLen(len(zones)))
+			for _, z := range zones {
+				g.Expect(z).NotTo(BeEmpty())
+			}
+		}, retryableOperationTimeout, retryableOperationSleepBetweenRetries).Should(Succeed())
 
 		// TODO: Find alternative when the number of zones is > 1 but doesn't equal to number of control plane machines.
 		if len(input.Cluster.Status.FailureDomains) == 3 {
 			By("Ensuring control planes are spread across availability zones.")
-			key := client.ObjectKeyFromObject(input.Cluster)
 			failureDomainsInput := framework.AssertControlPlaneFailureDomainsInput{
-				GetLister:  input.BootstrapClusterProxy.GetClient(),
-				ClusterKey: key,
-				ExpectedFailureDomains: map[string]int{
-					"1": 1,
-					"2": 1,
-					"3": 1,
-				},
+				Lister:  input.BootstrapClusterProxy.GetClient(),
+				Cluster: input.Cluster,
 			}
 			framework.AssertControlPlaneFailureDomains(ctx, failureDomainsInput)
 		}

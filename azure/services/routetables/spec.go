@@ -17,16 +17,23 @@ limitations under the License.
 package routetables
 
 import (
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-02-01/network"
-	"github.com/Azure/go-autorest/autorest/to"
+	"context"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v4"
 	"github.com/pkg/errors"
+	"k8s.io/utils/ptr"
+
+	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/converters"
 )
 
 // RouteTableSpec defines the specification for a route table.
 type RouteTableSpec struct {
-	Name          string
-	ResourceGroup string
-	Location      string
+	Name           string
+	ResourceGroup  string
+	Location       string
+	ClusterName    string
+	AdditionalTags infrav1.Tags
 }
 
 // ResourceName returns the name of the route table.
@@ -45,17 +52,23 @@ func (s *RouteTableSpec) OwnerResourceName() string {
 }
 
 // Parameters returns the parameters for the route table.
-func (s *RouteTableSpec) Parameters(existing interface{}) (params interface{}, err error) {
+func (s *RouteTableSpec) Parameters(_ context.Context, existing any) (params any, err error) {
 	if existing != nil {
-		if _, ok := existing.(network.RouteTable); !ok {
-			return nil, errors.Errorf("%T is not a network.RouteTable", existing)
+		if _, ok := existing.(armnetwork.RouteTable); !ok {
+			return nil, errors.Errorf("%T is not an armnetwork.RouteTable", existing)
 		}
 		// route table already exists
 		// currently don't support specifying your own routes via spec.
 		return nil, nil
 	}
-	return network.RouteTable{
-		Location:                   to.StringPtr(s.Location),
-		RouteTablePropertiesFormat: &network.RouteTablePropertiesFormat{},
+	return armnetwork.RouteTable{
+		Location:   ptr.To(s.Location),
+		Properties: &armnetwork.RouteTablePropertiesFormat{},
+		Tags: converters.TagsToMap(infrav1.Build(infrav1.BuildParams{
+			ClusterName: s.ClusterName,
+			Lifecycle:   infrav1.ResourceLifecycleOwned,
+			Name:        ptr.To(s.Name),
+			Additional:  s.AdditionalTags,
+		})),
 	}, nil
 }

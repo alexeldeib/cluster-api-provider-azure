@@ -18,150 +18,55 @@ package subnets
 
 import (
 	"context"
-	"fmt"
 
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-02-01/network"
-	"github.com/Azure/go-autorest/autorest/to"
-	"github.com/pkg/errors"
+	asonetworkv1 "github.com/Azure/azure-service-operator/v2/api/network/v1api20201101"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
-	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/converters"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/aso"
+	"sigs.k8s.io/cluster-api-provider-azure/util/slice"
 )
+
+const serviceName = "subnets"
 
 // SubnetScope defines the scope interface for a subnet service.
 type SubnetScope interface {
-	azure.ClusterScoper
-	SubnetSpecs() []azure.SubnetSpec
-}
-
-// Service provides operations on Azure resources.
-type Service struct {
-	Scope SubnetScope
-	Client
+	aso.Scope
+	UpdateSubnetID(string, string)
+	UpdateSubnetCIDRs(string, []string)
+	SubnetSpecs() []azure.ASOResourceSpecGetter[*asonetworkv1.VirtualNetworksSubnet]
 }
 
 // New creates a new service.
-func New(scope SubnetScope) *Service {
-	return &Service{
-		Scope:  scope,
-		Client: NewClient(scope),
-	}
+func New(scope SubnetScope) *aso.Service[*asonetworkv1.VirtualNetworksSubnet, SubnetScope] {
+	svc := aso.NewService[*asonetworkv1.VirtualNetworksSubnet, SubnetScope](serviceName, scope)
+	svc.ListFunc = list
+	svc.Specs = scope.SubnetSpecs()
+	svc.ConditionType = infrav1.SubnetsReadyCondition
+	svc.PostCreateOrUpdateResourceHook = postCreateOrUpdateResourceHook
+	return svc
 }
 
-// Reconcile gets/creates/updates a subnet.
-func (s *Service) Reconcile(ctx context.Context) error {
-	ctx, log, done := tele.StartSpanWithLogger(ctx, "subnets.Service.Reconcile")
-	defer done()
-
-	for _, subnetSpec := range s.Scope.SubnetSpecs() {
-		existingSubnet, err := s.getExisting(ctx, s.Scope.Vnet().ResourceGroup, subnetSpec)
-		switch {
-		case err != nil && !azure.ResourceNotFound(err):
-			return errors.Wrapf(err, "failed to get subnet %s", subnetSpec.Name)
-		case err == nil:
-			// subnet already exists, update the spec and skip creation
-			s.Scope.SetSubnet(*existingSubnet)
-			continue
-
-		case !s.Scope.IsVnetManaged():
-			return fmt.Errorf("vnet was provided but subnet %s is missing", subnetSpec.Name)
-
-		default:
-
-			subnetProperties := network.SubnetPropertiesFormat{
-				AddressPrefixes: &subnetSpec.CIDRs,
-			}
-
-			// workaround needed to avoid SubscriptionNotRegisteredForFeature for feature Microsoft.Network/AllowMultipleAddressPrefixesOnSubnet.
-			if len(subnetSpec.CIDRs) == 1 {
-				subnetProperties = network.SubnetPropertiesFormat{
-					AddressPrefix: &subnetSpec.CIDRs[0],
-				}
-			}
-
-			if subnetSpec.RouteTableName != "" {
-				subnetProperties.RouteTable = &network.RouteTable{
-					ID: to.StringPtr(azure.RouteTableID(s.Scope.SubscriptionID(), s.Scope.ResourceGroup(), subnetSpec.RouteTableName)),
-				}
-			}
-
-			if subnetSpec.NatGatewayName != "" {
-				subnetProperties.NatGateway = &network.SubResource{
-					ID: to.StringPtr(azure.NatGatewayID(s.Scope.SubscriptionID(), s.Scope.ResourceGroup(), subnetSpec.NatGatewayName)),
-				}
-			}
-
-			if subnetSpec.SecurityGroupName != "" {
-				subnetProperties.NetworkSecurityGroup = &network.SecurityGroup{
-					ID: to.StringPtr(azure.SecurityGroupID(s.Scope.SubscriptionID(), s.Scope.ResourceGroup(), subnetSpec.SecurityGroupName)),
-				}
-			}
-
-			log.V(2).Info("creating subnet in vnet", "subnet", subnetSpec.Name, "vnet", subnetSpec.VNetName)
-			err = s.Client.CreateOrUpdate(
-				ctx,
-				s.Scope.Vnet().ResourceGroup,
-				subnetSpec.VNetName,
-				subnetSpec.Name,
-				network.Subnet{
-					SubnetPropertiesFormat: &subnetProperties,
-				},
-			)
-			if err != nil {
-				return errors.Wrapf(err, "failed to create subnet %s in resource group %s", subnetSpec.Name, s.Scope.Vnet().ResourceGroup)
-			}
-
-			log.V(2).Info("successfully created subnet in vnet", "subnet", subnetSpec.Name, "vnet", subnetSpec.VNetName)
-		}
-	}
-	return nil
-}
-
-// Delete deletes the subnet with the provided name.
-func (s *Service) Delete(ctx context.Context) error {
-	ctx, log, done := tele.StartSpanWithLogger(ctx, "subnets.Service.Delete")
-	defer done()
-
-	for _, subnetSpec := range s.Scope.SubnetSpecs() {
-		if !s.Scope.Vnet().IsManaged(s.Scope.ClusterName()) {
-			log.V(4).Info("Skipping subnets deletion in custom vnet mode")
-			continue
-		}
-		log.V(2).Info("deleting subnet in vnet", "subnet", subnetSpec.Name, "vnet", subnetSpec.VNetName)
-		err := s.Client.Delete(ctx, s.Scope.Vnet().ResourceGroup, subnetSpec.VNetName, subnetSpec.Name)
-		if err != nil && azure.ResourceNotFound(err) {
-			// already deleted
-			continue
-		}
-		if err != nil {
-			return errors.Wrapf(err, "failed to delete subnet %s in resource group %s", subnetSpec.Name, s.Scope.Vnet().ResourceGroup)
-		}
-
-		log.V(2).Info("successfully deleted subnet in vnet", "subnet", subnetSpec.Name, "vnet", subnetSpec.VNetName)
-	}
-	return nil
-}
-
-// getExisting provides information about an existing subnet.
-func (s *Service) getExisting(ctx context.Context, rgName string, spec azure.SubnetSpec) (*infrav1.SubnetSpec, error) {
-	ctx, _, done := tele.StartSpanWithLogger(ctx, "subnets.Service.getExisting")
-	defer done()
-
-	subnet, err := s.Client.Get(ctx, rgName, spec.VNetName, spec.Name)
+func postCreateOrUpdateResourceHook(_ context.Context, scope SubnetScope, subnet *asonetworkv1.VirtualNetworksSubnet, err error) error {
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to fetch subnet named %s in vnet %s", spec.VNetName, spec.Name)
+		return err
 	}
 
-	var addresses []string
-	if subnet.SubnetPropertiesFormat != nil && subnet.SubnetPropertiesFormat.AddressPrefix != nil {
-		addresses = []string{to.String(subnet.SubnetPropertiesFormat.AddressPrefix)}
-	} else if subnet.SubnetPropertiesFormat != nil && subnet.SubnetPropertiesFormat.AddressPrefixes != nil {
-		addresses = to.StringSlice(subnet.SubnetPropertiesFormat.AddressPrefixes)
+	name := subnet.AzureName()
+	statusASOCIDRs := converters.GetSubnetAddresses(*subnet)
+	if len(statusASOCIDRs) != 0 {
+		scope.UpdateSubnetID(name, ptr.Deref(subnet.Status.Id, ""))
+		scope.UpdateSubnetCIDRs(name, statusASOCIDRs)
 	}
 
-	subnetSpec := s.Scope.Subnet(spec.Name)
-	subnetSpec.ID = to.String(subnet.ID)
-	subnetSpec.CIDRBlocks = addresses
+	return nil
+}
 
-	return &subnetSpec, nil
+func list(ctx context.Context, client client.Client, opts ...client.ListOption) ([]*asonetworkv1.VirtualNetworksSubnet, error) {
+	list := &asonetworkv1.VirtualNetworksSubnetList{}
+	err := client.List(ctx, list, opts...)
+	return slice.ToPtrs(list.Items), err
 }

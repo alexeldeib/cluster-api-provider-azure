@@ -23,8 +23,6 @@ import (
 )
 
 func TestTags_Merge(t *testing.T) {
-	g := NewWithT(t)
-
 	tests := []struct {
 		name     string
 		other    Tags
@@ -75,9 +73,9 @@ func TestTags_Merge(t *testing.T) {
 		},
 	}
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
+			g := NewWithT(t)
 			tags := Tags{
 				"a": "b",
 				"c": "d",

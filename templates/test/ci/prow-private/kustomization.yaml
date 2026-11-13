@@ -2,21 +2,35 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: default
 resources:
-  - ../../../flavors/private
-  - ../prow/cni-resource-set.yaml
-patchesStrategicMerge:
-  - ../patches/tags.yaml
-  - ../patches/controller-manager.yaml
-  - ../patches/cluster-cni.yaml
-  - patches/bastion.yaml
-  - patches/vnet-peerings.yaml
+- ../../../flavors/private
+- ../prow/mhc-kubeadmcontrolplane.yaml
+- cni-resource-set.yaml
+- ../../../addons/cluster-api-helm/calico.yaml
+- ../../../addons/cluster-api-helm/azuredisk-csi-driver.yaml
+- ../../../addons/cluster-api-helm/cloud-provider-azure.yaml
+- ../../../addons/cluster-api-helm/cloud-provider-azure-ci.yaml
+patches:
+- path: patches/user-assigned.yaml
+  target:
+    kind: AzureClusterIdentity
+- path: ../patches/tags.yaml
+- path: ../patches/controller-manager.yaml
+- path: patches/bastion.yaml
+- path: patches/vnet-peerings.yaml
+- path: ../patches/uami-md-0.yaml
+- path: ../patches/uami-control-plane.yaml
+- path: ../patches/cluster-label-calico.yaml
+- path: ../patches/cluster-label-cloud-provider-azure.yaml
 configMapGenerator:
-  - name: cni-${CLUSTER_NAME}-calico
-    files:
-      - resources=../../../addons/calico.yaml
+- files:
+  - resources=../../../addons/calico.yaml
+  name: cni-${CLUSTER_NAME}-calico
 generatorOptions:
+  annotations:
+    note: generated
   disableNameSuffixHash: true
   labels:
     type: generated
-  annotations:
-    note: generated
+
+sortOptions:
+  order: fifo

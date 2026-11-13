@@ -19,36 +19,35 @@ package converters
 import (
 	"encoding/base64"
 
-	azureautorest "github.com/Azure/go-autorest/autorest/azure"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/pkg/errors"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 )
 
-// SDKToFuture converts an SDK future to an infrav1.Future.
-func SDKToFuture(future azureautorest.FutureAPI, futureType, service, resourceName, rgName string) (*infrav1.Future, error) {
-	jsonData, err := future.MarshalJSON()
+// PollerToFuture converts an SDK poller to an infrav1.Future.
+func PollerToFuture[T any](poller *runtime.Poller[T], futureType, service, resourceName, rgName string) (*infrav1.Future, error) {
+	token, err := poller.ResumeToken()
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to marshal async future")
+		return nil, errors.Wrap(err, "failed to get resume token")
 	}
-
 	return &infrav1.Future{
 		Type:          futureType,
 		ResourceGroup: rgName,
 		ServiceName:   service,
 		Name:          resourceName,
-		Data:          base64.URLEncoding.EncodeToString(jsonData),
+		Data:          base64.URLEncoding.EncodeToString([]byte(token)),
 	}, nil
 }
 
-// FutureToSDK converts an infrav1.Future to an SDK future.
-func FutureToSDK(future infrav1.Future) (azureautorest.FutureAPI, error) {
-	futureData, err := base64.URLEncoding.DecodeString(future.Data)
+// FutureToResumeToken converts an infrav1.Future to an Azure SDK resume token.
+func FutureToResumeToken(future infrav1.Future) (string, error) {
+	if future.Data == "" {
+		return "", errors.New("failed to unmarshal future data: data is empty")
+	}
+	token, err := base64.URLEncoding.DecodeString(future.Data)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to base64 decode future data")
+		return "", errors.Wrap(err, "failed to decode future data")
 	}
-	var genericFuture azureautorest.Future
-	if err := genericFuture.UnmarshalJSON(futureData); err != nil {
-		return nil, errors.Wrap(err, "failed to unmarshal future data")
-	}
-	return &genericFuture, nil
+	return string(token), nil
 }

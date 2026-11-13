@@ -1,3 +1,9 @@
 # Topics
 
-This section contains information about enable and configure various Azure features with Cluster API Provider Azure.
+This section contains information which is relevant to managed and self-managed clusters created by CAPZ.
+
+- [Azure Service Operator](./aso.md)
+- [Autoscaling from Zero](./autoscaling-from-zero.md)
+- [Clusterclass](./clusterclass.md)
+- [Identities](./identities.md)
+- [FAQ](./FAQ.md)

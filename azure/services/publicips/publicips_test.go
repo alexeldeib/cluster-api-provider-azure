@@ -17,171 +17,175 @@ limitations under the License.
 package publicips
 
 import (
-	"context"
+	"io"
 	"net/http"
+	"strings"
 	"testing"
 
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-02-01/network"
-	"github.com/Azure/go-autorest/autorest"
-	"github.com/Azure/go-autorest/autorest/to"
-	"github.com/golang/mock/gomock"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	. "github.com/onsi/gomega"
+	"go.uber.org/mock/gomock"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/async/mock_async"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/publicips/mock_publicips"
 	gomockinternal "sigs.k8s.io/cluster-api-provider-azure/internal/test/matchers/gomock"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
 )
 
 func init() {
 	_ = clusterv1.AddToScheme(scheme.Scheme)
 }
 
+var (
+	fakePublicIPSpec1 = PublicIPSpec{
+		Name:           "my-publicip",
+		ResourceGroup:  "my-rg",
+		DNSName:        "fakedns.mydomain.io",
+		IsIPv6:         false,
+		ClusterName:    "my-cluster",
+		Location:       "centralIndia",
+		FailureDomains: []*string{ptr.To("failure-domain-id-1"), ptr.To("failure-domain-id-2"), ptr.To("failure-domain-id-3")},
+		AdditionalTags: infrav1.Tags{
+			"Name": "my-publicip-ipv6",
+			"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": "owned",
+		},
+	}
+	fakePublicIPSpec2 = PublicIPSpec{
+		Name:           "my-publicip-2",
+		ResourceGroup:  "my-rg",
+		DNSName:        "fakedns2-52959.uksouth.cloudapp.azure.com",
+		IsIPv6:         false,
+		ClusterName:    "my-cluster",
+		Location:       "centralIndia",
+		FailureDomains: []*string{ptr.To("failure-domain-id-1"), ptr.To("failure-domain-id-2"), ptr.To("failure-domain-id-3")},
+		AdditionalTags: infrav1.Tags{
+			"Name": "my-publicip-ipv6",
+			"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": "owned",
+		},
+	}
+	fakePublicIPSpec3 = PublicIPSpec{
+		Name:           "my-publicip-3",
+		ResourceGroup:  "my-rg",
+		DNSName:        "",
+		IsIPv6:         false,
+		ClusterName:    "my-cluster",
+		Location:       "centralIndia",
+		FailureDomains: []*string{ptr.To("failure-domain-id-1"), ptr.To("failure-domain-id-2"), ptr.To("failure-domain-id-3")},
+		AdditionalTags: infrav1.Tags{
+			"Name": "my-publicip-ipv6",
+			"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": "owned",
+		},
+	}
+	fakePublicIPSpecIpv6 = PublicIPSpec{
+		Name:           "my-publicip-ipv6",
+		ResourceGroup:  "my-rg",
+		DNSName:        "fakename.mydomain.io",
+		IsIPv6:         true,
+		ClusterName:    "my-cluster",
+		Location:       "centralIndia",
+		FailureDomains: []*string{ptr.To("failure-domain-id-1"), ptr.To("failure-domain-id-2"), ptr.To("failure-domain-id-3")},
+		AdditionalTags: infrav1.Tags{
+			"Name": "my-publicip-ipv6",
+			"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": "owned",
+			"foo": "bar",
+		},
+	}
+
+	managedTags = armresources.TagsResource{
+		Properties: &armresources.Tags{
+			Tags: map[string]*string{
+				"foo": ptr.To("bar"),
+				"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": ptr.To("owned"),
+			},
+		},
+	}
+
+	unmanagedTags = armresources.TagsResource{
+		Properties: &armresources.Tags{
+			Tags: map[string]*string{
+				"foo":       ptr.To("bar"),
+				"something": ptr.To("else"),
+			},
+		},
+	}
+
+	internalError = &azcore.ResponseError{
+		RawResponse: &http.Response{
+			Body:       io.NopCloser(strings.NewReader("#: Internal Server Error: StatusCode=500")),
+			StatusCode: http.StatusInternalServerError,
+		},
+	}
+)
+
 func TestReconcilePublicIP(t *testing.T) {
 	testcases := []struct {
 		name          string
 		expectedError string
-		expect        func(s *mock_publicips.MockPublicIPScopeMockRecorder, m *mock_publicips.MockClientMockRecorder)
+		expect        func(s *mock_publicips.MockPublicIPScopeMockRecorder, m *mock_async.MockTagsGetterMockRecorder, r *mock_async.MockReconcilerMockRecorder)
 	}{
 		{
-			name:          "can create public IPs",
+			name:          "noop if no public IPs",
 			expectedError: "",
-			expect: func(s *mock_publicips.MockPublicIPScopeMockRecorder, m *mock_publicips.MockClientMockRecorder) {
-				s.PublicIPSpecs().Return([]azure.PublicIPSpec{
-					{
-						Name:    "my-publicip",
-						DNSName: "fakedns.mydomain.io",
-					},
-					{
-						Name:    "my-publicip-2",
-						DNSName: "fakedns2-52959.uksouth.cloudapp.azure.com",
-					},
-					{
-						Name: "my-publicip-3",
-					},
-					{
-						Name:    "my-publicip-ipv6",
-						IsIPv6:  true,
-						DNSName: "fakename.mydomain.io",
-					},
-				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
-				s.ClusterName().AnyTimes().Return("my-cluster")
-				s.AdditionalTags().AnyTimes().Return(infrav1.Tags{})
-				s.Location().AnyTimes().Return("testlocation")
-				s.FailureDomains().AnyTimes().Return([]string{"1,2,3"})
-				gomock.InOrder(
-					m.CreateOrUpdate(gomockinternal.AContext(), "my-rg", "my-publicip", gomockinternal.DiffEq(network.PublicIPAddress{
-						Name:     to.StringPtr("my-publicip"),
-						Sku:      &network.PublicIPAddressSku{Name: network.PublicIPAddressSkuNameStandard},
-						Location: to.StringPtr("testlocation"),
-						Tags: map[string]*string{
-							"Name": to.StringPtr("my-publicip"),
-							"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": to.StringPtr("owned"),
-						},
-						PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
-							PublicIPAddressVersion:   network.IPVersionIPv4,
-							PublicIPAllocationMethod: network.IPAllocationMethodStatic,
-							DNSSettings: &network.PublicIPAddressDNSSettings{
-								DomainNameLabel: to.StringPtr("fakedns"),
-								Fqdn:            to.StringPtr("fakedns.mydomain.io"),
-							},
-						},
-						Zones: to.StringSlicePtr([]string{"1,2,3"}),
-					})).Times(1),
-					m.CreateOrUpdate(gomockinternal.AContext(), "my-rg", "my-publicip-2", gomockinternal.DiffEq(network.PublicIPAddress{
-						Name:     to.StringPtr("my-publicip-2"),
-						Sku:      &network.PublicIPAddressSku{Name: network.PublicIPAddressSkuNameStandard},
-						Location: to.StringPtr("testlocation"),
-						Tags: map[string]*string{
-							"Name": to.StringPtr("my-publicip-2"),
-							"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": to.StringPtr("owned"),
-						},
-						PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
-							PublicIPAddressVersion:   network.IPVersionIPv4,
-							PublicIPAllocationMethod: network.IPAllocationMethodStatic,
-							DNSSettings: &network.PublicIPAddressDNSSettings{
-								DomainNameLabel: to.StringPtr("fakedns2-52959"),
-								Fqdn:            to.StringPtr("fakedns2-52959.uksouth.cloudapp.azure.com"),
-							},
-						},
-						Zones: to.StringSlicePtr([]string{"1,2,3"}),
-					})).Times(1),
-					m.CreateOrUpdate(gomockinternal.AContext(), "my-rg", "my-publicip-3", gomockinternal.DiffEq(network.PublicIPAddress{
-						Name:     to.StringPtr("my-publicip-3"),
-						Sku:      &network.PublicIPAddressSku{Name: network.PublicIPAddressSkuNameStandard},
-						Location: to.StringPtr("testlocation"),
-						Tags: map[string]*string{
-							"Name": to.StringPtr("my-publicip-3"),
-							"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": to.StringPtr("owned"),
-						},
-						PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
-							PublicIPAddressVersion:   network.IPVersionIPv4,
-							PublicIPAllocationMethod: network.IPAllocationMethodStatic,
-						},
-						Zones: to.StringSlicePtr([]string{"1,2,3"}),
-					})).Times(1),
-					m.CreateOrUpdate(gomockinternal.AContext(), "my-rg", "my-publicip-ipv6", gomockinternal.DiffEq(network.PublicIPAddress{
-						Name:     to.StringPtr("my-publicip-ipv6"),
-						Sku:      &network.PublicIPAddressSku{Name: network.PublicIPAddressSkuNameStandard},
-						Location: to.StringPtr("testlocation"),
-						Tags: map[string]*string{
-							"Name": to.StringPtr("my-publicip-ipv6"),
-							"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": to.StringPtr("owned"),
-						},
-						PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
-							PublicIPAddressVersion:   network.IPVersionIPv6,
-							PublicIPAllocationMethod: network.IPAllocationMethodStatic,
-							DNSSettings: &network.PublicIPAddressDNSSettings{
-								DomainNameLabel: to.StringPtr("fakename"),
-								Fqdn:            to.StringPtr("fakename.mydomain.io"),
-							},
-						},
-						Zones: to.StringSlicePtr([]string{"1,2,3"}),
-					})).Times(1),
-				)
+			expect: func(s *mock_publicips.MockPublicIPScopeMockRecorder, m *mock_async.MockTagsGetterMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
+				s.PublicIPSpecs().Return([]azure.ResourceSpecGetter{})
+			},
+		},
+		{
+			name:          "successfully create public IPs",
+			expectedError: "",
+			expect: func(s *mock_publicips.MockPublicIPScopeMockRecorder, m *mock_async.MockTagsGetterMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
+				s.PublicIPSpecs().Return([]azure.ResourceSpecGetter{&fakePublicIPSpec1, &fakePublicIPSpec2, &fakePublicIPSpec3, &fakePublicIPSpecIpv6})
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakePublicIPSpec1, serviceName).Return(nil, nil)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakePublicIPSpec2, serviceName).Return(nil, nil)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakePublicIPSpec3, serviceName).Return(nil, nil)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakePublicIPSpecIpv6, serviceName).Return(nil, nil)
+				s.UpdatePutStatus(infrav1.PublicIPsReadyCondition, serviceName, nil)
 			},
 		},
 		{
 			name:          "fail to create a public IP",
-			expectedError: "cannot create public IP: #: Internal Server Error: StatusCode=500",
-			expect: func(s *mock_publicips.MockPublicIPScopeMockRecorder, m *mock_publicips.MockClientMockRecorder) {
-				s.PublicIPSpecs().Return([]azure.PublicIPSpec{
-					{
-						Name:    "my-publicip",
-						DNSName: "fakedns.mydomain.io",
-					},
-				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
-				s.ClusterName().AnyTimes().Return("my-cluster")
-				s.AdditionalTags().AnyTimes().Return(infrav1.Tags{})
-				s.Location().AnyTimes().Return("testlocation")
-				s.FailureDomains().Times(1)
-				m.CreateOrUpdate(gomockinternal.AContext(), "my-rg", "my-publicip", gomock.AssignableToTypeOf(network.PublicIPAddress{})).Return(autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 500}, "Internal Server Error"))
+			expectedError: internalError.Error(),
+			expect: func(s *mock_publicips.MockPublicIPScopeMockRecorder, m *mock_async.MockTagsGetterMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
+				s.PublicIPSpecs().Return([]azure.ResourceSpecGetter{&fakePublicIPSpec1, &fakePublicIPSpec2, &fakePublicIPSpec3, &fakePublicIPSpecIpv6})
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakePublicIPSpec1, serviceName).Return(nil, nil)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakePublicIPSpec2, serviceName).Return(nil, nil)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakePublicIPSpec3, serviceName).Return(nil, internalError)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakePublicIPSpecIpv6, serviceName).Return(nil, nil)
+				s.UpdatePutStatus(infrav1.PublicIPsReadyCondition, serviceName, internalError)
 			},
 		},
 	}
 
 	for _, tc := range testcases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 
 			t.Parallel()
 			mockCtrl := gomock.NewController(t)
 			defer mockCtrl.Finish()
-			scopeMock := mock_publicips.NewMockPublicIPScope(mockCtrl)
-			clientMock := mock_publicips.NewMockClient(mockCtrl)
 
-			tc.expect(scopeMock.EXPECT(), clientMock.EXPECT())
+			scopeMock := mock_publicips.NewMockPublicIPScope(mockCtrl)
+			tagsGetterMock := mock_async.NewMockTagsGetter(mockCtrl)
+			reconcilerMock := mock_async.NewMockReconciler(mockCtrl)
+
+			tc.expect(scopeMock.EXPECT(), tagsGetterMock.EXPECT(), reconcilerMock.EXPECT())
 
 			s := &Service{
-				Scope:  scopeMock,
-				Client: clientMock,
+				Scope:      scopeMock,
+				TagsGetter: tagsGetterMock,
+				Reconciler: reconcilerMock,
 			}
 
-			err := s.Reconcile(context.TODO())
+			err := s.Reconcile(t.Context())
 			if tc.expectedError != "" {
 				g.Expect(err).To(HaveOccurred())
 				g.Expect(err).To(MatchError(tc.expectedError))
@@ -196,138 +200,122 @@ func TestDeletePublicIP(t *testing.T) {
 	testcases := []struct {
 		name          string
 		expectedError string
-		expect        func(s *mock_publicips.MockPublicIPScopeMockRecorder, m *mock_publicips.MockClientMockRecorder)
+		expect        func(s *mock_publicips.MockPublicIPScopeMockRecorder, m *mock_async.MockTagsGetterMockRecorder, r *mock_async.MockReconcilerMockRecorder)
 	}{
 		{
-			name:          "successfully delete two existing public IP",
+			name:          "noop if no public IPs",
 			expectedError: "",
-			expect: func(s *mock_publicips.MockPublicIPScopeMockRecorder, m *mock_publicips.MockClientMockRecorder) {
-				s.PublicIPSpecs().Return([]azure.PublicIPSpec{
-					{
-						Name: "my-publicip",
-					},
-					{
-						Name: "my-publicip-2",
-					},
-				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
-				s.ClusterName().AnyTimes().Return("my-cluster")
-				m.Get(gomockinternal.AContext(), "my-rg", "my-publicip").Return(network.PublicIPAddress{
-					Name: to.StringPtr("my-publicip"),
-					Tags: map[string]*string{
-						"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": to.StringPtr("owned"),
-						"foo": to.StringPtr("bar"),
-					},
-				}, nil)
-				m.Delete(gomockinternal.AContext(), "my-rg", "my-publicip")
-				m.Get(gomockinternal.AContext(), "my-rg", "my-publicip-2").Return(network.PublicIPAddress{
-					Name: to.StringPtr("my-publicip-2"),
-					Tags: map[string]*string{
-						"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": to.StringPtr("owned"),
-						"foo": to.StringPtr("buzz"),
-					},
-				}, nil)
-				m.Delete(gomockinternal.AContext(), "my-rg", "my-publicip-2")
+			expect: func(s *mock_publicips.MockPublicIPScopeMockRecorder, m *mock_async.MockTagsGetterMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
+				s.PublicIPSpecs().Return([]azure.ResourceSpecGetter{})
 			},
 		},
 		{
-			name:          "public ip already deleted",
+			name:          "successfully delete managed public IPs and ignore unmanaged public IPs",
 			expectedError: "",
-			expect: func(s *mock_publicips.MockPublicIPScopeMockRecorder, m *mock_publicips.MockClientMockRecorder) {
-				s.PublicIPSpecs().Return([]azure.PublicIPSpec{
-					{
-						Name: "my-publicip",
-					},
-					{
-						Name: "my-publicip-2",
-					},
-				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
-				s.ClusterName().AnyTimes().Return("my-cluster")
-				m.Get(gomockinternal.AContext(), "my-rg", "my-publicip").Return(network.PublicIPAddress{}, autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not found"))
-				m.Get(gomockinternal.AContext(), "my-rg", "my-publicip-2").Return(network.PublicIPAddress{
-					Name: to.StringPtr("my-public-ip-2"),
-					Tags: map[string]*string{
-						"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": to.StringPtr("owned"),
-						"foo": to.StringPtr("buzz"),
-					},
-				}, nil)
-				m.Delete(gomockinternal.AContext(), "my-rg", "my-publicip-2")
+			expect: func(s *mock_publicips.MockPublicIPScopeMockRecorder, m *mock_async.MockTagsGetterMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
+				s.PublicIPSpecs().Return([]azure.ResourceSpecGetter{&fakePublicIPSpec1, &fakePublicIPSpec2, &fakePublicIPSpec3, &fakePublicIPSpecIpv6})
+
+				s.SubscriptionID().Return("123")
+				m.GetAtScope(gomockinternal.AContext(), azure.PublicIPID("123", fakePublicIPSpec1.ResourceGroupName(), fakePublicIPSpec1.ResourceName())).Return(managedTags, nil)
+				s.ClusterName().Return("my-cluster")
+				r.DeleteResource(gomockinternal.AContext(), &fakePublicIPSpec1, serviceName).Return(nil)
+
+				s.SubscriptionID().Return("123")
+				m.GetAtScope(gomockinternal.AContext(), azure.PublicIPID("123", fakePublicIPSpec2.ResourceGroupName(), fakePublicIPSpec2.ResourceName())).Return(managedTags, nil)
+				s.ClusterName().Return("my-cluster")
+				r.DeleteResource(gomockinternal.AContext(), &fakePublicIPSpec2, serviceName).Return(nil)
+
+				s.SubscriptionID().Return("123")
+				m.GetAtScope(gomockinternal.AContext(), azure.PublicIPID("123", fakePublicIPSpec3.ResourceGroupName(), fakePublicIPSpec3.ResourceName())).Return(unmanagedTags, nil)
+				s.ClusterName().Return("my-cluster")
+
+				s.SubscriptionID().Return("123")
+				m.GetAtScope(gomockinternal.AContext(), azure.PublicIPID("123", fakePublicIPSpecIpv6.ResourceGroupName(), fakePublicIPSpecIpv6.ResourceName())).Return(managedTags, nil)
+				s.ClusterName().Return("my-cluster")
+				r.DeleteResource(gomockinternal.AContext(), &fakePublicIPSpecIpv6, serviceName).Return(nil)
+
+				s.UpdateDeleteStatus(infrav1.PublicIPsReadyCondition, serviceName, nil)
 			},
 		},
 		{
-			name:          "public ip deletion fails",
-			expectedError: "failed to delete public IP my-publicip in resource group my-rg: #: Internal Server Error: StatusCode=500",
-			expect: func(s *mock_publicips.MockPublicIPScopeMockRecorder, m *mock_publicips.MockClientMockRecorder) {
-				s.PublicIPSpecs().Return([]azure.PublicIPSpec{
-					{
-						Name: "my-publicip",
-					},
-				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
-				s.ClusterName().AnyTimes().Return("my-cluster")
-				m.Get(gomockinternal.AContext(), "my-rg", "my-publicip").Return(network.PublicIPAddress{
-					Name: to.StringPtr("my-publicip"),
-					Tags: map[string]*string{
-						"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": to.StringPtr("owned"),
-						"foo": to.StringPtr("bar"),
-					},
-				}, nil)
-				m.Delete(gomockinternal.AContext(), "my-rg", "my-publicip").
-					Return(autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 500}, "Internal Server Error"))
+			name:          "noop if no managed public IPs",
+			expectedError: "",
+			expect: func(s *mock_publicips.MockPublicIPScopeMockRecorder, m *mock_async.MockTagsGetterMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
+				s.PublicIPSpecs().Return([]azure.ResourceSpecGetter{&fakePublicIPSpec1, &fakePublicIPSpec2, &fakePublicIPSpec3, &fakePublicIPSpecIpv6})
+
+				s.SubscriptionID().Return("123")
+				m.GetAtScope(gomockinternal.AContext(), azure.PublicIPID("123", fakePublicIPSpec1.ResourceGroupName(), fakePublicIPSpec1.ResourceName())).Return(unmanagedTags, nil)
+				s.ClusterName().Return("my-cluster")
+
+				s.SubscriptionID().Return("123")
+				m.GetAtScope(gomockinternal.AContext(), azure.PublicIPID("123", fakePublicIPSpec2.ResourceGroupName(), fakePublicIPSpec2.ResourceName())).Return(unmanagedTags, nil)
+				s.ClusterName().Return("my-cluster")
+
+				s.SubscriptionID().Return("123")
+				m.GetAtScope(gomockinternal.AContext(), azure.PublicIPID("123", fakePublicIPSpec3.ResourceGroupName(), fakePublicIPSpec3.ResourceName())).Return(unmanagedTags, nil)
+				s.ClusterName().Return("my-cluster")
+
+				s.SubscriptionID().Return("123")
+				m.GetAtScope(gomockinternal.AContext(), azure.PublicIPID("123", fakePublicIPSpecIpv6.ResourceGroupName(), fakePublicIPSpecIpv6.ResourceName())).Return(unmanagedTags, nil)
+				s.ClusterName().Return("my-cluster")
 			},
 		},
 		{
-			name:          "skip unmanaged public ip deletion",
-			expectedError: "",
-			expect: func(s *mock_publicips.MockPublicIPScopeMockRecorder, m *mock_publicips.MockClientMockRecorder) {
-				s.PublicIPSpecs().Return([]azure.PublicIPSpec{
-					{
-						Name: "my-publicip",
-					},
-					{
-						Name: "my-publicip-2",
-					},
-				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
-				s.ClusterName().AnyTimes().Return("my-cluster")
-				m.Get(gomockinternal.AContext(), "my-rg", "my-publicip").Return(network.PublicIPAddress{
-					Name: to.StringPtr("my-public-ip"),
-					Tags: map[string]*string{
-						"foo": to.StringPtr("bar"),
-					},
-				}, nil)
-				m.Get(gomockinternal.AContext(), "my-rg", "my-publicip-2").Return(network.PublicIPAddress{
-					Name: to.StringPtr("my-publicip-2"),
-					Tags: map[string]*string{
-						"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": to.StringPtr("owned"),
-						"foo": to.StringPtr("buzz"),
-					},
-				}, nil)
-				m.Delete(gomockinternal.AContext(), "my-rg", "my-publicip-2")
+			name:          "fail to delete managed public IP",
+			expectedError: internalError.Error(),
+			expect: func(s *mock_publicips.MockPublicIPScopeMockRecorder, m *mock_async.MockTagsGetterMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
+				s.PublicIPSpecs().Return([]azure.ResourceSpecGetter{&fakePublicIPSpec1, &fakePublicIPSpec2, &fakePublicIPSpec3, &fakePublicIPSpecIpv6})
+
+				s.SubscriptionID().Return("123")
+				m.GetAtScope(gomockinternal.AContext(), azure.PublicIPID("123", fakePublicIPSpec1.ResourceGroupName(), fakePublicIPSpec1.ResourceName())).Return(managedTags, nil)
+				s.ClusterName().Return("my-cluster")
+				r.DeleteResource(gomockinternal.AContext(), &fakePublicIPSpec1, serviceName).Return(nil)
+
+				s.SubscriptionID().Return("123")
+				m.GetAtScope(gomockinternal.AContext(), azure.PublicIPID("123", fakePublicIPSpec2.ResourceGroupName(), fakePublicIPSpec2.ResourceName())).Return(managedTags, nil)
+				s.ClusterName().Return("my-cluster")
+				r.DeleteResource(gomockinternal.AContext(), &fakePublicIPSpec2, serviceName).Return(nil)
+
+				s.SubscriptionID().Return("123")
+				m.GetAtScope(gomockinternal.AContext(), azure.PublicIPID("123", fakePublicIPSpec3.ResourceGroupName(), fakePublicIPSpec3.ResourceName())).Return(managedTags, nil)
+				s.ClusterName().Return("my-cluster")
+				r.DeleteResource(gomockinternal.AContext(), &fakePublicIPSpec3, serviceName).Return(internalError)
+
+				s.SubscriptionID().Return("123")
+				m.GetAtScope(gomockinternal.AContext(), azure.PublicIPID("123", fakePublicIPSpecIpv6.ResourceGroupName(), fakePublicIPSpecIpv6.ResourceName())).Return(managedTags, nil)
+				s.ClusterName().Return("my-cluster")
+				r.DeleteResource(gomockinternal.AContext(), &fakePublicIPSpecIpv6, serviceName).Return(nil)
+
+				s.UpdateDeleteStatus(infrav1.PublicIPsReadyCondition, serviceName, internalError)
 			},
 		},
 	}
 
 	for _, tc := range testcases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 
 			t.Parallel()
 			mockCtrl := gomock.NewController(t)
 			defer mockCtrl.Finish()
-			scopeMock := mock_publicips.NewMockPublicIPScope(mockCtrl)
-			clientMock := mock_publicips.NewMockClient(mockCtrl)
 
-			tc.expect(scopeMock.EXPECT(), clientMock.EXPECT())
+			scopeMock := mock_publicips.NewMockPublicIPScope(mockCtrl)
+			tagsGetterMock := mock_async.NewMockTagsGetter(mockCtrl)
+			reconcilerMock := mock_async.NewMockReconciler(mockCtrl)
+
+			tc.expect(scopeMock.EXPECT(), tagsGetterMock.EXPECT(), reconcilerMock.EXPECT())
 
 			s := &Service{
-				Scope:  scopeMock,
-				Client: clientMock,
+				Scope:      scopeMock,
+				TagsGetter: tagsGetterMock,
+				Reconciler: reconcilerMock,
 			}
 
-			err := s.Delete(context.TODO())
+			err := s.Delete(t.Context())
 			if tc.expectedError != "" {
 				g.Expect(err).To(HaveOccurred())
 				g.Expect(err).To(MatchError(tc.expectedError))

@@ -19,7 +19,6 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
@@ -28,19 +27,25 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"k8s.io/utils/ptr"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/annotations"
 	"sigs.k8s.io/cluster-api/util/predicates"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
+	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/scope"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/identities"
+	azureutil "sigs.k8s.io/cluster-api-provider-azure/util/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
 )
@@ -49,8 +54,9 @@ import (
 type AzureJSONMachineReconciler struct {
 	client.Client
 	Recorder         record.EventRecorder
-	ReconcileTimeout time.Duration
+	Timeouts         reconciler.Timeouts
 	WatchFilterValue string
+	CredentialCache  azure.CredentialCache
 }
 
 // SetupWithManager initializes this controller with a manager.
@@ -60,12 +66,27 @@ func (r *AzureJSONMachineReconciler) SetupWithManager(ctx context.Context, mgr c
 	)
 	defer done()
 
+	azureMachineMapper, err := util.ClusterToTypedObjectsMapper(r.Client, &infrav1.AzureMachineList{}, mgr.GetScheme())
+	if err != nil {
+		return errors.Wrap(err, "failed to create mapper for Cluster to AzureMachines")
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		WithOptions(options).
 		For(&infrav1.AzureMachine{}).
 		WithEventFilter(filterUnclonedMachinesPredicate{log: log}).
-		WithEventFilter(predicates.ResourceNotPausedAndHasFilterLabel(log, r.WatchFilterValue)).
+		WithEventFilter(predicates.ResourceNotPausedAndHasFilterLabel(mgr.GetScheme(), log, r.WatchFilterValue)).
 		Owns(&corev1.Secret{}).
+		// Add a watch on Clusters to requeue when the infraRef is set. This is needed because the infraRef is not initially
+		// set in Clusters created from a ClusterClass.
+		Watches(
+			&clusterv1.Cluster{},
+			handler.EnqueueRequestsFromMapFunc(azureMachineMapper),
+			builder.WithPredicates(
+				predicates.ClusterPausedTransitionsOrInfrastructureProvisioned(mgr.GetScheme(), log),
+				predicates.ResourceNotPausedAndHasFilterLabel(mgr.GetScheme(), log, r.WatchFilterValue),
+			),
+		).
 		Complete(r)
 }
 
@@ -75,7 +96,9 @@ type filterUnclonedMachinesPredicate struct {
 }
 
 func (f filterUnclonedMachinesPredicate) Create(e event.CreateEvent) bool {
-	return f.Generic(event.GenericEvent(e))
+	return f.Generic(event.GenericEvent{
+		Object: e.Object,
+	})
 }
 
 func (f filterUnclonedMachinesPredicate) Update(e event.UpdateEvent) bool {
@@ -103,7 +126,7 @@ func (f filterUnclonedMachinesPredicate) Generic(e event.GenericEvent) bool {
 
 // Reconcile reconciles the Azure json for a specific machine not in a machine deployment.
 func (r *AzureJSONMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, reterr error) {
-	ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultedLoopTimeout(r.ReconcileTimeout))
+	ctx, cancel := context.WithTimeout(ctx, r.Timeouts.DefaultedLoopTimeout())
 	defer cancel()
 
 	ctx, log, done := tele.StartSpanWithLogger(
@@ -144,9 +167,13 @@ func (r *AzureJSONMachineReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, nil
 	}
 
-	_, kind := infrav1.GroupVersion.WithKind("AzureCluster").ToAPIVersionAndKind()
+	_, kind := infrav1.GroupVersion.WithKind(infrav1.AzureClusterKind).ToAPIVersionAndKind()
 
 	// only look at azure clusters
+	if !cluster.Spec.InfrastructureRef.IsDefined() {
+		log.Info("infra ref is not defined")
+		return ctrl.Result{}, nil
+	}
 	if cluster.Spec.InfrastructureRef.Kind != kind {
 		log.WithValues("kind", cluster.Spec.InfrastructureRef.Kind).Info("infra ref was not an AzureCluster")
 		return ctrl.Result{}, nil
@@ -166,12 +193,14 @@ func (r *AzureJSONMachineReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	// Create the scope.
 	clusterScope, err := scope.NewClusterScope(ctx, scope.ClusterScopeParams{
-		Client:       r.Client,
-		Cluster:      cluster,
-		AzureCluster: azureCluster,
+		Client:          r.Client,
+		Cluster:         cluster,
+		AzureCluster:    azureCluster,
+		Timeouts:        r.Timeouts,
+		CredentialCache: r.CredentialCache,
 	})
 	if err != nil {
-		return reconcile.Result{}, errors.Errorf("failed to create scope: %+v", err)
+		return reconcile.Result{}, errors.Wrap(err, "failed to create scope")
 	}
 
 	apiVersion, kind := infrav1.GroupVersion.WithKind("AzureMachine").ToAPIVersionAndKind()
@@ -180,15 +209,35 @@ func (r *AzureJSONMachineReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		Kind:       kind,
 		Name:       azureMachine.GetName(),
 		UID:        azureMachine.GetUID(),
+		Controller: ptr.To(true),
 	}
 
 	// Construct secret for this machine
 	userAssignedIdentityIfExists := ""
 	if len(azureMachine.Spec.UserAssignedIdentities) > 0 {
-		userAssignedIdentityIfExists = azureMachine.Spec.UserAssignedIdentities[0].ProviderID
+		var identitiesClient identities.Client
+		identitiesClient, err := identities.NewClient(clusterScope)
+		if err != nil {
+			return reconcile.Result{}, errors.Wrap(err, "failed to create identities client")
+		}
+		parsed, err := azureutil.ParseResourceID(azureMachine.Spec.UserAssignedIdentities[0].ProviderID)
+		if err != nil {
+			return reconcile.Result{}, errors.Wrapf(err, "failed to parse ProviderID %s", azureMachine.Spec.UserAssignedIdentities[0].ProviderID)
+		}
+		if parsed.SubscriptionID != clusterScope.SubscriptionID() {
+			identitiesClient, err = identities.NewClientBySub(clusterScope, parsed.SubscriptionID)
+			if err != nil {
+				return reconcile.Result{}, errors.Wrapf(err, "failed to create identities client from subscription ID %s", parsed.SubscriptionID)
+			}
+		}
+		userAssignedIdentityIfExists, err = identitiesClient.GetClientID(
+			ctx, azureMachine.Spec.UserAssignedIdentities[0].ProviderID)
+		if err != nil {
+			return reconcile.Result{}, errors.Wrap(err, "failed to get user-assigned identity ClientID")
+		}
 	}
 
-	if azureMachine.Spec.Identity == infrav1.VMIdentityNone {
+	if azureMachine.Spec.Identity == infrav1.VMIdentityNone && isUsingSPCredentials(ctx, r.Client, azureCluster) {
 		log.Info(fmt.Sprintf("WARNING, %s", spIdentityWarning))
 		r.Recorder.Eventf(azureMachine, corev1.EventTypeWarning, "VMIdentityNone", spIdentityWarning)
 	}
@@ -207,7 +256,7 @@ func (r *AzureJSONMachineReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	if err := reconcileAzureSecret(ctx, r.Client, owner, newSecret, clusterScope.ClusterName()); err != nil {
-		r.Recorder.Eventf(azureMachine, corev1.EventTypeWarning, "Error reconciling cloud provider secret for AzureMachine", err.Error())
+		r.Recorder.Event(azureMachine, corev1.EventTypeWarning, "Error reconciling cloud provider secret for AzureMachine", err.Error())
 		return ctrl.Result{}, errors.Wrap(err, "failed to reconcile azure secret")
 	}
 

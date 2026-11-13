@@ -21,272 +21,432 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"testing"
 
-	"github.com/Azure/go-autorest/autorest"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	. "github.com/onsi/gomega"
+	"go.uber.org/mock/gomock"
 
+	"sigs.k8s.io/cluster-api-provider-azure/azure/mock_azure"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
 )
 
-func TestGetDefaultImageSKUID(t *testing.T) {
-	g := NewWithT(t)
-
-	var tests = []struct {
-		k8sVersion     string
-		os             string
-		osVersion      string
-		expectedResult string
-		expectedError  bool
+// TestARMClientOptions tests the `ARMClientOptions()` factory function.
+func TestARMClientOptions(t *testing.T) {
+	tests := []struct {
+		name          string
+		cloudName     string
+		expectedCloud cloud.Configuration
+		expectError   bool
 	}{
 		{
-			k8sVersion:     "v1.14.9",
-			expectedResult: "k8s-1dot14dot9-ubuntu-1804",
-			expectedError:  false,
-			os:             "ubuntu",
-			osVersion:      "1804",
+			name:          "should return default client options if cloudName is empty",
+			cloudName:     "",
+			expectedCloud: cloud.Configuration{},
 		},
 		{
-			k8sVersion:     "v1.14.10",
-			expectedResult: "k8s-1dot14dot10-ubuntu-1804",
-			expectedError:  false,
-			os:             "ubuntu",
-			osVersion:      "1804",
+			name:          "should return Azure public cloud client options",
+			cloudName:     PublicCloudName,
+			expectedCloud: cloud.AzurePublic,
 		},
 		{
-			k8sVersion:     "v1.15.6",
-			expectedResult: "k8s-1dot15dot6-ubuntu-1804",
-			expectedError:  false,
-			os:             "ubuntu",
-			osVersion:      "1804",
+			name:          "should return Azure China cloud client options",
+			cloudName:     ChinaCloudName,
+			expectedCloud: cloud.AzureChina,
 		},
 		{
-			k8sVersion:     "v1.15.7",
-			expectedResult: "k8s-1dot15dot7-ubuntu-1804",
-			expectedError:  false,
-			os:             "ubuntu",
-			osVersion:      "1804",
+			name:          "should return Azure government cloud client options",
+			cloudName:     USGovernmentCloudName,
+			expectedCloud: cloud.AzureGovernment,
 		},
 		{
-			k8sVersion:     "v1.16.3",
-			expectedResult: "k8s-1dot16dot3-ubuntu-1804",
-			expectedError:  false,
-			os:             "ubuntu",
-			osVersion:      "1804",
+			name:          "should accept Azure US Government Secret cloud",
+			cloudName:     USSecCloudName,
+			expectedCloud: cloud.Configuration{},
 		},
 		{
-			k8sVersion:     "v1.16.4",
-			expectedResult: "k8s-1dot16dot4-ubuntu-1804",
-			expectedError:  false,
-			os:             "ubuntu",
-			osVersion:      "1804",
-		},
-		{
-			k8sVersion:     "1.12.0",
-			expectedResult: "k8s-1dot12dot0-ubuntu-1804",
-			expectedError:  false,
-			os:             "ubuntu",
-			osVersion:      "1804",
-		},
-		{
-			k8sVersion:     "1.1.notvalid.semver",
-			expectedResult: "",
-			expectedError:  true,
-		},
-		{
-			k8sVersion:     "v1.19.3",
-			expectedResult: "k8s-1dot19dot3-windows-2019",
-			expectedError:  false,
-			os:             "windows",
-			osVersion:      "2019",
-		},
-		{
-			k8sVersion:     "v1.20.8",
-			expectedResult: "k8s-1dot20dot8-windows-2019",
-			expectedError:  false,
-			os:             "windows",
-			osVersion:      "2019",
-		},
-		{
-			k8sVersion:     "v1.21.2",
-			expectedResult: "k8s-1dot21dot2-windows-2019",
-			expectedError:  false,
-			os:             "windows",
-			osVersion:      "2019",
-		},
-		{
-			k8sVersion:     "v1.20.8",
-			expectedResult: "k8s-1dot20dot8-ubuntu-2004",
-			expectedError:  false,
-			os:             "ubuntu",
-			osVersion:      "2004",
-		},
-		{
-			k8sVersion:     "v1.21.2",
-			expectedResult: "k8s-1dot21dot2-ubuntu-2004",
-			expectedError:  false,
-			os:             "ubuntu",
-			osVersion:      "2004",
+			name:        "should return error if cloudName is unrecognized",
+			cloudName:   "AzureUnrecognizedCloud",
+			expectError: true,
 		},
 	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
 
-	for _, test := range tests {
-		t.Run(test.k8sVersion, func(t *testing.T) {
-			id, err := getDefaultImageSKUID(test.k8sVersion, test.os, test.osVersion)
-
-			if test.expectedError {
+			opts, err := ARMClientOptions(tc.cloudName)
+			if tc.expectError {
 				g.Expect(err).To(HaveOccurred())
-			} else {
-				g.Expect(err).NotTo(HaveOccurred())
+				return
 			}
-			g.Expect(id).To(Equal(test.expectedResult))
-		})
-	}
-}
-
-func TestAutoRestClientAppendUserAgent(t *testing.T) {
-	g := NewWithT(t)
-	userAgent := "cluster-api-provider-azure/2.29.2"
-
-	type args struct {
-		c         *autorest.Client
-		extension string
-	}
-	tests := []struct {
-		name string
-		args args
-		want string
-	}{
-		{
-			name: "should append extension to user agent if extension is not empty",
-			args: args{
-				c:         &autorest.Client{UserAgent: autorest.UserAgent()},
-				extension: userAgent,
-			},
-			want: fmt.Sprintf("%s %s", autorest.UserAgent(), userAgent),
-		},
-		{
-			name: "should no changed if extension is empty",
-			args: args{
-				c:         &autorest.Client{UserAgent: userAgent},
-				extension: "",
-			},
-			want: userAgent,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			AutoRestClientAppendUserAgent(tt.args.c, tt.args.extension)
-
-			g.Expect(tt.want).To(Equal(tt.args.c.UserAgent))
-		})
-	}
-}
-
-func TestGetDefaultUbuntuImage(t *testing.T) {
-	g := NewWithT(t)
-
-	tests := []struct {
-		k8sVersion  string
-		expectedSKU string
-	}{
-		{
-			k8sVersion:  "v1.15.6",
-			expectedSKU: "k8s-1dot15dot6-ubuntu-1804",
-		},
-		{
-			k8sVersion:  "v1.17.11",
-			expectedSKU: "k8s-1dot17dot11-ubuntu-1804",
-		},
-		{
-			k8sVersion:  "v1.18.19",
-			expectedSKU: "k8s-1dot18dot19-ubuntu-1804",
-		},
-		{
-			k8sVersion:  "v1.18.20",
-			expectedSKU: "k8s-1dot18dot20-ubuntu-2004",
-		},
-		{
-			k8sVersion:  "v1.19.11",
-			expectedSKU: "k8s-1dot19dot11-ubuntu-1804",
-		},
-		{
-			k8sVersion:  "v1.19.12",
-			expectedSKU: "k8s-1dot19dot12-ubuntu-2004",
-		},
-		{
-			k8sVersion:  "v1.21.1",
-			expectedSKU: "k8s-1dot21dot1-ubuntu-1804",
-		},
-		{
-			k8sVersion:  "v1.21.2",
-			expectedSKU: "k8s-1dot21dot2-ubuntu-2004",
-		},
-		{
-			k8sVersion:  "v1.22.0",
-			expectedSKU: "k8s-1dot22dot0-ubuntu-2004",
-		},
-		{
-			k8sVersion:  "v1.23.6",
-			expectedSKU: "k8s-1dot23dot6-ubuntu-2004",
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.k8sVersion, func(t *testing.T) {
-			image, err := GetDefaultUbuntuImage(test.k8sVersion)
 			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(image.Marketplace.SKU).To(Equal(test.expectedSKU))
+			g.Expect(opts.Cloud).To(Equal(tc.expectedCloud))
+			g.Expect(opts.Retry.MaxRetries).To(BeNumerically("==", -1))
+			g.Expect(opts.PerCallPolicies).To(HaveLen(2))
 		})
 	}
 }
 
-func TestMSCorrelationIDSendDecorator(t *testing.T) {
+// TestARMClientOptionsForAuth tests that ARMClientOptionsForAuth applies the
+// cloud configuration resolved by the Authorizer, in particular that air-gapped
+// USSec (IL6) clients target the endpoint and audience discovered at runtime
+// instead of public Azure.
+func TestARMClientOptionsForAuth(t *testing.T) {
+	ussecConfig := cloud.Configuration{
+		ActiveDirectoryAuthorityHost: "https://login.example.com/",
+		Services: map[cloud.ServiceName]cloud.ServiceConfiguration{
+			cloud.ResourceManager: {
+				Audience: "https://management.example.com/",
+				Endpoint: "https://management.example.com/",
+			},
+		},
+	}
+	tests := []struct {
+		name          string
+		cloudName     string
+		cloudConfig   cloud.Configuration
+		nilAuthorizer bool
+		expectedCloud cloud.Configuration
+		expectError   bool
+	}{
+		{
+			name:          "nil authorizer returns an error",
+			nilAuthorizer: true,
+			expectError:   true,
+		},
+		{
+			name:          "public cloud uses the SDK built-in configuration",
+			cloudName:     PublicCloudName,
+			cloudConfig:   ussecConfig,
+			expectedCloud: cloud.AzurePublic,
+		},
+		{
+			name:          "USSec cloud uses the Authorizer's resolved configuration",
+			cloudName:     USSecCloudName,
+			cloudConfig:   ussecConfig,
+			expectedCloud: ussecConfig,
+		},
+		{
+			name:        "unrecognized cloud returns an error",
+			cloudName:   "AzureUnrecognizedCloud",
+			expectError: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			mockCtrl := gomock.NewController(t)
+			defer mockCtrl.Finish()
+			var authorizer *mock_azure.MockAuthorizer
+			if !tc.nilAuthorizer {
+				authorizer = mock_azure.NewMockAuthorizer(mockCtrl)
+				authorizer.EXPECT().CloudEnvironment().Return(tc.cloudName).AnyTimes()
+				authorizer.EXPECT().CloudConfiguration().Return(tc.cloudConfig).AnyTimes()
+			}
+			var opts *arm.ClientOptions
+			var err error
+			if tc.nilAuthorizer {
+				opts, err = ARMClientOptionsForAuth(nil)
+			} else {
+				opts, err = ARMClientOptionsForAuth(authorizer)
+			}
+			if tc.expectError {
+				g.Expect(err).To(HaveOccurred())
+				return
+			}
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(opts.Cloud).To(Equal(tc.expectedCloud))
+		})
+	}
+}
+
+// TestShouldDisableInstanceDiscovery tests the `ShouldDisableInstanceDiscovery()` helper.
+func TestShouldDisableInstanceDiscovery(t *testing.T) {
 	g := NewWithT(t)
-	const corrID tele.CorrID = "TestMSCorrelationIDSendDecoratorCorrID"
-	ctx := context.WithValue(context.Background(), tele.CorrIDKeyVal, corrID)
 
-	// create a fake server so that the sender can send to
-	// somewhere
-	var wg sync.WaitGroup
-	receivedReqs := []*http.Request{}
-	wg.Add(1)
-	originHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedReqs = append(receivedReqs, r)
-		wg.Done()
-	})
+	cases := map[string]bool{
+		"":                                    false,
+		"https://login.microsoftonline.com":   false, // public, no trailing slash
+		"https://login.microsoftonline.com/":  false, // public
+		"https://login.microsoftonline.us/":   false, // government
+		"https://login.chinacloudapi.cn/":     false, // china
+		"https://login.microsoftonline.de/":   false, // germany
+		"https://login.microsoftonline.ussec": true,  // air-gapped / custom
+		"https://login.example.local/":        true,  // custom
+	}
+	for host, want := range cases {
+		g.Expect(ShouldDisableInstanceDiscovery(host)).To(Equal(want), "authority host %q", host)
+	}
+}
 
-	testSrv := httptest.NewServer(originHandler)
-	defer testSrv.Close()
+// TestPerCallPolicies tests the per-call policies returned by `ARMClientOptions()`.
+func TestPerCallPolicies(t *testing.T) {
+	g := NewWithT(t)
 
-	// create a sender that sends to the fake server, then
-	// decorate the sender with the msCorrelationIDSendDecorator
-	origSender := autorest.SenderFunc(func(r *http.Request) (*http.Response, error) {
-		// preserve the incoming headers to the fake server, so that
-		// we can test that the fake server received the right
-		// correlation ID header.
-		req, err := http.NewRequest("GET", testSrv.URL, nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header = r.Header
-		return testSrv.Client().Do(req)
-	})
-	newSender := autorest.DecorateSender(origSender, msCorrelationIDSendDecorator)
+	corrID := "test-1234abcd-5678efgh"
+	// This server will check that the correlation ID and user-agent are set correctly.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		g.Expect(r.Header.Get("User-Agent")).To(ContainSubstring("cluster-api-provider-azure/"))
+		g.Expect(r.Header.Get(string(tele.CorrIDKeyVal))).To(Equal(corrID))
+		fmt.Fprintf(w, "Hello, %s", r.Proto)
+	}))
+	defer server.Close()
 
-	// create a new HTTP request and send it via the new decorated sender
-	req, err := http.NewRequest("GET", "/abc", nil)
+	// Call the factory function and ensure it has both PerCallPolicies.
+	opts, err := ARMClientOptions("")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(opts.PerCallPolicies).To(HaveLen(2))
+	g.Expect(opts.PerCallPolicies).To(ContainElement(BeAssignableToTypeOf(correlationIDPolicy{})))
+	g.Expect(opts.PerCallPolicies).To(ContainElement(BeAssignableToTypeOf(userAgentPolicy{})))
+
+	// Create a request with a correlation ID.
+	ctx := context.WithValue(t.Context(), tele.CorrIDKeyVal, tele.CorrID(corrID))
+	req, err := runtime.NewRequest(ctx, http.MethodGet, server.URL)
 	g.Expect(err).NotTo(HaveOccurred())
 
-	req = req.WithContext(ctx)
-	rsp, err := newSender.Do(req)
+	// Create a pipeline and send the request, where it will be checked by the server.
+	pipeline := defaultTestPipeline(opts.PerCallPolicies)
+	resp, err := pipeline.Do(req)
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(rsp.Body.Close()).To(Succeed())
-	wg.Wait()
-	g.Expect(len(receivedReqs)).To(Equal(1))
-	receivedReq := receivedReqs[0]
-	g.Expect(
-		receivedReq.Header.Get(string(tele.CorrIDKeyVal)),
-	).To(Equal(string(corrID)))
+	defer resp.Body.Close()
+	g.Expect(resp.StatusCode).To(Equal(http.StatusOK))
+}
+
+func TestCustomPutPatchHeaderPolicy(t *testing.T) {
+	testHeaders := map[string]string{
+		"X-Test-Header":  "test-value",
+		"X-Test-Header2": "test-value2",
+	}
+	testcases := []struct {
+		name     string
+		method   string
+		headers  map[string]string
+		expected map[string]string
+	}{
+		{
+			name:     "should add custom headers to PUT request",
+			method:   http.MethodPut,
+			headers:  testHeaders,
+			expected: testHeaders,
+		},
+		{
+			name:     "should add custom headers to PATCH request",
+			method:   http.MethodPatch,
+			headers:  testHeaders,
+			expected: testHeaders,
+		},
+		{
+			name:   "should skip empty custom headers for PUT request",
+			method: http.MethodPut,
+		},
+		{
+			name:   "should skip empty custom headers for PATCH request",
+			method: http.MethodPatch,
+		},
+		{
+			name:   "should skip empty custom headers for GET request",
+			method: http.MethodGet,
+		},
+		{
+			name:    "should not add custom headers to GET request",
+			method:  http.MethodGet,
+			headers: testHeaders,
+		},
+		{
+			name:    "should not add custom headers to POST request",
+			method:  http.MethodPost,
+			headers: testHeaders,
+		},
+	}
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			mockCtrl := gomock.NewController(t)
+			defer mockCtrl.Finish()
+
+			// This server will check that custom headers are set correctly.
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				for k, v := range tc.expected {
+					g.Expect(r.Header.Get(k)).To(Equal(v))
+				}
+				fmt.Fprintf(w, "Hello, %s", r.Proto)
+			}))
+			defer server.Close()
+
+			// Create options with a custom PUT/PATCH header per-call policy
+			getterMock := mock_azure.NewMockResourceSpecGetterWithHeaders(mockCtrl)
+			getterMock.EXPECT().CustomHeaders().Return(tc.headers).AnyTimes()
+			opts, err := ARMClientOptions("", CustomPutPatchHeaderPolicy{Headers: tc.headers})
+			g.Expect(err).NotTo(HaveOccurred())
+
+			// Create a request
+			req, err := runtime.NewRequest(t.Context(), tc.method, server.URL)
+			g.Expect(err).NotTo(HaveOccurred())
+
+			// Create a pipeline and send the request to the test server for validation.
+			pipeline := defaultTestPipeline(opts.PerCallPolicies)
+			resp, err := pipeline.Do(req)
+			g.Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+			g.Expect(resp.StatusCode).To(Equal(http.StatusOK))
+		})
+	}
+}
+
+func defaultTestPipeline(policies []policy.Policy) runtime.Pipeline {
+	return runtime.NewPipeline(
+		"testmodule",
+		"v0.1.0",
+		runtime.PipelineOptions{},
+		&policy.ClientOptions{PerCallPolicies: policies},
+	)
+}
+
+func TestGetBootstrappingVMExtension(t *testing.T) {
+	testCases := []struct {
+		name            string
+		osType          string
+		cloud           string
+		vmName          string
+		cpuArchitecture string
+		expectedVersion string
+		expectNil       bool
+	}{
+		{
+			name:            "Linux OS, Public Cloud, x64 CPU Architecture",
+			osType:          LinuxOS,
+			cloud:           PublicCloudName,
+			vmName:          "test-vm",
+			cpuArchitecture: "x64",
+			expectedVersion: "1.0",
+		},
+		{
+			name:            "Linux OS, Public Cloud, ARM64 CPU Architecture",
+			osType:          LinuxOS,
+			cloud:           PublicCloudName,
+			vmName:          "test-vm",
+			cpuArchitecture: "Arm64",
+			expectedVersion: "1.1",
+		},
+		{
+			name:            "Windows OS, Public Cloud",
+			osType:          WindowsOS,
+			cloud:           PublicCloudName,
+			vmName:          "test-vm",
+			cpuArchitecture: "x64",
+			expectedVersion: "1.0",
+		},
+		{
+			name:            "Invalid OS Type",
+			osType:          "invalid",
+			cloud:           PublicCloudName,
+			vmName:          "test-vm",
+			cpuArchitecture: "x64",
+			expectedVersion: "1.0",
+			expectNil:       true,
+		},
+		{
+			name:            "Invalid Cloud",
+			osType:          LinuxOS,
+			cloud:           "invalid",
+			vmName:          "test-vm",
+			cpuArchitecture: "x64",
+			expectedVersion: "1.0",
+			expectNil:       true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			actualExtension := GetBootstrappingVMExtension(tc.osType, tc.cloud, tc.vmName, tc.cpuArchitecture)
+			if tc.expectNil {
+				g.Expect(actualExtension).To(BeNil())
+			} else {
+				g.Expect(actualExtension.Version).To(Equal(tc.expectedVersion))
+			}
+		})
+	}
+}
+
+func TestNormalizeAzureName(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "should return lower case",
+			input:    "Test",
+			expected: "test",
+		},
+		{
+			name:     "should return lower case with spaces replaced by hyphens",
+			input:    "Test Name",
+			expected: "test-name",
+		},
+		{
+			name:     "should return lower case with spaces replaced by hyphens and non-alphanumeric characters removed",
+			input:    "Test Name 1",
+			expected: "test-name-1",
+		},
+		{
+			name:     "should return lower case with spaces replaced by hyphens and non-alphanumeric characters removed",
+			input:    "Test-Name-1-",
+			expected: "test-name-1",
+		},
+		{
+			name:     "should return lower case with spaces replaced by hyphens and non-alphanumeric characters removed",
+			input:    "Test-Name-1-@",
+			expected: "test-name-1",
+		},
+		{
+			name:     "should return lower case with spaces replaced by hyphens and non-alphanumeric characters removed",
+			input:    "Test-Name-1-@-",
+			expected: "test-name-1",
+		},
+		{
+			name:     "should return lower case with spaces replaced by hyphens and non-alphanumeric characters removed",
+			input:    "Test-Name-1-@-@",
+			expected: "test-name-1",
+		},
+		{
+			name:     "should return lower case with underscores replaced by hyphens and non-alphanumeric characters removed",
+			input:    "Test_Name_1-@-@",
+			expected: "test-name-1",
+		},
+		{
+			name:     "should return lower case with underscores replaced by hyphens and non-alphanumeric characters removed",
+			input:    "0_Test_Name_1-@-@",
+			expected: "0-test-name-1",
+		},
+		{
+			name:     "should return lower case with underscores replaced by hyphens and non-alphanumeric characters removed",
+			input:    "_Test_Name_1-@-@",
+			expected: "test-name-1",
+		},
+		{
+			name:     "should return lower case with name without hyphens",
+			input:    "_Test_Name_1---",
+			expected: "test-name-1",
+		},
+		{
+			name:     "should not change the input since input is valid k8s name",
+			input:    "test-name-1",
+			expected: "test-name-1",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			normalizedNamed := GetNormalizedKubernetesName(tc.input)
+			g.Expect(normalizedNamed).To(Equal(tc.expected))
+		})
+	}
 }

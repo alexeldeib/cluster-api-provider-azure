@@ -41,6 +41,9 @@ config:
     zipkin:
       endpoint: 0.0.0.0:9411
   service:
+    telemetry:
+      metrics:
+        address: 0.0.0.0:8888
     extensions:
       - health_check
       - memory_ballast
@@ -86,7 +89,7 @@ imagePullSecrets: []
 
 # OpenTelemetry Collector executable
 command:
-  name: otelcontribcol
+  name: otelcol-contrib
   extraArgs: []
 
 serviceAccount:
@@ -137,9 +140,8 @@ affinity: {}
 priorityClassName: ""
 
 extraEnvs: []
-extraConfigMapMounts: []
-extraHostPathMounts: []
-secretMounts: []
+extraVolumes: []
+extraVolumeMounts: []
 
 # Configuration for ports, shared between agentCollector, standaloneCollector and service.
 # Can be overridden here or for agentCollector and standaloneCollector independently.
@@ -180,6 +182,13 @@ ports:
     servicePort: 9411
     hostPort: 9411
     protocol: TCP
+  metrics:
+    # The metrics port is disabled by default. However you need to enable the port
+    # in order to use the ServiceMonitor (serviceMonitor.enabled) or PodMonitor (podMonitor.enabled).
+    enabled: false
+    containerPort: 8888
+    servicePort: 8888
+    protocol: TCP
 
 # Configuration for agent OpenTelemetry Collector daemonset, enabled by default
 agentCollector:
@@ -196,6 +205,9 @@ agentCollector:
   podAnnotations: {}
 
   podLabels: {}
+
+  # Host networking requested for this pod. Use the host's network namespace.
+  hostNetwork: false
 
   # Configuration override that will be merged into the agent's default config
   configOverride: {}
@@ -290,24 +302,50 @@ service:
   type: ClusterIP
   annotations: {}
 
-podMonitor:
+ingress:
   enabled: false
-  metricsEndpoints: {}
-  # - port: prometheus
+  annotations: {}
+#  ingressClassName: nginx
+#  hosts:
+#    - host: collector.example.com
+#      paths:
+#        - path: /
+#          pathType: Prefix
+#          port: 4318
+#  tls:
+#    - secretName: collector-tls
+#      hosts:
+#        - collector.example.com
+
+podMonitor:
+  # The pod monitor by default scrapes the metrics port.
+  # The metrics port needs to be enabled as well.
+  enabled: false
+  metricsEndpoints:
+  - port: metrics
+    # interval: 15s
 
   # additional labels for the PodMonitor
   extraLabels: {}
   #   release: kube-prometheus-stack
 
 serviceMonitor:
+  # The service monitor by default scrapes the metrics port.
+  # The metrics port needs to be enabled as well.
   enabled: false
-  metricsEndpoints: {}
-  # - port: metrics
-  #   interval: 15s
+  metricsEndpoints:
+  - port: metrics
+    # interval: 15s
 
   # additional labels for the ServiceMonitor
   extraLabels: {}
   #  release: kube-prometheus-stack
+
+# PodDisruptionBudget is used only if standaloneCollector enabled
+podDisruptionBudget:
+  enabled: false
+#   minAvailable: 2
+#   maxUnavailable: 1
 
 # autoscaling is used only if standaloneCollector enabled
 autoscaling:

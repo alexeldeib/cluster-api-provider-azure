@@ -18,142 +18,129 @@ package securitygroups
 
 import (
 	"context"
-	"strings"
 
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-02-01/network"
-	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v4"
 	"github.com/pkg/errors"
+
+	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
-	"sigs.k8s.io/cluster-api-provider-azure/azure/converters"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/async"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
 )
 
+const serviceName = "securitygroups"
+
 // NSGScope defines the scope interface for a security groups service.
 type NSGScope interface {
-	azure.ClusterDescriber
-	azure.NetworkDescriber
-	NSGSpecs() []azure.NSGSpec
+	azure.Authorizer
+	azure.AsyncStatusUpdater
+	NSGSpecs() []azure.ResourceSpecGetter
+	IsVnetManaged() bool
+	UpdateAnnotationJSON(string, map[string]any) error
 }
 
 // Service provides operations on Azure resources.
 type Service struct {
 	Scope NSGScope
-	client
+	async.Reconciler
 }
 
 // New creates a new service.
-func New(scope NSGScope) *Service {
-	return &Service{
-		Scope:  scope,
-		client: newClient(scope),
+func New(scope NSGScope) (*Service, error) {
+	client, err := newClient(scope, scope.DefaultedAzureCallTimeout())
+	if err != nil {
+		return nil, err
 	}
+	return &Service{
+		Scope: scope,
+		Reconciler: async.New[armnetwork.SecurityGroupsClientCreateOrUpdateResponse,
+			armnetwork.SecurityGroupsClientDeleteResponse](scope, client, client),
+	}, nil
 }
 
-// Reconcile gets/creates/updates a network security group.
+// Name returns the service name.
+func (s *Service) Name() string {
+	return serviceName
+}
+
+// Reconcile idempotently creates or updates a set of network security groups.
 func (s *Service) Reconcile(ctx context.Context) error {
 	ctx, log, done := tele.StartSpanWithLogger(ctx, "securitygroups.Service.Reconcile")
 	defer done()
 
-	if !s.Scope.IsVnetManaged() {
-		log.V(4).Info("Skipping network security group reconcile in custom VNet mode")
+	ctx, cancel := context.WithTimeout(ctx, s.Scope.DefaultedAzureServiceReconcileTimeout())
+	defer cancel()
+
+	// Only create the NSGs if their lifecycle is managed by this controller.
+	if managed, err := s.IsManaged(ctx); err == nil && !managed {
+		log.V(4).Info("Skipping network security groups reconcile in custom VNet mode")
+		return nil
+	} else if err != nil {
+		return errors.Wrap(err, "failed to check if security groups are managed")
+	}
+
+	specs := s.Scope.NSGSpecs()
+	if len(specs) == 0 {
 		return nil
 	}
 
-	for _, nsgSpec := range s.Scope.NSGSpecs() {
-		securityRules := make([]network.SecurityRule, 0)
-		var etag *string
+	var resErr error
 
-		existingNSG, err := s.client.Get(ctx, s.Scope.ResourceGroup(), nsgSpec.Name)
-		switch {
-		case err != nil && !azure.ResourceNotFound(err):
-			return errors.Wrapf(err, "failed to get NSG %s in %s", nsgSpec.Name, s.Scope.ResourceGroup())
-		case err == nil:
-			// security group already exists
-			// We append the existing NSG etag to the header to ensure we only apply the updates if the NSG has not been modified.
-			etag = existingNSG.Etag
-			// Check if the expected rules are present
-			update := false
-			securityRules = *existingNSG.SecurityRules
-			for _, rule := range nsgSpec.SecurityRules {
-				sdkRule := converters.SecurityRuleToSDK(rule)
-				if !ruleExists(securityRules, sdkRule) {
-					update = true
-					securityRules = append(securityRules, sdkRule)
-				}
+	newAnnotation := make(map[string]any)
+
+	// We go through the list of security groups to reconcile each one, independently of the result of the previous one.
+	// If multiple errors occur, we return the most pressing one.
+	//  Order of precedence (highest -> lowest) is: error that is not an operationNotDoneError (i.e. error creating) -> operationNotDoneError (i.e. creating in progress) -> no error (i.e. created)
+	for _, resourceSpec := range specs {
+		nsgSpec := resourceSpec.(*NSGSpec)
+		currentAnnotation := make(map[string]string)
+
+		if _, err := s.CreateOrUpdateResource(ctx, nsgSpec, serviceName); err != nil {
+			if !azure.IsOperationNotDoneError(err) || resErr == nil {
+				resErr = err
 			}
-			if !update {
-				// Skip update for NSG as the required default rules are present
-				log.V(2).Info("security group exists and no default rules are missing, skipping update", "security group", nsgSpec.Name)
-				continue
-			}
-		default:
-			log.V(2).Info("creating security group", "security group", nsgSpec.Name)
-			for _, rule := range nsgSpec.SecurityRules {
-				securityRules = append(securityRules, converters.SecurityRuleToSDK(rule))
-			}
-		}
-		sg := network.SecurityGroup{
-			Location: to.StringPtr(s.Scope.Location()),
-			SecurityGroupPropertiesFormat: &network.SecurityGroupPropertiesFormat{
-				SecurityRules: &securityRules,
-			},
-			Etag: etag,
-		}
-		err = s.client.CreateOrUpdate(ctx, s.Scope.ResourceGroup(), nsgSpec.Name, sg)
-		if err != nil {
-			return errors.Wrapf(err, "failed to create or update security group %s in resource group %s", nsgSpec.Name, s.Scope.ResourceGroup())
 		}
 
-		log.V(2).Info("successfully created or updated security group", "security group", nsgSpec.Name)
+		for _, rule := range nsgSpec.SecurityRules {
+			currentAnnotation[rule.Name] = rule.Description
+		}
+
+		if len(currentAnnotation) > 0 {
+			newAnnotation[nsgSpec.Name] = currentAnnotation
+		}
 	}
-	return nil
+
+	if err := s.Scope.UpdateAnnotationJSON(azure.SecurityRuleLastAppliedAnnotation, newAnnotation); err != nil {
+		return err
+	}
+
+	s.Scope.UpdatePutStatus(infrav1.SecurityGroupsReadyCondition, serviceName, resErr)
+	return resErr
 }
 
-func ruleExists(rules []network.SecurityRule, rule network.SecurityRule) bool {
-	for _, existingRule := range rules {
-		if !strings.EqualFold(to.String(existingRule.Name), to.String(rule.Name)) {
-			continue
-		}
-		if !strings.EqualFold(to.String(existingRule.DestinationPortRange), to.String(rule.DestinationPortRange)) {
-			continue
-		}
-		if existingRule.Protocol != network.SecurityRuleProtocolTCP &&
-			existingRule.Access != network.SecurityRuleAccessAllow &&
-			existingRule.Direction != network.SecurityRuleDirectionInbound {
-			continue
-		}
-		if !strings.EqualFold(to.String(existingRule.SourcePortRange), "*") &&
-			!strings.EqualFold(to.String(existingRule.SourceAddressPrefix), "*") &&
-			!strings.EqualFold(to.String(existingRule.DestinationAddressPrefix), "*") {
-			continue
-		}
-		return true
-	}
-	return false
-}
-
-// Delete deletes the network security group with the provided name.
+// Delete deletes network security groups.
 func (s *Service) Delete(ctx context.Context) error {
 	ctx, log, done := tele.StartSpanWithLogger(ctx, "securitygroups.Service.Delete")
 	defer done()
 
-	if !s.Scope.IsVnetManaged() {
-		log.V(4).Info("Skipping network security group delete in custom VNet mode")
+	ctx, cancel := context.WithTimeout(ctx, s.Scope.DefaultedAzureServiceReconcileTimeout())
+	defer cancel()
+
+	// Only delete the security groups if their lifecycle is managed by this controller.
+	if managed, err := s.IsManaged(ctx); err == nil && !managed {
+		log.V(4).Info("Skipping network security groups delete in custom VNet mode")
 		return nil
+	} else if err != nil {
+		return errors.Wrap(err, "failed to check if security groups are managed")
 	}
 
-	for _, nsgSpec := range s.Scope.NSGSpecs() {
-		log.V(2).Info("deleting security group", "security group", nsgSpec.Name)
-		err := s.client.Delete(ctx, s.Scope.ResourceGroup(), nsgSpec.Name)
-		if err != nil && azure.ResourceNotFound(err) {
-			// already deleted
-			continue
-		}
-		if err != nil {
-			return errors.Wrapf(err, "failed to delete security group %s in resource group %s", nsgSpec.Name, s.Scope.ResourceGroup())
-		}
+	return azure.DeleteAll(ctx, s.Reconciler, s.Scope, s.Scope.NSGSpecs(), serviceName, infrav1.SecurityGroupsReadyCondition)
+}
 
-		log.V(2).Info("successfully deleted security group", "security group", nsgSpec.Name)
-	}
-	return nil
+// IsManaged returns true if the security groups' lifecycles are managed.
+func (s *Service) IsManaged(ctx context.Context) (bool, error) {
+	_, _, done := tele.StartSpanWithLogger(ctx, "securitygroups.Service.IsManaged")
+	defer done()
+
+	return s.Scope.IsVnetManaged(), nil
 }

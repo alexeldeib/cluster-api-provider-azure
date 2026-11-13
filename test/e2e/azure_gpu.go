@@ -1,3 +1,4 @@
+//go:build e2e
 // +build e2e
 
 /*
@@ -24,7 +25,7 @@ import (
 	"os"
 	"strings"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -121,10 +122,15 @@ func AzureGPUSpec(ctx context.Context, inputGetter func() AzureGPUSpecInput) {
 // getGPUOperatorPodLogs returns the logs of the Nvidia GPU operator pods.
 func getGPUOperatorPodLogs(ctx context.Context, clientset *kubernetes.Clientset) string {
 	podsClient := clientset.CoreV1().Pods(corev1.NamespaceAll)
-	pods, err := podsClient.List(ctx, metav1.ListOptions{LabelSelector: "app.kubernetes.io/instance=gpu-operator"})
-	if err != nil {
-		return err.Error()
-	}
+	var pods *corev1.PodList
+	var err error
+	Eventually(func(g Gomega) {
+		pods, err = podsClient.List(ctx, metav1.ListOptions{LabelSelector: "app.kubernetes.io/instance=gpu-operator"})
+		if err != nil {
+			LogWarning(err.Error())
+		}
+		g.Expect(err).NotTo(HaveOccurred())
+	}, retryableOperationTimeout, retryableOperationSleepBetweenRetries).Should(Succeed())
 	b := strings.Builder{}
 	for _, pod := range pods.Items {
 		b.WriteString(fmt.Sprintf("\nLogs for pod %s:\n", pod.Name))

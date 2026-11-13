@@ -28,12 +28,18 @@ envfile
 kind.kubeconfig
 minikube.kubeconfig
 kubeconfig
+!kubeconfig/
+*.kubeconfig
 
 # ssh keys
 .ssh*
 
 # Example and binary output directory
 /out
+
+# Mdbook build directory
+docs/book/bookout
+docs/book/src/reference/*.html
 
 # vscode
 .vscode
@@ -54,6 +60,7 @@ bazel-*
 .tiltbuild
 /tilt.d
 tilt-settings.json
+tilt-settings.yaml
 tilt_config.json
 
 # e2e output
@@ -73,5 +80,19 @@ hack/boilerplate/*.pyc
 # Helm chart caching
 .helm/
 
-# release notes
-_releasenotes
+# calico manifests archive
+release-*/manifests/calico-*.yaml
+
+# mentioned in the capz book
+/sp.json
+/cluster.yaml
+
+# CI workload-identity
+jwks.json
+*.pub
+*.key
+azure_identity_id
+azure_wi_back_compat
+openid-configuration.json
+aks-mgmt.config
+.service-account-issuer.env

@@ -19,26 +19,35 @@ package converters
 import (
 	"strconv"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2021-04-01/compute"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
+	"k8s.io/utils/ptr"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 )
 
 // GetSpotVMOptions takes the spot vm options
 // and returns the individual vm priority, eviction policy and billing profile.
-func GetSpotVMOptions(spotVMOptions *infrav1.SpotVMOptions) (compute.VirtualMachinePriorityTypes, compute.VirtualMachineEvictionPolicyTypes, *compute.BillingProfile, error) {
+func GetSpotVMOptions(spotVMOptions *infrav1.SpotVMOptions, _ *infrav1.DiffDiskSettings) (*armcompute.VirtualMachinePriorityTypes, *armcompute.VirtualMachineEvictionPolicyTypes, *armcompute.BillingProfile, error) {
 	// Spot VM not requested, return zero values to apply defaults
 	if spotVMOptions == nil {
-		return "", "", nil, nil
+		return nil, nil, nil, nil
 	}
-	var billingProfile *compute.BillingProfile
+	var billingProfile *armcompute.BillingProfile
 	if spotVMOptions.MaxPrice != nil {
 		maxPrice, err := strconv.ParseFloat(spotVMOptions.MaxPrice.AsDec().String(), 64)
 		if err != nil {
-			return "", "", nil, err
+			return nil, nil, nil, err
 		}
-		billingProfile = &compute.BillingProfile{
+		billingProfile = &armcompute.BillingProfile{
 			MaxPrice: &maxPrice,
 		}
 	}
-	return compute.VirtualMachinePriorityTypesSpot, compute.VirtualMachineEvictionPolicyTypesDeallocate, billingProfile, nil
+
+	// Set the spot vm eviction policy if provided.
+	var evictionPolicy *armcompute.VirtualMachineEvictionPolicyTypes
+	if spotVMOptions.EvictionPolicy != nil {
+		evictionPolicy = ptr.To(armcompute.VirtualMachineEvictionPolicyTypes(*spotVMOptions.EvictionPolicy))
+	}
+
+	return ptr.To(armcompute.VirtualMachinePriorityTypesSpot), evictionPolicy, billingProfile, nil
 }

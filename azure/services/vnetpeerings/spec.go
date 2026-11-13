@@ -17,20 +17,27 @@ limitations under the License.
 package vnetpeerings
 
 import (
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-02-01/network"
-	"github.com/Azure/go-autorest/autorest/to"
+	"context"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v4"
 	"github.com/pkg/errors"
+	"k8s.io/utils/ptr"
+
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
 )
 
 // VnetPeeringSpec defines the specification for a virtual network peering.
 type VnetPeeringSpec struct {
-	SourceResourceGroup string
-	SourceVnetName      string
-	RemoteResourceGroup string
-	RemoteVnetName      string
-	PeeringName         string
-	SubscriptionID      string
+	SourceResourceGroup       string
+	SourceVnetName            string
+	RemoteResourceGroup       string
+	RemoteVnetName            string
+	PeeringName               string
+	SubscriptionID            string
+	AllowForwardedTraffic     *bool
+	AllowGatewayTransit       *bool
+	AllowVirtualNetworkAccess *bool
+	UseRemoteGateways         *bool
 }
 
 // ResourceName returns the name of the virtual network peering.
@@ -49,22 +56,26 @@ func (s *VnetPeeringSpec) OwnerResourceName() string {
 }
 
 // Parameters returns the parameters for the virtual network peering.
-func (s *VnetPeeringSpec) Parameters(existing interface{}) (params interface{}, err error) {
+func (s *VnetPeeringSpec) Parameters(_ context.Context, existing any) (params any, err error) {
 	if existing != nil {
-		if _, ok := existing.(network.VirtualNetworkPeering); !ok {
-			return nil, errors.Errorf("%T is not a network.VnetPeering", existing)
+		if _, ok := existing.(armnetwork.VirtualNetworkPeering); !ok {
+			return nil, errors.Errorf("%T is not an armnetwork.VnetPeering", existing)
 		}
 		// virtual network peering already exists
 		return nil, nil
 	}
 	vnetID := azure.VNetID(s.SubscriptionID, s.RemoteResourceGroup, s.RemoteVnetName)
-	peeringProperties := network.VirtualNetworkPeeringPropertiesFormat{
-		RemoteVirtualNetwork: &network.SubResource{
-			ID: to.StringPtr(vnetID),
+	peeringProperties := armnetwork.VirtualNetworkPeeringPropertiesFormat{
+		RemoteVirtualNetwork: &armnetwork.SubResource{
+			ID: ptr.To(vnetID),
 		},
+		AllowForwardedTraffic:     s.AllowForwardedTraffic,
+		AllowGatewayTransit:       s.AllowGatewayTransit,
+		AllowVirtualNetworkAccess: s.AllowVirtualNetworkAccess,
+		UseRemoteGateways:         s.UseRemoteGateways,
 	}
-	return network.VirtualNetworkPeering{
-		Name:                                  to.StringPtr(s.PeeringName),
-		VirtualNetworkPeeringPropertiesFormat: &peeringProperties,
+	return armnetwork.VirtualNetworkPeering{
+		Name:       ptr.To(s.PeeringName),
+		Properties: &peeringProperties,
 	}, nil
 }

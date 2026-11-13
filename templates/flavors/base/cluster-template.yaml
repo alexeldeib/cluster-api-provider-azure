@@ -3,8 +3,6 @@ apiVersion: cluster.x-k8s.io/v1beta1
 kind: Cluster
 metadata:
   name: ${CLUSTER_NAME}
-  labels:
-    cni: "calico"
 spec:
   clusterNetwork:
     pods:
@@ -33,8 +31,6 @@ spec:
     - name: control-plane-subnet
       role: control-plane
     - name: node-subnet
-      natGateway:
-        name: node-natgateway
       role: node
 ---
 kind: KubeadmControlPlane
@@ -42,7 +38,7 @@ apiVersion: controlplane.cluster.x-k8s.io/v1beta1
 metadata:
   name: "${CLUSTER_NAME}-control-plane"
 spec:
-  replicas: ${CONTROL_PLANE_MACHINE_COUNT}
+  replicas: ${CONTROL_PLANE_MACHINE_COUNT:=1}
   machineTemplate:
     infrastructureRef:
       kind: AzureMachineTemplate
@@ -53,38 +49,22 @@ spec:
       nodeRegistration:
         name: '{{ ds.meta_data["local_hostname"] }}'
         kubeletExtraArgs:
-          cloud-provider: azure
-          cloud-config: /etc/kubernetes/azure.json
-          azure-container-registry-config: /etc/kubernetes/azure.json
+          cloud-provider: external
     joinConfiguration:
       nodeRegistration:
         name: '{{ ds.meta_data["local_hostname"] }}'
         kubeletExtraArgs:
-          cloud-provider: azure
-          cloud-config: /etc/kubernetes/azure.json
-          azure-container-registry-config: /etc/kubernetes/azure.json
+          cloud-provider: external
     clusterConfiguration:
       apiServer:
         timeoutForControlPlane: 20m
         extraArgs:
-          cloud-provider: azure
-          cloud-config: /etc/kubernetes/azure.json
-        extraVolumes:
-          - hostPath: /etc/kubernetes/azure.json
-            mountPath: /etc/kubernetes/azure.json
-            name: cloud-config
-            readOnly: true
+          service-account-issuer: ${SERVICE_ACCOUNT_ISSUER:-https://kubernetes.default.svc.cluster.local}
       controllerManager:
         extraArgs:
-          cloud-provider: azure
-          cloud-config: /etc/kubernetes/azure.json
           allocate-node-cidrs: "false"
           cluster-name: ${CLUSTER_NAME}
-        extraVolumes:
-          - hostPath: /etc/kubernetes/azure.json
-            mountPath: /etc/kubernetes/azure.json
-            name: cloud-config
-            readOnly: true
+          cloud-provider: external
       etcd:
         local:
           dataDir: "/var/lib/etcddisk/etcd"
@@ -120,6 +100,7 @@ spec:
         - /var/lib/etcddisk
     preKubeadmCommands: []
     postKubeadmCommands: []
+    verbosity: 10
   version: "${KUBERNETES_VERSION}"
 ---
 kind: AzureMachineTemplate
@@ -138,3 +119,6 @@ spec:
           diskSizeGB: 256
           lun: 0
       sshPublicKey: ${AZURE_SSH_PUBLIC_KEY_B64:=""}
+      identity: UserAssigned
+      userAssignedIdentities:
+      - providerID: azure:///subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${CI_RG:=capz-ci}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/${USER_IDENTITY:=cloud-provider-user-identity}

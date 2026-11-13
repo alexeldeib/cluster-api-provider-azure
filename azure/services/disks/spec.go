@@ -16,6 +16,8 @@ limitations under the License.
 
 package disks
 
+import "context"
+
 // DiskSpec defines the specification for a disk.
 type DiskSpec struct {
 	Name          string
@@ -38,6 +40,6 @@ func (s *DiskSpec) OwnerResourceName() string {
 }
 
 // Parameters is a no-op for disks.
-func (s *DiskSpec) Parameters(existing interface{}) (params interface{}, err error) {
+func (s *DiskSpec) Parameters(_ context.Context, _ any) (params any, err error) {
 	return nil, nil
 }

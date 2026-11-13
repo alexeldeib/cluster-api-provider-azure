@@ -18,157 +18,61 @@ package agentpools
 
 import (
 	"context"
-	"fmt"
-	"time"
 
-	"github.com/Azure/azure-sdk-for-go/services/containerservice/mgmt/2021-05-01/containerservice"
-	"github.com/Azure/go-autorest/autorest/to"
-	"github.com/google/go-cmp/cmp"
-	"github.com/pkg/errors"
+	asocontainerservicev1hub "github.com/Azure/azure-service-operator/v2/api/containerservice/v1api20250801/storage"
+	"github.com/Azure/azure-service-operator/v2/pkg/genruntime"
+	"k8s.io/utils/ptr"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/controller-runtime/pkg/conversion"
 
-	infrav1alpha4 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
+	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
-	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/aso"
 )
 
-// ManagedMachinePoolScope defines the scope interface for a managed machine pool.
-type ManagedMachinePoolScope interface {
-	azure.ClusterDescriber
+const serviceName = "agentpools"
 
+// AgentPoolScope defines the scope interface for an agent pool.
+type AgentPoolScope interface {
+	aso.Scope
+
+	Name() string
 	NodeResourceGroup() string
-	AgentPoolSpec() azure.AgentPoolSpec
+	AgentPoolSpec() azure.ASOResourceSpecGetter[genruntime.MetaObject]
 	SetAgentPoolProviderIDList([]string)
 	SetAgentPoolReplicas(int32)
 	SetAgentPoolReady(bool)
-}
-
-// Service provides operations on Azure resources.
-type Service struct {
-	scope ManagedMachinePoolScope
-	Client
+	SetCAPIMachinePoolReplicas(replicas *int)
+	SetCAPIMachinePoolAnnotation(key, value string)
+	RemoveCAPIMachinePoolAnnotation(key string)
+	SetSubnetName()
+	IsPreviewEnabled() bool
 }
 
 // New creates a new service.
-func New(scope ManagedMachinePoolScope) *Service {
-	return &Service{
-		scope:  scope,
-		Client: NewClient(scope),
-	}
+func New(scope AgentPoolScope) *aso.Service[genruntime.MetaObject, AgentPoolScope] {
+	svc := aso.NewService[genruntime.MetaObject](serviceName, scope)
+	svc.Specs = []azure.ASOResourceSpecGetter[genruntime.MetaObject]{scope.AgentPoolSpec()}
+	svc.ConditionType = infrav1.AgentPoolsReadyCondition
+	svc.PostCreateOrUpdateResourceHook = postCreateOrUpdateResourceHook
+	return svc
 }
 
-// Reconcile idempotently creates or updates a agent pool, if possible.
-func (s *Service) Reconcile(ctx context.Context) error {
-	ctx, log, done := tele.StartSpanWithLogger(
-		ctx,
-		"agentpools.Service.Reconcile",
-	)
-	defer done()
-
-	agentPoolSpec := s.scope.AgentPoolSpec()
-
-	profile := containerservice.AgentPool{
-		ManagedClusterAgentPoolProfileProperties: &containerservice.ManagedClusterAgentPoolProfileProperties{
-			VMSize:              &agentPoolSpec.SKU,
-			OsType:              containerservice.OSTypeLinux,
-			OsDiskSizeGB:        &agentPoolSpec.OSDiskSizeGB,
-			Count:               &agentPoolSpec.Replicas,
-			Type:                containerservice.AgentPoolTypeVirtualMachineScaleSets,
-			OrchestratorVersion: agentPoolSpec.Version,
-			VnetSubnetID:        &agentPoolSpec.VnetSubnetID,
-			Mode:                containerservice.AgentPoolMode(agentPoolSpec.Mode),
-			EnableAutoScaling:   agentPoolSpec.EnableAutoScaling,
-			MaxCount:            agentPoolSpec.MaxCount,
-			MinCount:            agentPoolSpec.MinCount,
-			AvailabilityZones:   &agentPoolSpec.AvailabilityZones,
-			MaxPods:             agentPoolSpec.MaxPods,
-			OsDiskType:          containerservice.OSDiskType(to.String(agentPoolSpec.OsDiskType)),
-		},
-	}
-
-	existingPool, err := s.Client.Get(ctx, agentPoolSpec.ResourceGroup, agentPoolSpec.Cluster, agentPoolSpec.Name)
-	if err != nil && !azure.ResourceNotFound(err) {
-		return errors.Wrap(err, "failed to get existing agent pool")
-	}
-
-	// For updates, we want to pass whatever we find in the existing
-	// cluster, normalized to reflect the input we originally provided.
-	// AKS will populate defaults and read-only values, which we want
-	// to strip/clean to match what we expect.
-
-	if isCreate := azure.ResourceNotFound(err); isCreate {
-		err = s.Client.CreateOrUpdate(ctx, agentPoolSpec.ResourceGroup, agentPoolSpec.Cluster, agentPoolSpec.Name, profile)
-		if err != nil && azure.ResourceNotFound(err) {
-			return azure.WithTransientError(errors.Wrap(err, "agent pool dependent resource does not exist yet"), 20*time.Second)
-		} else if err != nil {
-			return errors.Wrap(err, "failed to create or update agent pool")
-		}
-	} else {
-		ps := *existingPool.ManagedClusterAgentPoolProfileProperties.ProvisioningState
-		if ps != string(infrav1alpha4.Canceled) && ps != string(infrav1alpha4.Failed) && ps != string(infrav1alpha4.Succeeded) {
-			msg := fmt.Sprintf("Unable to update existing agent pool in non terminal state. Agent pool must be in one of the following provisioning states: canceled, failed, or succeeded. Actual state: %s", ps)
-			log.V(2).Info(msg)
-			return azure.WithTransientError(errors.New(msg), 20*time.Second)
-		}
-
-		// Normalize individual agent pools to diff in case we need to update
-		existingProfile := containerservice.AgentPool{
-			ManagedClusterAgentPoolProfileProperties: &containerservice.ManagedClusterAgentPoolProfileProperties{
-				Count:               existingPool.Count,
-				OrchestratorVersion: existingPool.OrchestratorVersion,
-				Mode:                existingPool.Mode,
-				EnableAutoScaling:   existingPool.EnableAutoScaling,
-				MinCount:            existingPool.MinCount,
-				MaxCount:            existingPool.MaxCount,
-			},
-		}
-
-		normalizedProfile := containerservice.AgentPool{
-			ManagedClusterAgentPoolProfileProperties: &containerservice.ManagedClusterAgentPoolProfileProperties{
-				Count:               profile.Count,
-				OrchestratorVersion: profile.OrchestratorVersion,
-				Mode:                profile.Mode,
-				EnableAutoScaling:   profile.EnableAutoScaling,
-				MinCount:            profile.MinCount,
-				MaxCount:            profile.MaxCount,
-			},
-		}
-
-		// Diff and check if we require an update
-		diff := cmp.Diff(normalizedProfile, existingProfile)
-		if diff != "" {
-			log.V(2).Info(fmt.Sprintf("Update required (+new -old):\n%s", diff))
-			err = s.Client.CreateOrUpdate(ctx, agentPoolSpec.ResourceGroup, agentPoolSpec.Cluster, agentPoolSpec.Name, profile)
-			if err != nil {
-				return errors.Wrap(err, "failed to create or update agent pool")
-			}
-		} else {
-			log.V(2).Info("Normalized and desired agent pool matched, no update needed")
-		}
-	}
-
-	return nil
-}
-
-// Delete deletes the virtual network with the provided name.
-func (s *Service) Delete(ctx context.Context) error {
-	ctx, log, done := tele.StartSpanWithLogger(
-		ctx,
-		"agentpools.Service.Delete",
-	)
-	defer done()
-
-	agentPoolSpec := s.scope.AgentPoolSpec()
-
-	log.V(2).Info(fmt.Sprintf("deleting agent pool  %s ", agentPoolSpec.Name))
-	err := s.Client.Delete(ctx, agentPoolSpec.ResourceGroup, agentPoolSpec.Cluster, agentPoolSpec.Name)
+func postCreateOrUpdateResourceHook(_ context.Context, scope AgentPoolScope, obj genruntime.MetaObject, err error) error {
 	if err != nil {
-		if azure.ResourceNotFound(err) {
-			// already deleted
-			return nil
-		}
-		return errors.Wrapf(err, "failed to delete agent pool %s in resource group %s", agentPoolSpec.Name, agentPoolSpec.ResourceGroup)
+		return err
+	}
+	agentPool := &asocontainerservicev1hub.ManagedClustersAgentPool{}
+	if err := obj.(conversion.Convertible).ConvertTo(agentPool); err != nil {
+		return err
 	}
 
-	log.V(2).Info(fmt.Sprintf("Successfully deleted agent pool %s ", agentPoolSpec.Name))
+	// When autoscaling is set, add the annotation to the machine pool and update the replica count.
+	if ptr.Deref(agentPool.Status.EnableAutoScaling, false) {
+		scope.SetCAPIMachinePoolAnnotation(clusterv1.ReplicasManagedByAnnotation, "true")
+		scope.SetCAPIMachinePoolReplicas(agentPool.Status.Count)
+	} else { // Otherwise, remove the annotation.
+		scope.RemoveCAPIMachinePoolAnnotation(clusterv1.ReplicasManagedByAnnotation)
+	}
 	return nil
 }

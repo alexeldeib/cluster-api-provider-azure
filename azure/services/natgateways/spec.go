@@ -17,10 +17,13 @@ limitations under the License.
 package natgateways
 
 import (
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-02-01/network"
-	autorest "github.com/Azure/go-autorest/autorest/azure"
-	"github.com/Azure/go-autorest/autorest/to"
-	"github.com/pkg/errors"
+	"context"
+
+	asonetworkv1 "github.com/Azure/azure-service-operator/v2/api/network/v1api20220701"
+	"github.com/Azure/azure-service-operator/v2/pkg/genruntime"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
 )
@@ -32,67 +35,56 @@ type NatGatewaySpec struct {
 	SubscriptionID string
 	Location       string
 	NatGatewayIP   infrav1.PublicIPSpec
+	ClusterName    string
+	Zones          []string
+	AdditionalTags infrav1.Tags
+	IsVnetManaged  bool
 }
 
-// ResourceName returns the name of the NAT gateway.
-func (s *NatGatewaySpec) ResourceName() string {
-	return s.Name
+// ResourceRef implements azure.ASOResourceSpecGetter.
+func (s *NatGatewaySpec) ResourceRef() *asonetworkv1.NatGateway {
+	return &asonetworkv1.NatGateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: azure.GetNormalizedKubernetesName(s.Name),
+		},
+	}
 }
 
-// ResourceGroupName returns the name of the resource group.
-func (s *NatGatewaySpec) ResourceGroupName() string {
-	return s.ResourceGroup
-}
+// Parameters implements azure.ASOResourceSpecGetter.
+func (s *NatGatewaySpec) Parameters(_ context.Context, existingNatGateway *asonetworkv1.NatGateway) (params *asonetworkv1.NatGateway, err error) {
+	natGateway := &asonetworkv1.NatGateway{}
+	natGateway.Spec = asonetworkv1.NatGateway_Spec{}
 
-// OwnerResourceName is a no-op for NAT gateways.
-func (s *NatGatewaySpec) OwnerResourceName() string {
-	return ""
-}
-
-// Parameters returns the parameters for the NAT gateway.
-func (s *NatGatewaySpec) Parameters(existing interface{}) (params interface{}, err error) {
-	if existing != nil {
-		existingNatGateway, ok := existing.(network.NatGateway)
-		if !ok {
-			return nil, errors.Errorf("%T is not a network.NatGateway", existing)
-		}
-
-		if hasPublicIP(existingNatGateway, s.NatGatewayIP.Name) {
-			// Skip update for NAT gateway as it exists with expected values
-			return nil, nil
-		}
+	if existingNatGateway != nil {
+		natGateway = existingNatGateway
 	}
 
-	natGatewayToCreate := network.NatGateway{
-		Name:     to.StringPtr(s.Name),
-		Location: to.StringPtr(s.Location),
-		Sku:      &network.NatGatewaySku{Name: network.NatGatewaySkuNameStandard},
-		NatGatewayPropertiesFormat: &network.NatGatewayPropertiesFormat{
-			PublicIPAddresses: &[]network.SubResource{
-				{
-					ID: to.StringPtr(azure.PublicIPID(s.SubscriptionID, s.ResourceGroupName(), s.NatGatewayIP.Name)),
-				},
+	natGateway.Spec.AzureName = s.Name
+	natGateway.Spec.Owner = &genruntime.KnownResourceReference{
+		Name: azure.GetNormalizedKubernetesName(s.ResourceGroup),
+	}
+	natGateway.Spec.Location = ptr.To(s.Location)
+	natGateway.Spec.Sku = &asonetworkv1.NatGatewaySku{
+		Name: ptr.To(asonetworkv1.NatGatewaySku_Name_Standard),
+	}
+	natGateway.Spec.PublicIpAddresses = []asonetworkv1.SubResource{
+		{
+			Reference: &genruntime.ResourceReference{
+				ARMID: azure.PublicIPID(s.SubscriptionID, s.ResourceGroup, s.NatGatewayIP.Name),
 			},
 		},
 	}
-
-	return natGatewayToCreate, nil
+	natGateway.Spec.Tags = infrav1.Build(infrav1.BuildParams{
+		ClusterName: s.ClusterName,
+		Lifecycle:   infrav1.ResourceLifecycleOwned,
+		Name:        ptr.To(s.Name),
+		Additional:  s.AdditionalTags,
+	})
+	natGateway.Spec.Zones = s.Zones
+	return natGateway, nil
 }
 
-func hasPublicIP(natGateway network.NatGateway, publicIPName string) bool {
-	// We must have a non-nil, non-"empty" PublicIPAddresses
-	if !(natGateway.PublicIPAddresses != nil && len(*natGateway.PublicIPAddresses) > 0) {
-		return false
-	}
-
-	for _, publicIP := range *natGateway.PublicIPAddresses {
-		resource, err := autorest.ParseResourceID(*publicIP.ID)
-		if err != nil {
-			continue
-		}
-		if resource.ResourceName == publicIPName {
-			return true
-		}
-	}
-	return false
+// WasManaged implements azure.ASOResourceSpecGetter.
+func (s *NatGatewaySpec) WasManaged(_ *asonetworkv1.NatGateway) bool {
+	return s.IsVnetManaged
 }

@@ -18,8 +18,11 @@ package controllers
 
 import (
 	"context"
+	"strings"
 
 	"github.com/pkg/errors"
+	clusterv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1"
+
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/scope"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/bastionhosts"
@@ -27,34 +30,29 @@ import (
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/loadbalancers"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/natgateways"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/privatedns"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/privateendpoints"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/privatelinks"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/publicips"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/resourceskus"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/routetables"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/securitygroups"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/subnets"
-	"sigs.k8s.io/cluster-api-provider-azure/azure/services/tags"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/virtualnetworks"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/vnetpeerings"
+	apiinternal "sigs.k8s.io/cluster-api-provider-azure/internal/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 )
 
 // azureClusterService is the reconciler called by the AzureCluster controller.
 type azureClusterService struct {
-	scope            *scope.ClusterScope
-	groupsSvc        azure.Reconciler
-	vnetSvc          azure.Reconciler
-	securityGroupSvc azure.Reconciler
-	routeTableSvc    azure.Reconciler
-	subnetsSvc       azure.Reconciler
-	publicIPSvc      azure.Reconciler
-	loadBalancerSvc  azure.Reconciler
-	privateDNSSvc    azure.Reconciler
-	bastionSvc       azure.Reconciler
-	skuCache         *resourceskus.Cache
-	natGatewaySvc    azure.Reconciler
-	peeringsSvc      azure.Reconciler
-	tagsSvc          azure.Reconciler
+	scope *scope.ClusterScope
+	// services is the list of services that are reconciled by this controller.
+	// The order of the services is important as it determines the order in which the services are reconciled.
+	services  []azure.ServiceReconciler
+	skuCache  *resourceskus.Cache
+	Reconcile func(context.Context) error
+	Pause     func(context.Context) error
+	Delete    func(context.Context) error
 }
 
 // newAzureClusterService populates all the services based on input scope.
@@ -63,138 +61,143 @@ func newAzureClusterService(scope *scope.ClusterScope) (*azureClusterService, er
 	if err != nil {
 		return nil, errors.Wrap(err, "failed creating a NewCache")
 	}
+	securityGroupsSvc, err := securitygroups.New(scope)
+	if err != nil {
+		return nil, err
+	}
+	routeTablesSvc, err := routetables.New(scope)
+	if err != nil {
+		return nil, err
+	}
+	publicIPsSvc, err := publicips.New(scope)
+	if err != nil {
+		return nil, err
+	}
+	privateDNSSvc, err := privatedns.New(scope)
+	if err != nil {
+		return nil, err
+	}
+	vnetPeeringsSvc, err := vnetpeerings.New(scope)
+	if err != nil {
+		return nil, err
+	}
+	loadbalancersSvc, err := loadbalancers.New(scope)
+	if err != nil {
+		return nil, err
+	}
+	acs := &azureClusterService{
+		scope: scope,
+		services: []azure.ServiceReconciler{
+			groups.New(scope),
+			virtualnetworks.New(scope),
+			securityGroupsSvc,
+			routeTablesSvc,
+			publicIPsSvc,
+			natgateways.New(scope),
+			subnets.New(scope),
+			vnetPeeringsSvc,
+			loadbalancersSvc,
+			privateDNSSvc,
+			privatelinks.New(scope),
+			privateendpoints.New(scope),
+			bastionhosts.New(scope),
+		},
+		skuCache: skuCache,
+	}
+	acs.Reconcile = acs.reconcile
+	acs.Pause = acs.pause
+	acs.Delete = acs.delete
 
-	return &azureClusterService{
-		scope:            scope,
-		groupsSvc:        groups.New(scope),
-		vnetSvc:          virtualnetworks.New(scope),
-		securityGroupSvc: securitygroups.New(scope),
-		routeTableSvc:    routetables.New(scope),
-		natGatewaySvc:    natgateways.New(scope),
-		subnetsSvc:       subnets.New(scope),
-		publicIPSvc:      publicips.New(scope),
-		loadBalancerSvc:  loadbalancers.New(scope),
-		privateDNSSvc:    privatedns.New(scope),
-		bastionSvc:       bastionhosts.New(scope),
-		skuCache:         skuCache,
-		peeringsSvc:      vnetpeerings.New(scope),
-		tagsSvc:          tags.New(scope),
-	}, nil
+	return acs, nil
 }
 
-var _ azure.Reconciler = (*azureClusterService)(nil)
-
 // Reconcile reconciles all the services in a predetermined order.
-func (s *azureClusterService) Reconcile(ctx context.Context) error {
+func (s *azureClusterService) reconcile(ctx context.Context) error {
 	ctx, _, done := tele.StartSpanWithLogger(ctx, "controllers.azureClusterService.Reconcile")
 	defer done()
 
 	if err := s.setFailureDomainsForLocation(ctx); err != nil {
 		return errors.Wrap(err, "failed to get availability zones")
 	}
-
-	s.scope.SetDNSName()
-	s.scope.SetControlPlaneSecurityRules()
-
-	if err := s.groupsSvc.Reconcile(ctx); err != nil {
-		return errors.Wrap(err, "failed to reconcile resource group")
+	if s.scope.ControlPlaneEnabled() {
+		apiinternal.SetDefaultAzureClusterBackendPoolName(s.scope.AzureCluster)
+		if err := s.scope.ValidateAPIServerDNSName(); err != nil {
+			return err
+		}
+		s.scope.SetDNSName()
+		s.scope.SetControlPlaneSecurityRules()
 	}
 
-	if err := s.vnetSvc.Reconcile(ctx); err != nil {
-		return errors.Wrap(err, "failed to reconcile virtual network")
+	for _, service := range s.services {
+		if err := service.Reconcile(ctx); err != nil {
+			return errors.Wrapf(err, "failed to reconcile AzureCluster service %s", service.Name())
+		}
 	}
 
-	if err := s.securityGroupSvc.Reconcile(ctx); err != nil {
-		return errors.Wrap(err, "failed to reconcile network security group")
-	}
+	return nil
+}
 
-	if err := s.routeTableSvc.Reconcile(ctx); err != nil {
-		return errors.Wrap(err, "failed to reconcile route table")
-	}
+// Pause pauses all components making up the cluster.
+func (s *azureClusterService) pause(ctx context.Context) error {
+	ctx, _, done := tele.StartSpanWithLogger(ctx, "controllers.azureClusterService.Pause")
+	defer done()
 
-	if err := s.publicIPSvc.Reconcile(ctx); err != nil {
-		return errors.Wrap(err, "failed to reconcile public IP")
-	}
-
-	if err := s.natGatewaySvc.Reconcile(ctx); err != nil {
-		return errors.Wrapf(err, "failed to reconcile NAT gateway")
-	}
-
-	if err := s.subnetsSvc.Reconcile(ctx); err != nil {
-		return errors.Wrapf(err, "failed to reconcile subnet")
-	}
-
-	if err := s.peeringsSvc.Reconcile(ctx); err != nil {
-		return errors.Wrap(err, "failed to reconcile peerings")
-	}
-
-	if err := s.loadBalancerSvc.Reconcile(ctx); err != nil {
-		return errors.Wrap(err, "failed to reconcile load balancer")
-	}
-
-	if err := s.privateDNSSvc.Reconcile(ctx); err != nil {
-		return errors.Wrap(err, "failed to reconcile private dns")
-	}
-
-	if err := s.bastionSvc.Reconcile(ctx); err != nil {
-		return errors.Wrap(err, "failed to reconcile bastion")
-	}
-
-	if err := s.tagsSvc.Reconcile(ctx); err != nil {
-		return errors.Wrap(err, "unable to update tags")
+	for _, service := range s.services {
+		pauser, ok := service.(azure.Pauser)
+		if !ok {
+			continue
+		}
+		if err := pauser.Pause(ctx); err != nil {
+			return errors.Wrapf(err, "failed to pause AzureCluster service %s", service.Name())
+		}
 	}
 
 	return nil
 }
 
 // Delete reconciles all the services in a predetermined order.
-func (s *azureClusterService) Delete(ctx context.Context) error {
+func (s *azureClusterService) delete(ctx context.Context) error {
 	ctx, _, done := tele.StartSpanWithLogger(ctx, "controllers.azureClusterService.Delete")
 	defer done()
 
-	if err := s.groupsSvc.Delete(ctx); err != nil {
-		if errors.Is(err, azure.ErrNotOwned) {
-			if err := s.bastionSvc.Delete(ctx); err != nil {
-				return errors.Wrap(err, "failed to delete bastion")
-			}
+	if !ShouldDeleteIndividualResources(ctx, s.scope) {
+		// If the resource group is managed, delete it.
+		// We need to explicitly delete vnet peerings, as it is not part of the resource group.
+		vnetPeeringsSvc, err := s.getService(vnetpeerings.ServiceName)
+		if err != nil {
+			return errors.Wrap(err, "failed to get vnet peerings service")
+		}
+		if err := vnetPeeringsSvc.Delete(ctx); err != nil {
+			return errors.Wrap(err, "failed to delete peerings")
+		}
 
-			if err := s.privateDNSSvc.Delete(ctx); err != nil {
-				return errors.Wrap(err, "failed to delete private dns")
+		// The private DNS zone can live in a resource group that is not deleted with the cluster.
+		if s.isPrivateDNSZoneOutsideResourceGroups() {
+			privateDNSSvc, err := s.getService(privatedns.ServiceName)
+			if err != nil {
+				return errors.Wrap(err, "failed to get private DNS service")
 			}
+			if err := privateDNSSvc.Delete(ctx); err != nil {
+				return errors.Wrap(err, "failed to delete private DNS")
+			}
+		}
 
-			if err := s.loadBalancerSvc.Delete(ctx); err != nil {
-				return errors.Wrap(err, "failed to delete load balancer")
-			}
+		groupSvc, err := s.getService(groups.ServiceName)
+		if err != nil {
+			return errors.Wrap(err, "failed to get group service")
+		}
 
-			if err := s.peeringsSvc.Delete(ctx); err != nil {
-				return errors.Wrap(err, "failed to delete peerings")
-			}
-
-			if err := s.subnetsSvc.Delete(ctx); err != nil {
-				return errors.Wrap(err, "failed to delete subnet")
-			}
-
-			if err := s.natGatewaySvc.Delete(ctx); err != nil {
-				return errors.Wrapf(err, "failed to delete NAT gateway")
-			}
-
-			if err := s.publicIPSvc.Delete(ctx); err != nil {
-				return errors.Wrapf(err, "failed to delete public IP")
-			}
-
-			if err := s.routeTableSvc.Delete(ctx); err != nil {
-				return errors.Wrap(err, "failed to delete route table")
-			}
-
-			if err := s.securityGroupSvc.Delete(ctx); err != nil {
-				return errors.Wrap(err, "failed to delete network security group")
-			}
-
-			if err := s.vnetSvc.Delete(ctx); err != nil {
-				return errors.Wrap(err, "failed to delete virtual network")
-			}
-		} else {
+		// Delete the entire resource group directly.
+		if err := groupSvc.Delete(ctx); err != nil {
 			return errors.Wrap(err, "failed to delete resource group")
+		}
+	} else {
+		// If the resource group is not managed we need to delete resources inside the group one by one.
+		// services are deleted in reverse order from the order in which they are reconciled.
+		for i := len(s.services) - 1; i >= 0; i-- {
+			if err := s.services[i].Delete(ctx); err != nil {
+				return errors.Wrapf(err, "failed to delete AzureCluster service %s", s.services[i].Name())
+			}
 		}
 	}
 
@@ -204,16 +207,41 @@ func (s *azureClusterService) Delete(ctx context.Context) error {
 // setFailureDomainsForLocation sets the AzureCluster Status failure domains based on which Azure Availability Zones are available in the cluster location.
 // Note that this is not done in a webhook as it requires API calls to fetch the availability zones.
 func (s *azureClusterService) setFailureDomainsForLocation(ctx context.Context) error {
+	if s.scope.ExtendedLocation() != nil {
+		return nil
+	}
+
 	zones, err := s.skuCache.GetZones(ctx, s.scope.Location())
 	if err != nil {
 		return errors.Wrapf(err, "failed to get zones for location %s", s.scope.Location())
 	}
 
 	for _, zone := range zones {
-		s.scope.SetFailureDomain(zone, clusterv1.FailureDomainSpec{
+		s.scope.SetFailureDomain(zone, clusterv1beta1.FailureDomainSpec{
 			ControlPlane: true,
 		})
 	}
 
 	return nil
+}
+
+// isPrivateDNSZoneOutsideResourceGroups returns true if the private DNS zone is in a resource group
+// other than the cluster and vnet resource groups.
+func (s *azureClusterService) isPrivateDNSZoneOutsideResourceGroups() bool {
+	zoneSpec, _, _ := s.scope.PrivateDNSSpec()
+	if zoneSpec == nil {
+		return false
+	}
+	zoneResourceGroup := zoneSpec.ResourceGroupName()
+	return !strings.EqualFold(zoneResourceGroup, s.scope.ResourceGroup()) &&
+		!strings.EqualFold(zoneResourceGroup, s.scope.Vnet().ResourceGroup)
+}
+
+func (s *azureClusterService) getService(name string) (azure.ServiceReconciler, error) {
+	for _, service := range s.services {
+		if service.Name() == name {
+			return service, nil
+		}
+	}
+	return nil, errors.Errorf("service %s not found", name)
 }

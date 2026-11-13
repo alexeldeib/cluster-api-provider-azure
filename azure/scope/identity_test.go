@@ -18,18 +18,23 @@ package scope
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 
-	aadpodv1 "github.com/Azure/aad-pod-identity/pkg/apis/aadpodidentity/v1"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	. "github.com/onsi/gomega"
-
-	"k8s.io/apimachinery/pkg/runtime"
-	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
-
+	"go.uber.org/mock/gomock"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/mock_azure"
 )
 
 func TestAllowedNamespaces(t *testing.T) {
@@ -130,138 +135,564 @@ func TestAllowedNamespaces(t *testing.T) {
 			initObjects := []runtime.Object{tc.identity, fakeNamespace}
 			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(initObjects...).Build()
 
-			actual := IsClusterNamespaceAllowed(context.TODO(), fakeClient, tc.identity.Spec.AllowedNamespaces, tc.clusterNamespace)
+			actual := IsClusterNamespaceAllowed(t.Context(), fakeClient, tc.identity.Spec.AllowedNamespaces, tc.clusterNamespace)
 			g.Expect(actual).To(Equal(tc.expected))
 		})
 	}
 }
 
-func TestCreateAzureIdentityWithBindings(t *testing.T) {
-	g := NewWithT(t)
+func TestHasClientSecret(t *testing.T) {
+	tests := []struct {
+		name     string
+		identity *infrav1.AzureClusterIdentity
+		want     bool
+	}{
+		{
+			name: "user assigned identity",
+			identity: &infrav1.AzureClusterIdentity{
+				Spec: infrav1.AzureClusterIdentitySpec{
+					Type: infrav1.UserAssignedMSI,
+				},
+			},
+			want: false,
+		},
+		{
+			name: "service principal with secret",
+			identity: &infrav1.AzureClusterIdentity{
+				Spec: infrav1.AzureClusterIdentitySpec{
+					Type:         infrav1.ServicePrincipal,
+					ClientSecret: corev1.SecretReference{Name: "my-client-secret"},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "service principal with certificate",
+			identity: &infrav1.AzureClusterIdentity{
+				Spec: infrav1.AzureClusterIdentitySpec{
+					Type: infrav1.ServicePrincipalCertificate,
+				},
+			},
+			want: true,
+		},
+		{
+			name: "service principal with certificate path",
+			identity: &infrav1.AzureClusterIdentity{
+				Spec: infrav1.AzureClusterIdentitySpec{
+					Type:     infrav1.ServicePrincipalCertificate,
+					CertPath: "something",
+				},
+			},
+			want: false,
+		},
+		{
+			name: "manual service principal",
+			identity: &infrav1.AzureClusterIdentity{
+				Spec: infrav1.AzureClusterIdentitySpec{
+					Type:         infrav1.ManualServicePrincipal,
+					ClientSecret: corev1.SecretReference{Name: "my-client-secret"},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "azure cli",
+			identity: &infrav1.AzureClusterIdentity{
+				Spec: infrav1.AzureClusterIdentitySpec{
+					Type: infrav1.AzureCLI,
+				},
+			},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &AzureCredentialsProvider{
+				Identity: tt.identity,
+			}
+			if got := p.hasClientSecret(); got != tt.want {
+				t.Errorf("AzureCredentialsProvider.hasClientSecret() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetTokenCredential(t *testing.T) {
+	testCertPath := "../../test/setup/certificate"
+
+	tests := []struct {
+		name                         string
+		cluster                      *infrav1.AzureCluster
+		secret                       *corev1.Secret
+		identity                     *infrav1.AzureClusterIdentity
+		ActiveDirectoryAuthorityHost string
+		cacheExpect                  func(*mock_azure.MockCredentialCache)
+	}{
+		{
+			name: "workload identity",
+			cluster: &infrav1.AzureCluster{
+				Spec: infrav1.AzureClusterSpec{
+					AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+						IdentityRef: &corev1.ObjectReference{
+							Kind: infrav1.AzureClusterIdentityKind,
+						},
+					},
+				},
+			},
+			identity: &infrav1.AzureClusterIdentity{
+				Spec: infrav1.AzureClusterIdentitySpec{
+					Type:     infrav1.WorkloadIdentity,
+					ClientID: fakeClientID,
+					TenantID: fakeTenantID,
+				},
+			},
+			cacheExpect: func(cache *mock_azure.MockCredentialCache) {
+				cache.EXPECT().GetOrStoreWorkloadIdentity(gomock.Cond(func(opts *azidentity.WorkloadIdentityCredentialOptions) bool {
+					// ignore tracing provider
+					return opts.TenantID == fakeTenantID &&
+						opts.ClientID == fakeClientID &&
+						opts.TokenFilePath == GetProjectedTokenPath() &&
+						!opts.DisableInstanceDiscovery
+				}))
+			},
+		},
+		{
+			name: "workload identity in air-gapped cloud disables instance discovery",
+			cluster: &infrav1.AzureCluster{
+				Spec: infrav1.AzureClusterSpec{
+					AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+						IdentityRef: &corev1.ObjectReference{
+							Kind: infrav1.AzureClusterIdentityKind,
+						},
+					},
+				},
+			},
+			identity: &infrav1.AzureClusterIdentity{
+				Spec: infrav1.AzureClusterIdentitySpec{
+					Type:     infrav1.WorkloadIdentity,
+					ClientID: fakeClientID,
+					TenantID: fakeTenantID,
+				},
+			},
+			ActiveDirectoryAuthorityHost: "https://login.microsoftonline.ussec.example",
+			cacheExpect: func(cache *mock_azure.MockCredentialCache) {
+				cache.EXPECT().GetOrStoreWorkloadIdentity(gomock.Cond(func(opts *azidentity.WorkloadIdentityCredentialOptions) bool {
+					return opts.DisableInstanceDiscovery &&
+						opts.ClientOptions.Cloud.ActiveDirectoryAuthorityHost == "https://login.microsoftonline.ussec.example"
+				}))
+			},
+		},
+		{
+			name: "manual service principal",
+			cluster: &infrav1.AzureCluster{
+				Spec: infrav1.AzureClusterSpec{
+					AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+						IdentityRef: &corev1.ObjectReference{
+							Kind: infrav1.AzureClusterIdentityKind,
+						},
+					},
+				},
+			},
+			identity: &infrav1.AzureClusterIdentity{
+				Spec: infrav1.AzureClusterIdentitySpec{
+					Type:     infrav1.ManualServicePrincipal,
+					TenantID: fakeTenantID,
+					ClientID: fakeClientID,
+					ClientSecret: corev1.SecretReference{
+						Name: "test-identity-secret",
+					},
+				},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-identity-secret",
+				},
+				Data: map[string][]byte{
+					"clientSecret": []byte("fooSecret"),
+				},
+			},
+			ActiveDirectoryAuthorityHost: "https://login.microsoftonline.com",
+			cacheExpect: func(cache *mock_azure.MockCredentialCache) {
+				cache.EXPECT().GetOrStoreClientSecret(fakeTenantID, fakeClientID, "fooSecret", gomock.Cond(func(opts *azidentity.ClientSecretCredentialOptions) bool {
+					// ignore tracing provider
+					return reflect.DeepEqual(opts.ClientOptions.Cloud, cloud.Configuration{
+						ActiveDirectoryAuthorityHost: "https://login.microsoftonline.com",
+						Services: map[cloud.ServiceName]cloud.ServiceConfiguration{
+							cloud.ResourceManager: {
+								Audience: "",
+								Endpoint: "",
+							},
+						},
+					})
+				}))
+			},
+		},
+		{
+			name: "service principal",
+			cluster: &infrav1.AzureCluster{
+				Spec: infrav1.AzureClusterSpec{
+					AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+						IdentityRef: &corev1.ObjectReference{
+							Kind: infrav1.AzureClusterIdentityKind,
+						},
+					},
+				},
+			},
+			identity: &infrav1.AzureClusterIdentity{
+				Spec: infrav1.AzureClusterIdentitySpec{
+					Type:     infrav1.ServicePrincipal,
+					TenantID: fakeTenantID,
+					ClientID: fakeClientID,
+					ClientSecret: corev1.SecretReference{
+						Name: "test-identity-secret",
+					},
+				},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-identity-secret",
+				},
+				Data: map[string][]byte{
+					"clientSecret": []byte("fooSecret"),
+				},
+			},
+			ActiveDirectoryAuthorityHost: "https://login.microsoftonline.com",
+			cacheExpect: func(cache *mock_azure.MockCredentialCache) {
+				cache.EXPECT().GetOrStoreClientSecret(fakeTenantID, fakeClientID, "fooSecret", gomock.Cond(func(opts *azidentity.ClientSecretCredentialOptions) bool {
+					// ignore tracing provider
+					return reflect.DeepEqual(opts.ClientOptions.Cloud, cloud.Configuration{
+						ActiveDirectoryAuthorityHost: "https://login.microsoftonline.com",
+						Services: map[cloud.ServiceName]cloud.ServiceConfiguration{
+							cloud.ResourceManager: {
+								Audience: "",
+								Endpoint: "",
+							},
+						},
+					})
+				}))
+			},
+		},
+		{
+			name: "service principal certificate",
+			cluster: &infrav1.AzureCluster{
+				Spec: infrav1.AzureClusterSpec{
+					AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+						IdentityRef: &corev1.ObjectReference{
+							Kind: infrav1.AzureClusterIdentityKind,
+						},
+					},
+				},
+			},
+			identity: &infrav1.AzureClusterIdentity{
+				Spec: infrav1.AzureClusterIdentitySpec{
+					Type:     infrav1.ServicePrincipalCertificate,
+					TenantID: fakeTenantID,
+					ClientID: fakeClientID,
+					ClientSecret: corev1.SecretReference{
+						Name: "test-identity-secret",
+					},
+				},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-identity-secret",
+				},
+				Data: map[string][]byte{
+					"clientSecret": []byte("fooSecret"),
+				},
+			},
+			cacheExpect: func(cache *mock_azure.MockCredentialCache) {
+				cache.EXPECT().GetOrStoreClientCert(fakeTenantID, fakeClientID, []byte("fooSecret"), gomock.Nil(), gomock.Any())
+			},
+		},
+		{
+			name: "service principal certificate with certificate filepath",
+			cluster: &infrav1.AzureCluster{
+				Spec: infrav1.AzureClusterSpec{
+					AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+						IdentityRef: &corev1.ObjectReference{
+							Kind: infrav1.AzureClusterIdentityKind,
+						},
+					},
+				},
+			},
+			identity: &infrav1.AzureClusterIdentity{
+				Spec: infrav1.AzureClusterIdentitySpec{
+					Type:     infrav1.ServicePrincipalCertificate,
+					TenantID: fakeTenantID,
+					ClientID: fakeClientID,
+					CertPath: testCertPath,
+				},
+			},
+			cacheExpect: func(cache *mock_azure.MockCredentialCache) {
+				expectedCert, err := os.ReadFile(testCertPath)
+				if err != nil {
+					panic(err)
+				}
+				cache.EXPECT().GetOrStoreClientCert(fakeTenantID, fakeClientID, expectedCert, gomock.Nil(), gomock.Any())
+			},
+		},
+		{
+			name: "user-assigned identity",
+			cluster: &infrav1.AzureCluster{
+				Spec: infrav1.AzureClusterSpec{
+					AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+						IdentityRef: &corev1.ObjectReference{
+							Kind: infrav1.AzureClusterIdentityKind,
+						},
+					},
+				},
+			},
+			identity: &infrav1.AzureClusterIdentity{
+				Spec: infrav1.AzureClusterIdentitySpec{
+					Type:     infrav1.UserAssignedMSI,
+					TenantID: fakeTenantID,
+					ClientID: fakeClientID,
+				},
+			},
+			cacheExpect: func(cache *mock_azure.MockCredentialCache) {
+				cache.EXPECT().GetOrStoreManagedIdentity(gomock.Cond(func(opts *azidentity.ManagedIdentityCredentialOptions) bool {
+					// ignore tracing provider
+					return opts.ID == azidentity.ClientID(fakeClientID)
+				}))
+			},
+		},
+		{
+			name: "UserAssignedIdentityCredential",
+			cluster: &infrav1.AzureCluster{
+				Spec: infrav1.AzureClusterSpec{
+					AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+						IdentityRef: &corev1.ObjectReference{
+							Kind: infrav1.AzureClusterIdentityKind,
+						},
+					},
+				},
+			},
+			identity: &infrav1.AzureClusterIdentity{
+				Spec: infrav1.AzureClusterIdentitySpec{
+					Type:                                     infrav1.UserAssignedIdentityCredential,
+					UserAssignedIdentityCredentialsPath:      "../../test/setup/credentials.json",
+					UserAssignedIdentityCredentialsCloudType: "public",
+				},
+			},
+			cacheExpect: func(cache *mock_azure.MockCredentialCache) {
+				ctx := context.Background()
+				credsPath := "../../test/setup/credentials.json"
+				clientOptions := azcore.ClientOptions{
+					Cloud: cloud.Configuration{
+						ActiveDirectoryAuthorityHost: "https://login.microsoftonline.com/",
+						Services: map[cloud.ServiceName]cloud.ServiceConfiguration{
+							cloud.ResourceManager: {
+								Audience: "https://management.core.windows.net/",
+								Endpoint: "https://management.azure.com",
+							},
+						},
+					},
+				}
+				cache.EXPECT().GetOrStoreUserAssignedManagedIdentityCredentials(ctx, credsPath, gomock.Cond(func(opts azcore.ClientOptions) bool {
+					return opts.Cloud.ActiveDirectoryAuthorityHost == clientOptions.Cloud.ActiveDirectoryAuthorityHost &&
+						opts.Cloud.Services[cloud.ResourceManager].Audience == clientOptions.Cloud.Services[cloud.ResourceManager].Audience &&
+						opts.Cloud.Services[cloud.ResourceManager].Endpoint == clientOptions.Cloud.Services[cloud.ResourceManager].Endpoint
+				}), gomock.Any())
+			},
+		},
+		{
+			name: "azure cli",
+			cluster: &infrav1.AzureCluster{
+				Spec: infrav1.AzureClusterSpec{
+					AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+						IdentityRef: &corev1.ObjectReference{
+							Kind: infrav1.AzureClusterIdentityKind,
+						},
+					},
+				},
+			},
+			identity: &infrav1.AzureClusterIdentity{
+				Spec: infrav1.AzureClusterIdentitySpec{
+					Type:              infrav1.AzureCLI,
+					TenantID:          fakeTenantID,
+					AllowedNamespaces: &infrav1.AllowedNamespaces{},
+				},
+			},
+			cacheExpect: func(cache *mock_azure.MockCredentialCache) {
+				cache.EXPECT().GetOrStoreAzureCLI(gomock.Cond(func(opts *azidentity.AzureCLICredentialOptions) bool {
+					return opts != nil && opts.TenantID == fakeTenantID && opts.Subscription == ""
+				}))
+			},
+		},
+		{
+			name: "azure cli prefers cluster subscription over tenant",
+			cluster: &infrav1.AzureCluster{
+				Spec: infrav1.AzureClusterSpec{
+					AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+						SubscriptionID: "sub-123",
+						IdentityRef: &corev1.ObjectReference{
+							Kind: infrav1.AzureClusterIdentityKind,
+						},
+					},
+				},
+			},
+			identity: &infrav1.AzureClusterIdentity{
+				Spec: infrav1.AzureClusterIdentitySpec{
+					Type:              infrav1.AzureCLI,
+					TenantID:          fakeTenantID,
+					AllowedNamespaces: &infrav1.AllowedNamespaces{},
+				},
+			},
+			cacheExpect: func(cache *mock_azure.MockCredentialCache) {
+				cache.EXPECT().GetOrStoreAzureCLI(gomock.Cond(func(opts *azidentity.AzureCLICredentialOptions) bool {
+					return opts != nil && opts.Subscription == "sub-123" && opts.TenantID == ""
+				}))
+			},
+		},
+		{
+			name: "azure cli without tenant id",
+			cluster: &infrav1.AzureCluster{
+				Spec: infrav1.AzureClusterSpec{
+					AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+						IdentityRef: &corev1.ObjectReference{
+							Kind: infrav1.AzureClusterIdentityKind,
+						},
+					},
+				},
+			},
+			identity: &infrav1.AzureClusterIdentity{
+				Spec: infrav1.AzureClusterIdentitySpec{
+					Type:              infrav1.AzureCLI,
+					AllowedNamespaces: &infrav1.AllowedNamespaces{},
+				},
+			},
+			cacheExpect: func(cache *mock_azure.MockCredentialCache) {
+				cache.EXPECT().GetOrStoreAzureCLI(gomock.Cond(func(opts *azidentity.AzureCLICredentialOptions) bool {
+					return opts != nil && opts.TenantID == "" && opts.Subscription == ""
+				}))
+			},
+		},
+	}
+
 	scheme := runtime.NewScheme()
 	_ = infrav1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
-	_ = aadpodv1.AddToScheme(scheme)
-
-	tests := []struct {
-		name                    string
-		identity                *infrav1.AzureClusterIdentity
-		identityType            aadpodv1.IdentityType
-		resourceManagerEndpoint string
-		activeDirectoryEndpoint string
-		clusterMeta             metav1.ObjectMeta
-		copiedIdentity          metav1.ObjectMeta
-		binding                 metav1.ObjectMeta
-		expectedErr             bool
-	}{
-		{
-			name: "create service principal identity",
-			identity: &infrav1.AzureClusterIdentity{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-identity",
-				},
-				Spec: infrav1.AzureClusterIdentitySpec{
-					Type:         infrav1.ServicePrincipal,
-					ResourceID:   "my-resource-id",
-					ClientID:     "my-client-id",
-					ClientSecret: corev1.SecretReference{Name: "my-client-secret"},
-					TenantID:     "my-tenant-id",
-				},
-			},
-			identityType:            aadpodv1.ServicePrincipal,
-			resourceManagerEndpoint: "public-cloud-endpoint",
-			activeDirectoryEndpoint: "active-directory-endpoint",
-			clusterMeta: metav1.ObjectMeta{
-				Name:      "cluster-name",
-				Namespace: "my-namespace",
-			},
-			copiedIdentity: metav1.ObjectMeta{
-				Name:      "cluster-name-my-namespace-test-identity",
-				Namespace: "capz-system",
-			},
-			binding: metav1.ObjectMeta{
-				Name:      "cluster-name-my-namespace-test-identity-binding",
-				Namespace: "capz-system",
-			},
-		},
-		{
-			name: "create UAMI identity",
-			identity: &infrav1.AzureClusterIdentity{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-identity",
-				},
-				Spec: infrav1.AzureClusterIdentitySpec{
-					Type:         infrav1.UserAssignedMSI,
-					ResourceID:   "my-resource-id",
-					ClientID:     "my-client-id",
-					ClientSecret: corev1.SecretReference{Name: "my-client-secret"},
-					TenantID:     "my-tenant-id",
-				},
-			},
-			identityType:            aadpodv1.UserAssignedMSI,
-			resourceManagerEndpoint: "public-cloud-endpoint",
-			activeDirectoryEndpoint: "active-directory-endpoint",
-			clusterMeta: metav1.ObjectMeta{
-				Name:      "cluster-name",
-				Namespace: "my-namespace",
-			},
-			copiedIdentity: metav1.ObjectMeta{
-				Name:      "cluster-name-my-namespace-test-identity",
-				Namespace: "capz-system",
-			},
-			binding: metav1.ObjectMeta{
-				Name:      "cluster-name-my-namespace-test-identity-binding",
-				Namespace: "capz-system",
-			},
-		},
-		{
-			name: "invalid identity type",
-			identity: &infrav1.AzureClusterIdentity{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-identity",
-				},
-				Spec: infrav1.AzureClusterIdentitySpec{
-					Type:         "fooIdentity",
-					ResourceID:   "my-resource-id",
-					ClientID:     "my-client-id",
-					ClientSecret: corev1.SecretReference{Name: "my-client-secret"},
-					TenantID:     "my-tenant-id",
-				},
-			},
-			identityType: 0,
-			expectedErr:  true,
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			initObjects := []runtime.Object{tc.identity}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			initObjects := []runtime.Object{tt.cluster}
+			if tt.identity != nil {
+				initObjects = append(initObjects, tt.identity)
+			}
+			if tt.secret != nil {
+				initObjects = append(initObjects, tt.secret)
+			}
 			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(initObjects...).Build()
 
-			err := createAzureIdentityWithBindings(context.TODO(), tc.identity, tc.resourceManagerEndpoint, tc.activeDirectoryEndpoint, tc.clusterMeta, fakeClient)
-			if !tc.expectedErr {
-				g.Expect(err).To(BeNil())
+			mockCtrl := gomock.NewController(t)
+			cache := mock_azure.NewMockCredentialCache(mockCtrl)
+			tt.cacheExpect(cache)
 
-				resultIdentity := &aadpodv1.AzureIdentity{}
-				key := client.ObjectKey{Name: tc.copiedIdentity.Name, Namespace: tc.copiedIdentity.Namespace}
-				g.Expect(fakeClient.Get(context.TODO(), key, resultIdentity)).To(Succeed())
-				g.Expect(resultIdentity.Spec.Type).To(Equal(tc.identityType))
-				g.Expect(resultIdentity.Spec.ResourceID).To(Equal(tc.identity.Spec.ResourceID))
-				g.Expect(resultIdentity.Spec.ClientID).To(Equal(tc.identity.Spec.ClientID))
-				g.Expect(resultIdentity.Spec.ClientPassword).To(Equal(tc.identity.Spec.ClientSecret))
-				g.Expect(resultIdentity.Spec.TenantID).To(Equal(tc.identity.Spec.TenantID))
-				g.Expect(resultIdentity.Spec.ADResourceID).To(Equal(tc.resourceManagerEndpoint))
-				g.Expect(resultIdentity.Spec.ADEndpoint).To(Equal(tc.activeDirectoryEndpoint))
+			provider, err := NewAzureCredentialsProvider(t.Context(), cache, fakeClient, tt.cluster.Spec.IdentityRef, "")
+			g.Expect(err).NotTo(HaveOccurred())
+			_, err = provider.GetTokenCredential(t.Context(), "", tt.ActiveDirectoryAuthorityHost, "", tt.cluster.Spec.SubscriptionID)
+			g.Expect(err).NotTo(HaveOccurred())
+		})
+	}
+}
 
-				resultIdentityBinding := &aadpodv1.AzureIdentityBinding{}
-				key = client.ObjectKey{Name: tc.binding.Name, Namespace: tc.binding.Namespace}
-				g.Expect(fakeClient.Get(context.TODO(), key, resultIdentityBinding)).To(Succeed())
+func TestNewAzureCredentialsProviderAzureCLIAllowedNamespaces(t *testing.T) {
+	g := NewWithT(t)
+	scheme := runtime.NewScheme()
+	g.Expect(infrav1.AddToScheme(scheme)).To(Succeed())
+	identity := &infrav1.AzureClusterIdentity{
+		ObjectMeta: metav1.ObjectMeta{Name: "cli-identity", Namespace: "identity-ns"},
+		Spec: infrav1.AzureClusterIdentitySpec{
+			Type: infrav1.AzureCLI,
+			AllowedNamespaces: &infrav1.AllowedNamespaces{
+				NamespaceList: []string{"other-ns"},
+			},
+		},
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(identity).Build()
 
-				// no error if identity already exists
-				err = createAzureIdentityWithBindings(context.TODO(), tc.identity, tc.resourceManagerEndpoint, tc.activeDirectoryEndpoint, tc.clusterMeta, fakeClient)
-				g.Expect(err).To(BeNil())
-			} else {
-				g.Expect(err).ToNot(BeNil())
+	_, err := NewAzureCredentialsProvider(
+		t.Context(),
+		nil,
+		kubeClient,
+		&corev1.ObjectReference{Name: identity.Name, Namespace: identity.Namespace},
+		"cluster-ns",
+	)
+	g.Expect(err).To(MatchError(ContainSubstring("allowed namespaces")))
+}
+
+func TestAzureCLICredentialOptions(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(azureCLICredentialOptions("sub", "tenant").Subscription).To(Equal("sub"))
+	g.Expect(azureCLICredentialOptions("sub", "tenant").TenantID).To(BeEmpty())
+	g.Expect(azureCLICredentialOptions("", "tenant").TenantID).To(Equal("tenant"))
+	g.Expect(azureCLICredentialOptions("", "").TenantID).To(BeEmpty())
+	g.Expect(azureCLICredentialOptions("", "").Subscription).To(BeEmpty())
+}
+
+func TestParseCloudType(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		envFile   string
+		expected  cloud.Configuration
+		expectErr bool
+	}{
+		{
+			name:     "when the input is public, expect AzurePublic",
+			input:    "public",
+			expected: cloud.AzurePublic,
+		},
+		{
+			name:     "when the input is China, expect AzureChina",
+			input:    "china",
+			expected: cloud.AzureChina,
+		},
+		{
+			name:     "when the input is usgovernment, expect AzureGovernment",
+			input:    "usgovernment",
+			expected: cloud.AzureGovernment,
+		},
+		{
+			name:     "when the input is empty, expect AzurePublic",
+			input:    "", // Test case for default value
+			expected: cloud.AzurePublic,
+		},
+		{
+			name:     "when the input is PUBLIC, expect AzurePublic",
+			input:    "PUBLIC", // Test case for uppercased input
+			expected: cloud.AzurePublic,
+		},
+		{
+			name:      "when the input is USSEC without an environment file, expect an error",
+			input:     "USSEC",
+			expectErr: true,
+		},
+		{
+			name:     "when the input is USSEC with a valid environment file, expect the configured authority host",
+			input:    "USSEC",
+			envFile:  validUSSecEnvFile,
+			expected: cloud.Configuration{ActiveDirectoryAuthorityHost: "https://login.example.com/"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			if tt.envFile != "" {
+				path := filepath.Join(t.TempDir(), "environment.json")
+				g.Expect(os.WriteFile(path, []byte(tt.envFile), 0o600)).To(Succeed())
+				t.Setenv("AZURE_ENVIRONMENT_FILEPATH", path)
 			}
+			got, err := parseCloudType(tt.input)
+			if tt.expectErr {
+				g.Expect(err).To(HaveOccurred())
+				return
+			}
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(got).To(Equal(tt.expected))
 		})
 	}
 }

@@ -37,20 +37,20 @@ if [ -z "${GOBIN}" ]; then
   exit 1
 fi
 
-tmp_dir=$(mktemp -d -t goinstall_XXXXXXXXXX)
-function clean {
-  rm -rf "${tmp_dir}"
-}
-trap clean EXIT
+rm "${GOBIN}/${2}"* 2> /dev/null || true
 
-rm "${GOBIN}/${2}"* || true
-
-cd "${tmp_dir}"
-
-# create a new module in the tmp directory
-go mod init fake/mod
+# Ensure tools are built with the project's Go toolchain version.
+# CI images may have an older Go as the default, and `go install module@version`
+# uses the module's own go.mod for toolchain selection, which may not require
+# the newer Go version needed to process this project's source files.
+if [ -f go.mod ]; then
+  toolchain=$(sed -n 's/^toolchain //p' go.mod)
+  if [ -n "${toolchain}" ]; then
+    export GOTOOLCHAIN="${toolchain}"
+  fi
+fi
 
 # install the golang module specified as the first argument
-go get -tags tools "${1}@${3}"
+go install -tags capztools "${1}@${3}"
 mv "${GOBIN}/${2}" "${GOBIN}/${2}-${3}"
 ln -sf "${GOBIN}/${2}-${3}" "${GOBIN}/${2}"

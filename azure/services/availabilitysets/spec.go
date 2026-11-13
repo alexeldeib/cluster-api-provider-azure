@@ -17,11 +17,13 @@ limitations under the License.
 package availabilitysets
 
 import (
+	"context"
 	"strconv"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2021-04-01/compute"
-	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
 	"github.com/pkg/errors"
+	"k8s.io/utils/ptr"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/converters"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/resourceskus"
@@ -53,10 +55,10 @@ func (s *AvailabilitySetSpec) OwnerResourceName() string {
 }
 
 // Parameters returns the parameters for the availability set.
-func (s *AvailabilitySetSpec) Parameters(existing interface{}) (params interface{}, err error) {
+func (s *AvailabilitySetSpec) Parameters(_ context.Context, existing any) (params any, err error) {
 	if existing != nil {
-		if _, ok := existing.(compute.AvailabilitySet); !ok {
-			return nil, errors.Errorf("%T is not a compute.AvailabilitySet", existing)
+		if _, ok := existing.(armcompute.AvailabilitySet); !ok {
+			return nil, errors.Errorf("%T is not an armcompute.AvailabilitySet", existing)
 		}
 		// availability set already exists
 		return nil, nil
@@ -75,23 +77,23 @@ func (s *AvailabilitySetSpec) Parameters(existing interface{}) (params interface
 	if err != nil {
 		return nil, errors.Wrapf(err, "unable to parse availability set fault domain count")
 	}
-	faultDomainCount = to.Int32Ptr(int32(count))
+	faultDomainCount = ptr.To[int32](int32(count))
 
-	asParams := compute.AvailabilitySet{
-		Sku: &compute.Sku{
-			Name: to.StringPtr(string(compute.AvailabilitySetSkuTypesAligned)),
+	asParams := armcompute.AvailabilitySet{
+		SKU: &armcompute.SKU{
+			Name: ptr.To(string(armcompute.AvailabilitySetSKUTypesAligned)),
 		},
-		AvailabilitySetProperties: &compute.AvailabilitySetProperties{
+		Properties: &armcompute.AvailabilitySetProperties{
 			PlatformFaultDomainCount: faultDomainCount,
 		},
 		Tags: converters.TagsToMap(infrav1.Build(infrav1.BuildParams{
 			ClusterName: s.ClusterName,
 			Lifecycle:   infrav1.ResourceLifecycleOwned,
-			Name:        to.StringPtr(s.Name),
-			Role:        to.StringPtr(infrav1.CommonRole),
+			Name:        ptr.To(s.Name),
+			Role:        ptr.To(infrav1.CommonRole),
 			Additional:  s.AdditionalTags,
 		})),
-		Location: to.StringPtr(s.Location),
+		Location: ptr.To(s.Location),
 	}
 
 	return asParams, nil

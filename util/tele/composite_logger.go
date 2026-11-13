@@ -28,7 +28,7 @@ func (c *compositeLogSink) Init(info logr.RuntimeInfo) {
 	// we change the depth of the stack so that we can get the real
 	// line where the log statement was called. We need to do this because the composite logger adds to the
 	// call stack due to wrapping the internal logger.
-	info.CallDepth = info.CallDepth + 2
+	info.CallDepth += 2
 	for _, l := range c.logSinks {
 		l.Init(info)
 	}
@@ -49,19 +49,19 @@ func (c *compositeLogSink) iter(fn func(l logr.LogSink)) {
 	}
 }
 
-func (c *compositeLogSink) Info(level int, msg string, keysAndValues ...interface{}) {
+func (c *compositeLogSink) Info(level int, msg string, keysAndValues ...any) {
 	c.iter(func(l logr.LogSink) {
 		l.Info(level, msg, keysAndValues...)
 	})
 }
 
-func (c *compositeLogSink) Error(err error, msg string, keysAndValues ...interface{}) {
+func (c *compositeLogSink) Error(err error, msg string, keysAndValues ...any) {
 	c.iter(func(l logr.LogSink) {
 		l.Error(err, msg, keysAndValues...)
 	})
 }
 
-func (c *compositeLogSink) WithValues(keysAndValues ...interface{}) logr.LogSink {
+func (c *compositeLogSink) WithValues(keysAndValues ...any) logr.LogSink {
 	var logSinks = make([]logr.LogSink, len(c.logSinks))
 	for i, l := range c.logSinks {
 		logSinks[i] = l.WithValues(keysAndValues...)

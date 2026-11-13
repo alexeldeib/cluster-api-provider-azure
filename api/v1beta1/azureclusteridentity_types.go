@@ -19,16 +19,15 @@ package v1beta1
 import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1"
 )
 
 // AllowedNamespaces defines the namespaces the clusters are allowed to use the identity from
 // NamespaceList takes precedence over the Selector.
 type AllowedNamespaces struct {
-	// A nil or empty list indicates that AzureCluster cannot use the identity from any namespace.
+	// An empty list indicates that AzureCluster cannot use the identity from any namespace.
 	//
 	// +optional
-	// +nullable
 	NamespaceList []string `json:"list"`
 	// Selector is a selector of namespaces that AzureCluster can
 	// use this Identity from. This is a standard Kubernetes LabelSelector,
@@ -42,18 +41,39 @@ type AllowedNamespaces struct {
 }
 
 // AzureClusterIdentitySpec defines the parameters that are used to create an AzureIdentity.
+// +kubebuilder:validation:XValidation:rule="self.type == 'AzureCLI' || has(self.clientID)",message="clientID must be present when type is not AzureCLI",fieldPath=".clientID"
 type AzureClusterIdentitySpec struct {
-	// UserAssignedMSI or Service Principal
+	// Type is the type of Azure Identity used.
+	// ServicePrincipal, ServicePrincipalCertificate, UserAssignedMSI, ManualServicePrincipal, UserAssignedIdentityCredential, WorkloadIdentity, or AzureCLI.
 	Type IdentityType `json:"type"`
-	// User assigned MSI resource id.
+	// ResourceID is the Azure resource ID for the User Assigned MSI resource.
+	// Only applicable when type is UserAssignedMSI.
+	//
+	// Deprecated: This field no longer has any effect.
+	//
 	// +optional
 	ResourceID string `json:"resourceID,omitempty"`
-	// Both User Assigned MSI and SP can use this field.
-	ClientID string `json:"clientID"`
+	// ClientID is the service principal or user-assigned MSI client ID.
+	// All identity types except AzureCLI require this property; the value may be empty.
+	// +optional
+	ClientID string `json:"clientID"` // Keep omitempty off so typed clients preserve an explicitly empty value.
 	// ClientSecret is a secret reference which should contain either a Service Principal password or certificate secret.
 	// +optional
 	ClientSecret corev1.SecretReference `json:"clientSecret,omitempty"`
-	// Service principal primary tenant id.
+	// CertPath is the path where certificates exist. When set, it takes precedence over ClientSecret for types that use certs like ServicePrincipalCertificate.
+	// +optional
+	CertPath string `json:"certPath,omitempty"`
+	// UserAssignedIdentityCredentialsPath is the path where an existing JSON file exists containing the JSON format of
+	// a UserAssignedIdentityCredentials struct.
+	// See the msi-dataplane for more details on UserAssignedIdentityCredentials - https://github.com/Azure/msi-dataplane/blob/main/pkg/dataplane/internal/client/models.go#L125
+	// +optional
+	UserAssignedIdentityCredentialsPath string `json:"userAssignedIdentityCredentialsPath,omitempty"`
+	// UserAssignedIdentityCredentialsCloudType is used with UserAssignedIdentityCredentialsPath to specify the Cloud
+	// type. Can only be one of the following values: public, china, usgovernment, or ussec
+	// If a value is not specified, defaults to public
+	// +optional
+	UserAssignedIdentityCredentialsCloudType string `json:"userAssignedIdentityCredentialsCloudType,omitempty"`
+	// TenantID is the service principal primary tenant id.
 	TenantID string `json:"tenantID"`
 	// AllowedNamespaces is used to identify the namespaces the clusters are allowed to use the identity from.
 	// Namespaces can be selected either using an array of namespaces or with label selector.
@@ -62,7 +82,6 @@ type AzureClusterIdentitySpec struct {
 	// A namespace should be either in the NamespaceList or match with Selector to use the identity.
 	//
 	// +optional
-	// +nullable
 	AllowedNamespaces *AllowedNamespaces `json:"allowedNamespaces"`
 }
 
@@ -70,10 +89,12 @@ type AzureClusterIdentitySpec struct {
 type AzureClusterIdentityStatus struct {
 	// Conditions defines current service state of the AzureClusterIdentity.
 	// +optional
-	Conditions clusterv1.Conditions `json:"conditions,omitempty"`
+	Conditions clusterv1beta1.Conditions `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true
+// +kubebuilder:printcolumn:name="Type",type="string",JSONPath=".spec.type",description="Type of AzureClusterIdentity"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp",description="Time duration since creation of this AzureClusterIdentity"
 // +kubebuilder:resource:path=azureclusteridentities,scope=Namespaced,categories=cluster-api
 // +kubebuilder:storageversion
 // +kubebuilder:subresource:status
@@ -97,15 +118,15 @@ type AzureClusterIdentityList struct {
 }
 
 // GetConditions returns the list of conditions for an AzureClusterIdentity API object.
-func (c *AzureClusterIdentity) GetConditions() clusterv1.Conditions {
+func (c *AzureClusterIdentity) GetConditions() clusterv1beta1.Conditions {
 	return c.Status.Conditions
 }
 
 // SetConditions will set the given conditions on an AzureClusterIdentity object.
-func (c *AzureClusterIdentity) SetConditions(conditions clusterv1.Conditions) {
+func (c *AzureClusterIdentity) SetConditions(conditions clusterv1beta1.Conditions) {
 	c.Status.Conditions = conditions
 }
 
 func init() {
-	SchemeBuilder.Register(&AzureClusterIdentity{}, &AzureClusterIdentityList{})
+	objectTypes = append(objectTypes, &AzureClusterIdentity{}, &AzureClusterIdentityList{})
 }

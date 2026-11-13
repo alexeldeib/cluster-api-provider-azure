@@ -17,16 +17,22 @@ limitations under the License.
 package converters
 
 import (
-	"github.com/Azure/go-autorest/autorest/to"
+	"k8s.io/utils/ptr"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
+	"sigs.k8s.io/cluster-api-provider-azure/azure"
 )
 
 // MapToTags converts a map[string]*string into a infrav1.Tags.
 func MapToTags(src map[string]*string) infrav1.Tags {
+	if src == nil {
+		return nil
+	}
+
 	tags := make(infrav1.Tags, len(src))
 
 	for k, v := range src {
-		tags[k] = to.String(v)
+		tags[k] = ptr.Deref(v, "")
 	}
 
 	return tags
@@ -34,11 +40,5 @@ func MapToTags(src map[string]*string) infrav1.Tags {
 
 // TagsToMap converts infrav1.Tags into a map[string]*string.
 func TagsToMap(src infrav1.Tags) map[string]*string {
-	tags := make(map[string]*string, len(src))
-
-	for k, v := range src {
-		tags[k] = to.StringPtr(v)
-	}
-
-	return tags
+	return azure.StringMapPtr(src)
 }

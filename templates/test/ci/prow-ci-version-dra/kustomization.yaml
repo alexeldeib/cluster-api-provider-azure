@@ -1,0 +1,49 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: default
+resources:
+- ../prow-machine-pool-ci-version
+patches:
+- patch: |-
+    - op: add
+      path: /spec/kubeadmConfigSpec/clusterConfiguration/scheduler
+      value:
+        extraArgs: {}
+  target:
+    kind: KubeadmControlPlane
+- path: ../patches/dra-kubeadmcontrolplane.yaml
+  target:
+    kind: KubeadmControlPlane
+- path: ../patches/dra-kubeadmconfig.yaml
+  target:
+    kind: KubeadmConfig
+- patch: |-
+    - op: replace
+      path: /spec/kubeadmConfigSpec/clusterConfiguration/apiServer/extraArgs/feature-gates
+      value: ${K8S_FEATURE_GATES:-"DRADeviceTaints=true,DRADeviceTaintRules=true,GenericWorkload=true,DRAWorkloadResourceClaims=true"}
+    - op: replace
+      path: /spec/kubeadmConfigSpec/clusterConfiguration/apiServer/extraArgs/runtime-config
+      value: resource.k8s.io/v1beta1=true,resource.k8s.io/v1beta2=true,scheduling.k8s.io/v1beta1=true
+    - op: replace
+      path: /spec/kubeadmConfigSpec/clusterConfiguration/controllerManager/extraArgs/feature-gates
+      value: DRADeviceTaints=true,DRADeviceTaintRules=true,GenericWorkload=true,DRAWorkloadResourceClaims=true
+    - op: replace
+      path: /spec/kubeadmConfigSpec/clusterConfiguration/scheduler/extraArgs/feature-gates
+      value: DRADeviceTaints=true,DRADeviceTaintRules=true,GenericWorkload=true,DRAWorkloadResourceClaims=true
+    - op: replace
+      path: /spec/kubeadmConfigSpec/initConfiguration/nodeRegistration/kubeletExtraArgs/feature-gates
+      value: DRADeviceTaints=true,DRADeviceTaintRules=true,GenericWorkload=true,DRAWorkloadResourceClaims=true
+    - op: replace
+      path: /spec/kubeadmConfigSpec/joinConfiguration/nodeRegistration/kubeletExtraArgs/feature-gates
+      value: DRADeviceTaints=true,DRADeviceTaintRules=true,GenericWorkload=true,DRAWorkloadResourceClaims=true
+  target:
+    kind: KubeadmControlPlane
+- patch: |-
+    - op: replace
+      path: /spec/joinConfiguration/nodeRegistration/kubeletExtraArgs/feature-gates
+      value: ${NODE_FEATURE_GATES:-"DRADeviceTaints=true,DRADeviceTaintRules=true,GenericWorkload=true,DRAWorkloadResourceClaims=true"}
+  target:
+    kind: KubeadmConfig
+
+sortOptions:
+  order: fifo

@@ -19,111 +19,48 @@ package natgateways
 import (
 	"context"
 
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-02-01/network"
-	"github.com/pkg/errors"
+	asonetworkv1 "github.com/Azure/azure-service-operator/v2/api/network/v1api20220701"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
-	"sigs.k8s.io/cluster-api-provider-azure/azure/services/async"
-	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
-	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/aso"
+	"sigs.k8s.io/cluster-api-provider-azure/util/slice"
 )
 
 const serviceName = "natgateways"
 
 // NatGatewayScope defines the scope interface for NAT gateway service.
 type NatGatewayScope interface {
-	azure.ClusterScoper
-	azure.AsyncStatusUpdater
+	aso.Scope
 	SetNatGatewayIDInSubnets(natGatewayName string, natGatewayID string)
-	NatGatewaySpecs() []azure.ResourceSpecGetter
-}
-
-// Service provides operations on azure resources.
-type Service struct {
-	Scope NatGatewayScope
-	async.Reconciler
+	NatGatewaySpecs() []azure.ASOResourceSpecGetter[*asonetworkv1.NatGateway]
 }
 
 // New creates a new service.
-func New(scope NatGatewayScope) *Service {
-	client := newClient(scope)
-	return &Service{
-		Scope:      scope,
-		Reconciler: async.New(scope, client, client),
-	}
+func New(scope NatGatewayScope) *aso.Service[*asonetworkv1.NatGateway, NatGatewayScope] {
+	svc := aso.NewService[*asonetworkv1.NatGateway, NatGatewayScope](serviceName, scope)
+	svc.ListFunc = list
+	svc.Specs = scope.NatGatewaySpecs()
+	svc.ConditionType = infrav1.NATGatewaysReadyCondition
+	svc.PostCreateOrUpdateResourceHook = postCreateOrUpdateResourceHook
+	return svc
 }
 
-// Reconcile gets/creates/updates a NAT gateway.
-// Only when the NAT gateway 'Name' property is defined we create the NAT gateway: it's opt-in.
-func (s *Service) Reconcile(ctx context.Context) error {
-	ctx, log, done := tele.StartSpanWithLogger(ctx, "natgateways.Service.Reconcile")
-	defer done()
-
-	ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultAzureServiceReconcileTimeout)
-	defer cancel()
-
-	if !s.Scope.Vnet().IsManaged(s.Scope.ClusterName()) {
-		log.V(4).Info("Skipping nat gateways reconcile in custom vnet mode")
-
-		s.Scope.UpdatePutStatus(infrav1.NATGatewaysReadyCondition, serviceName, nil)
-		return nil
+func postCreateOrUpdateResourceHook(_ context.Context, scope NatGatewayScope, result *asonetworkv1.NatGateway, err error) error {
+	if err != nil {
+		return err
 	}
-
-	// We go through the list of NatGatewaySpecs to reconcile each one, independently of the resultingErr of the previous one.
-	// If multiple errors occur, we return the most pressing one.
-	//  Order of precedence (highest -> lowest) is: error that is not an operationNotDoneError (ie. error creating) -> operationNotDoneError (ie. creating in progress) -> no error (ie. created)
-	var resultingErr error
-	for _, natGatewaySpec := range s.Scope.NatGatewaySpecs() {
-		result, err := s.CreateResource(ctx, natGatewaySpec, serviceName)
-		if err != nil {
-			if !azure.IsOperationNotDoneError(err) || resultingErr == nil {
-				resultingErr = err
-			}
-		}
-		if err == nil {
-			natGateway, ok := result.(network.NatGateway)
-			if !ok {
-				// Return out of loop since this would be an unexepcted fatal error
-				resultingErr = errors.Errorf("created resource %T is not a network.NatGateway", result)
-				break
-			}
-
-			// TODO: ideally we wouldn't need to set the subnet spec based on the result of the create operation
-			s.Scope.SetNatGatewayIDInSubnets(natGatewaySpec.ResourceName(), *natGateway.ID)
-		}
+	// TODO: ideally we wouldn't need to set the subnet spec based on the result of the create operation
+	// result only gets populated when the resource is created or if it already exists
+	if result != nil && result.Status.Id != nil {
+		scope.SetNatGatewayIDInSubnets(result.Name, *result.Status.Id)
 	}
-
-	s.Scope.UpdatePutStatus(infrav1.NATGatewaysReadyCondition, serviceName, resultingErr)
-	return resultingErr
+	return nil
 }
 
-// Delete deletes the NAT gateway with the provided name.
-func (s *Service) Delete(ctx context.Context) error {
-	ctx, log, done := tele.StartSpanWithLogger(ctx, "natgateways.Service.Delete")
-	defer done()
-
-	ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultAzureServiceReconcileTimeout)
-	defer cancel()
-
-	if !s.Scope.Vnet().IsManaged(s.Scope.ClusterName()) {
-		log.V(4).Info("Skipping nat gateway deletion in custom vnet mode")
-
-		s.Scope.UpdateDeleteStatus(infrav1.NATGatewaysReadyCondition, serviceName, nil)
-		return nil
-	}
-
-	var resultingErr error
-
-	// We go through the list of NatGatewaySpecs to delete each one, independently of the resultingErr of the previous one.
-	// If multiple errors occur, we return the most pressing one.
-	//  Order of precedence (highest -> lowest) is: error that is not an operationNotDoneError (ie. error creating) -> operationNotDoneError (ie. creating in progress) -> no error (ie. created)
-	for _, natGatewaySpec := range s.Scope.NatGatewaySpecs() {
-		if err := s.DeleteResource(ctx, natGatewaySpec, serviceName); err != nil {
-			if !azure.IsOperationNotDoneError(err) || resultingErr == nil {
-				resultingErr = err
-			}
-		}
-	}
-	s.Scope.UpdateDeleteStatus(infrav1.NATGatewaysReadyCondition, serviceName, resultingErr)
-	return resultingErr
+func list(ctx context.Context, client client.Client, opts ...client.ListOption) ([]*asonetworkv1.NatGateway, error) {
+	list := &asonetworkv1.NatGatewayList{}
+	err := client.List(ctx, list, opts...)
+	return slice.ToPtrs(list.Items), err
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Kubernetes Authors.
+Copyright 2023 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,52 +17,77 @@ limitations under the License.
 package groups
 
 import (
-	"github.com/Azure/azure-sdk-for-go/services/resources/mgmt/2019-05-01/resources"
-	"github.com/Azure/go-autorest/autorest/to"
+	"context"
+
+	asoresourcesv1 "github.com/Azure/azure-service-operator/v2/api/resources/v1api20200601"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
-	"sigs.k8s.io/cluster-api-provider-azure/azure/converters"
+	"sigs.k8s.io/cluster-api-provider-azure/azure"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/aso"
 )
 
 // GroupSpec defines the specification for a Resource Group.
 type GroupSpec struct {
 	Name           string
+	AzureName      string
 	Location       string
 	ClusterName    string
 	AdditionalTags infrav1.Tags
 }
 
-// ResourceName returns the name of the group.
-func (s *GroupSpec) ResourceName() string {
-	return s.Name
-}
-
-// ResourceGroupName returns the name of the group.
-// Note that it is the same as the resource name in this case.
-func (s *GroupSpec) ResourceGroupName() string {
-	return s.Name
-}
-
-// OwnerResourceName is a no-op for groups.
-func (s *GroupSpec) OwnerResourceName() string {
-	return "" // not applicable
-}
-
-// Parameters returns the parameters for the group.
-func (s *GroupSpec) Parameters(existing interface{}) (params interface{}, err error) {
-	if existing != nil {
-		// rg already exists, nothing to update.
-		// Note that rg tags are updated separately using tags service.
-		return nil, nil
+// ResourceRef implements aso.ResourceSpecGetter.
+func (s *GroupSpec) ResourceRef() *asoresourcesv1.ResourceGroup {
+	return &asoresourcesv1.ResourceGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: azure.GetNormalizedKubernetesName(s.Name),
+		},
 	}
-	return resources.Group{
-		Location: to.StringPtr(s.Location),
-		// We create only CAPZ default tags. User defined additional tags
-		// are created and updated using tags service.
-		Tags: converters.TagsToMap(infrav1.Build(infrav1.BuildParams{
-			ClusterName: s.ClusterName,
-			Lifecycle:   infrav1.ResourceLifecycleOwned,
-			Name:        to.StringPtr(s.Name),
-			Role:        to.StringPtr(infrav1.CommonRole),
-		})),
-	}, nil
+}
+
+// Parameters implements aso.ResourceSpecGetter.
+func (s *GroupSpec) Parameters(_ context.Context, existing *asoresourcesv1.ResourceGroup) (*asoresourcesv1.ResourceGroup, error) {
+	if existing != nil {
+		return existing, nil
+	}
+
+	resourceGroup := &asoresourcesv1.ResourceGroup{
+		Spec: asoresourcesv1.ResourceGroup_Spec{
+			Location: ptr.To(s.Location),
+			Tags: infrav1.Build(infrav1.BuildParams{
+				ClusterName: s.ClusterName,
+				Lifecycle:   infrav1.ResourceLifecycleOwned,
+				Name:        ptr.To(s.Name),
+				Role:        ptr.To(infrav1.CommonRole),
+				Additional:  s.AdditionalTags,
+			}),
+		},
+	}
+	if s.AzureName != "" {
+		resourceGroup.Spec.AzureName = s.AzureName
+	}
+	return resourceGroup, nil
+}
+
+// WasManaged implements azure.ASOResourceSpecGetter.
+func (s *GroupSpec) WasManaged(resource *asoresourcesv1.ResourceGroup) bool {
+	return infrav1.Tags(resource.Status.Tags).HasOwned(s.ClusterName)
+}
+
+var _ aso.TagsGetterSetter[*asoresourcesv1.ResourceGroup] = (*GroupSpec)(nil)
+
+// GetAdditionalTags implements aso.TagsGetterSetter.
+func (s *GroupSpec) GetAdditionalTags() infrav1.Tags {
+	return s.AdditionalTags
+}
+
+// GetDesiredTags implements aso.TagsGetterSetter.
+func (*GroupSpec) GetDesiredTags(resource *asoresourcesv1.ResourceGroup) infrav1.Tags {
+	return resource.Spec.Tags
+}
+
+// SetTags implements aso.TagsGetterSetter.
+func (*GroupSpec) SetTags(resource *asoresourcesv1.ResourceGroup, tags infrav1.Tags) {
+	resource.Spec.Tags = tags
 }

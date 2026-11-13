@@ -19,14 +19,16 @@ package vnetpeerings
 import (
 	"context"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v4"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/async"
-	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
 )
 
-const serviceName = "vnetpeerings"
+// ServiceName is the name of this service.
+const ServiceName = "vnetpeerings"
 
 // VnetPeeringScope defines the scope interface for a subnet service.
 type VnetPeeringScope interface {
@@ -42,36 +44,32 @@ type Service struct {
 }
 
 // New creates a new service.
-func New(scope VnetPeeringScope) *Service {
-	Client := NewClient(scope)
-	return &Service{
-		Scope:      scope,
-		Reconciler: async.New(scope, Client, Client),
+func New(scope VnetPeeringScope) (*Service, error) {
+	Client, err := NewClient(scope, scope.DefaultedAzureCallTimeout())
+	if err != nil {
+		return nil, err
 	}
+	return &Service{
+		Scope: scope,
+		Reconciler: async.New[armnetwork.VirtualNetworkPeeringsClientCreateOrUpdateResponse,
+			armnetwork.VirtualNetworkPeeringsClientDeleteResponse](scope, Client, Client),
+	}, nil
 }
 
-// Reconcile gets/creates/updates a peering.
+// Name returns the service name.
+func (s *Service) Name() string {
+	return ServiceName
+}
+
+// Reconcile idempotently creates or updates a peering.
 func (s *Service) Reconcile(ctx context.Context) error {
 	ctx, _, done := tele.StartSpanWithLogger(ctx, "vnetpeerings.Service.Reconcile")
 	defer done()
 
-	ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultAzureServiceReconcileTimeout)
+	ctx, cancel := context.WithTimeout(ctx, s.Scope.DefaultedAzureServiceReconcileTimeout())
 	defer cancel()
 
-	// We go through the list of VnetPeeringSpecs to reconcile each one, independently of the result of the previous one.
-	// If multiple errors occur, we return the most pressing one.
-	//  Order of precedence (highest -> lowest) is: error that is not an operationNotDoneError (i.e. error creating) -> operationNotDoneError (i.e. creating in progress) -> no error (i.e. created)
-	var result error
-	for _, peeringSpec := range s.Scope.VnetPeeringSpecs() {
-		if _, err := s.CreateResource(ctx, peeringSpec, serviceName); err != nil {
-			if !azure.IsOperationNotDoneError(err) || result == nil {
-				result = err
-			}
-		}
-	}
-
-	s.Scope.UpdatePutStatus(infrav1.VnetPeeringReadyCondition, serviceName, result)
-	return result
+	return azure.ReconcileAll(ctx, s.Reconciler, s.Scope, s.Scope.VnetPeeringSpecs(), ServiceName, infrav1.VnetPeeringReadyCondition)
 }
 
 // Delete deletes the peering with the provided name.
@@ -79,21 +77,13 @@ func (s *Service) Delete(ctx context.Context) error {
 	ctx, _, done := tele.StartSpanWithLogger(ctx, "vnetpeerings.Service.Delete")
 	defer done()
 
-	ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultAzureServiceReconcileTimeout)
+	ctx, cancel := context.WithTimeout(ctx, s.Scope.DefaultedAzureServiceReconcileTimeout())
 	defer cancel()
 
-	var result error
+	return azure.DeleteAll(ctx, s.Reconciler, s.Scope, s.Scope.VnetPeeringSpecs(), ServiceName, infrav1.VnetPeeringReadyCondition)
+}
 
-	// We go through the list of VnetPeeringSpecs to delete each one, independently of the result of the previous one.
-	// If multiple errors occur, we return the most pressing one.
-	//  Order of precedence (highest -> lowest) is: error that is not an operationNotDoneError (i.e. error deleting) -> operationNotDoneError (i.e. deleting in progress) -> no error (i.e. deleted)
-	for _, peeringSpec := range s.Scope.VnetPeeringSpecs() {
-		if err := s.DeleteResource(ctx, peeringSpec, serviceName); err != nil {
-			if !azure.IsOperationNotDoneError(err) || result == nil {
-				result = err
-			}
-		}
-	}
-	s.Scope.UpdateDeleteStatus(infrav1.VnetPeeringReadyCondition, serviceName, result)
-	return result
+// IsManaged returns always returns true as CAPZ does not support BYO VNet peering.
+func (s *Service) IsManaged(_ context.Context) (bool, error) {
+	return true, nil
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2020 The Kubernetes Authors.
+Copyright 2023 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,186 +17,162 @@ limitations under the License.
 package groups
 
 import (
-	"context"
-
-	"net/http"
 	"testing"
 
-	"github.com/Azure/azure-sdk-for-go/services/resources/mgmt/2019-05-01/resources"
-	"github.com/Azure/go-autorest/autorest"
-	"github.com/Azure/go-autorest/autorest/to"
-	"github.com/golang/mock/gomock"
+	asoresourcesv1 "github.com/Azure/azure-service-operator/v2/api/resources/v1api20200601"
+	asoannotations "github.com/Azure/azure-service-operator/v2/pkg/common/annotations"
 	. "github.com/onsi/gomega"
-	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
+	"go.uber.org/mock/gomock"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
+
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
-	"sigs.k8s.io/cluster-api-provider-azure/azure/services/async/mock_async"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/groups/mock_groups"
-	gomockinternal "sigs.k8s.io/cluster-api-provider-azure/internal/test/matchers/gomock"
 )
 
-var (
-	fakeGroupSpec = GroupSpec{
-		Name:           "test-group",
-		Location:       "test-location",
-		ClusterName:    "test-cluster",
-		AdditionalTags: map[string]string{"foo": "bar"},
+func TestIsManaged(t *testing.T) {
+	newOwner := func() *asoresourcesv1.ResourceGroup {
+		return &asoresourcesv1.ResourceGroup{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "namespace",
+			},
+		}
 	}
-	internalError      = autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 500}, "Internal Server Error")
-	notFoundError      = autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not Found")
-	sampleManagedGroup = resources.Group{
-		Name:       to.StringPtr("test-group"),
-		Location:   to.StringPtr("test-location"),
-		Properties: &resources.GroupProperties{},
-		Tags:       map[string]*string{"sigs.k8s.io_cluster-api-provider-azure_cluster_test-cluster": to.StringPtr("owned")},
-	}
-	sampleBYOGroup = resources.Group{
-		Name:       to.StringPtr("test-group"),
-		Location:   to.StringPtr("test-location"),
-		Properties: &resources.GroupProperties{},
-		Tags:       map[string]*string{"foo": to.StringPtr("bar")},
-	}
-)
 
-func TestReconcileGroups(t *testing.T) {
-	testcases := []struct {
+	newOwnerRefs := func() []metav1.OwnerReference {
+		s := runtime.NewScheme()
+		if err := asoresourcesv1.AddToScheme(s); err != nil {
+			t.Fatal(err.Error())
+		}
+		gvk, _ := apiutil.GVKForObject(&asoresourcesv1.ResourceGroup{}, s)
+		return []metav1.OwnerReference{
+			{
+				APIVersion:         gvk.GroupVersion().String(),
+				Kind:               gvk.Kind,
+				Controller:         ptr.To(true),
+				BlockOwnerDeletion: ptr.To(true),
+			},
+		}
+	}
+
+	tests := []struct {
 		name          string
-		expectedError string
-		expect        func(s *mock_groups.MockGroupScopeMockRecorder, m *mock_groups.MockclientMockRecorder, r *mock_async.MockReconcilerMockRecorder)
+		objects       []client.Object
+		expect        func(s *mock_groups.MockGroupScopeMockRecorder)
+		expected      bool
+		expectedError bool
 	}{
 		{
-			name:          "create group succeeds",
-			expectedError: "",
-			expect: func(s *mock_groups.MockGroupScopeMockRecorder, m *mock_groups.MockclientMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
-				s.GroupSpec().Return(&fakeGroupSpec)
-				r.CreateResource(gomockinternal.AContext(), &fakeGroupSpec, serviceName).Return(nil, nil)
-				s.UpdatePutStatus(infrav1.ResourceGroupReadyCondition, serviceName, nil)
+			name:    "error checking if group is managed",
+			objects: nil,
+			expect: func(s *mock_groups.MockGroupScopeMockRecorder) {
+				s.GroupSpecs().Return([]azure.ASOResourceSpecGetter[*asoresourcesv1.ResourceGroup]{&GroupSpec{}}).AnyTimes()
+				s.ClusterName().Return("").AnyTimes()
 			},
+			expectedError: true,
 		},
 		{
-			name:          "create resource group fails",
-			expectedError: "#: Internal Server Error: StatusCode=500",
-			expect: func(s *mock_groups.MockGroupScopeMockRecorder, m *mock_groups.MockclientMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
-				s.GroupSpec().Return(&fakeGroupSpec)
-				r.CreateResource(gomockinternal.AContext(), &fakeGroupSpec, serviceName).Return(nil, internalError)
-				s.UpdatePutStatus(infrav1.ResourceGroupReadyCondition, serviceName, internalError)
+			name: "group is unmanaged",
+			objects: []client.Object{
+				&asoresourcesv1.ResourceGroup{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "name",
+						Namespace: "namespace",
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion: "wrong version",
+							},
+						},
+					},
+				},
 			},
+			expect: func(s *mock_groups.MockGroupScopeMockRecorder) {
+				s.GroupSpecs().Return([]azure.ASOResourceSpecGetter[*asoresourcesv1.ResourceGroup]{
+					&GroupSpec{
+						Name: "name",
+					},
+				}).AnyTimes()
+				s.ClusterName().Return("cluster").AnyTimes()
+			},
+			expected: false,
+		},
+		{
+			name: "group is managed and has reconcile policy skip",
+			objects: []client.Object{
+				&asoresourcesv1.ResourceGroup{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            "name",
+						Namespace:       "namespace",
+						OwnerReferences: newOwnerRefs(),
+						Annotations: map[string]string{
+							asoannotations.ReconcilePolicy: string(asoannotations.ReconcilePolicySkip),
+						},
+					},
+				},
+			},
+			expect: func(s *mock_groups.MockGroupScopeMockRecorder) {
+				s.GroupSpecs().Return([]azure.ASOResourceSpecGetter[*asoresourcesv1.ResourceGroup]{
+					&GroupSpec{
+						Name: "name",
+					},
+				}).AnyTimes()
+				s.ClusterName().Return("cluster").AnyTimes()
+			},
+			expected: false,
+		},
+		{
+			name: "group is managed and has reconcile policy manage",
+			objects: []client.Object{
+				&asoresourcesv1.ResourceGroup{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            "name",
+						Namespace:       "namespace",
+						OwnerReferences: newOwnerRefs(),
+						Annotations: map[string]string{
+							asoannotations.ReconcilePolicy: string(asoannotations.ReconcilePolicyManage),
+						},
+					},
+				},
+			},
+			expect: func(s *mock_groups.MockGroupScopeMockRecorder) {
+				s.GroupSpecs().Return([]azure.ASOResourceSpecGetter[*asoresourcesv1.ResourceGroup]{
+					&GroupSpec{
+						Name: "name",
+					},
+				}).AnyTimes()
+				s.ClusterName().Return("cluster").AnyTimes()
+			},
+			expected: true,
 		},
 	}
 
-	for _, tc := range testcases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
 			g := NewWithT(t)
 
-			t.Parallel()
 			mockCtrl := gomock.NewController(t)
 			defer mockCtrl.Finish()
 			scopeMock := mock_groups.NewMockGroupScope(mockCtrl)
-			clientMock := mock_groups.NewMockclient(mockCtrl)
-			asyncMock := mock_async.NewMockReconciler(mockCtrl)
 
-			tc.expect(scopeMock.EXPECT(), clientMock.EXPECT(), asyncMock.EXPECT())
+			scheme := runtime.NewScheme()
+			g.Expect(asoresourcesv1.AddToScheme(scheme)).To(Succeed())
+			ctrlClient := fakeclient.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(test.objects...).
+				Build()
+			scopeMock.EXPECT().GetClient().Return(ctrlClient).AnyTimes()
+			scopeMock.EXPECT().ASOOwner().Return(newOwner()).AnyTimes()
+			test.expect(scopeMock.EXPECT())
 
-			s := &Service{
-				Scope:      scopeMock,
-				client:     clientMock,
-				Reconciler: asyncMock,
-			}
-
-			err := s.Reconcile(context.TODO())
-			if tc.expectedError != "" {
+			actual, err := New(scopeMock).IsManaged(t.Context())
+			if test.expectedError {
 				g.Expect(err).To(HaveOccurred())
-				g.Expect(err).To(MatchError(tc.expectedError))
 			} else {
-				g.Expect(err).NotTo(HaveOccurred())
-			}
-		})
-	}
-}
-
-func TestDeleteGroups(t *testing.T) {
-	testcases := []struct {
-		name          string
-		expectedError string
-		expect        func(s *mock_groups.MockGroupScopeMockRecorder, m *mock_groups.MockclientMockRecorder, r *mock_async.MockReconcilerMockRecorder)
-	}{
-		{
-			name:          "delete operation is successful for managed resource group",
-			expectedError: "",
-			expect: func(s *mock_groups.MockGroupScopeMockRecorder, m *mock_groups.MockclientMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
-				s.GroupSpec().AnyTimes().Return(&fakeGroupSpec)
-				m.Get(gomockinternal.AContext(), &fakeGroupSpec).Return(sampleManagedGroup, nil)
-				s.ClusterName().Return("test-cluster")
-				r.DeleteResource(gomockinternal.AContext(), &fakeGroupSpec, serviceName).Return(nil)
-				s.UpdateDeleteStatus(infrav1.ResourceGroupReadyCondition, serviceName, nil)
-			},
-		},
-		{
-			name:          "resource group is not managed by capz",
-			expectedError: azure.ErrNotOwned.Error(),
-			expect: func(s *mock_groups.MockGroupScopeMockRecorder, m *mock_groups.MockclientMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
-				s.GroupSpec().AnyTimes().Return(&fakeGroupSpec)
-				m.Get(gomockinternal.AContext(), &fakeGroupSpec).Return(sampleBYOGroup, nil)
-				s.ClusterName().Return("test-cluster")
-			},
-		},
-		{
-			name:          "fail to check if resource group is managed",
-			expectedError: "could not get resource group management state",
-			expect: func(s *mock_groups.MockGroupScopeMockRecorder, m *mock_groups.MockclientMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
-				s.GroupSpec().AnyTimes().Return(&fakeGroupSpec)
-				m.Get(gomockinternal.AContext(), &fakeGroupSpec).Return(resources.Group{}, internalError)
-			},
-		},
-		{
-			name:          "resource group doesn't exist",
-			expectedError: "",
-			expect: func(s *mock_groups.MockGroupScopeMockRecorder, m *mock_groups.MockclientMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
-				s.GroupSpec().AnyTimes().Return(&fakeGroupSpec)
-				m.Get(gomockinternal.AContext(), &fakeGroupSpec).Return(resources.Group{}, notFoundError)
-				s.DeleteLongRunningOperationState("test-group", serviceName)
-				s.UpdateDeleteStatus(infrav1.ResourceGroupReadyCondition, serviceName, nil)
-			},
-		},
-		{
-			name:          "error occurs when deleting resource group",
-			expectedError: "#: Internal Server Error: StatusCode=500",
-			expect: func(s *mock_groups.MockGroupScopeMockRecorder, m *mock_groups.MockclientMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
-				s.GroupSpec().AnyTimes().Return(&fakeGroupSpec)
-				m.Get(gomockinternal.AContext(), &fakeGroupSpec).Return(sampleManagedGroup, nil)
-				s.ClusterName().Return("test-cluster")
-				r.DeleteResource(gomockinternal.AContext(), &fakeGroupSpec, serviceName).Return(internalError)
-				s.UpdateDeleteStatus(infrav1.ResourceGroupReadyCondition, serviceName, gomockinternal.ErrStrEq("#: Internal Server Error: StatusCode=500"))
-			},
-		},
-	}
-
-	for _, tc := range testcases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			g := NewWithT(t)
-
-			t.Parallel()
-			mockCtrl := gomock.NewController(t)
-			defer mockCtrl.Finish()
-			scopeMock := mock_groups.NewMockGroupScope(mockCtrl)
-			clientMock := mock_groups.NewMockclient(mockCtrl)
-			asyncMock := mock_async.NewMockReconciler(mockCtrl)
-
-			tc.expect(scopeMock.EXPECT(), clientMock.EXPECT(), asyncMock.EXPECT())
-
-			s := &Service{
-				Scope:      scopeMock,
-				client:     clientMock,
-				Reconciler: asyncMock,
-			}
-
-			err := s.Delete(context.TODO())
-			if tc.expectedError != "" {
-				g.Expect(err).To(HaveOccurred())
-				g.Expect(err.Error()).To(ContainSubstring(tc.expectedError))
-			} else {
-				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(actual).To(Equal(test.expected))
 			}
 		})
 	}

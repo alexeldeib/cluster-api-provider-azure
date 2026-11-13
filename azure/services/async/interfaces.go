@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Kubernetes Authors.
+Copyright 2023 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,38 +19,40 @@ package async
 import (
 	"context"
 
-	azureautorest "github.com/Azure/go-autorest/autorest/azure"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
+
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
 )
 
-// FutureScope is a scope that can perform store futures and conditions in Status.
+// FutureScope stores and retrieves Futures and Conditions.
 type FutureScope interface {
 	azure.AsyncStatusUpdater
 }
 
-// FutureHandler is a client that can check on the progress of a future.
-type FutureHandler interface {
-	// IsDone returns true if the operation is complete.
-	IsDone(ctx context.Context, future azureautorest.FutureAPI) (isDone bool, err error)
-	// Result returns the result of the operation.
-	Result(ctx context.Context, future azureautorest.FutureAPI, futureType string) (result interface{}, err error)
+// Getter gets a resource.
+type Getter interface {
+	Get(ctx context.Context, spec azure.ResourceSpecGetter) (result any, err error)
 }
 
-// Creator is a client that can create or update a resource asynchronously.
-type Creator interface {
-	FutureHandler
-	CreateOrUpdateAsync(ctx context.Context, spec azure.ResourceSpecGetter, parameters interface{}) (result interface{}, future azureautorest.FutureAPI, err error)
-	Get(ctx context.Context, spec azure.ResourceSpecGetter) (result interface{}, err error)
+// TagsGetter is an interface that can get a tags resource.
+type TagsGetter interface {
+	GetAtScope(ctx context.Context, scope string) (result armresources.TagsResource, err error)
 }
 
-// Deleter is a client that can delete a resource asynchronously.
-type Deleter interface {
-	FutureHandler
-	DeleteAsync(ctx context.Context, spec azure.ResourceSpecGetter) (future azureautorest.FutureAPI, err error)
+// Creator creates or updates a resource asynchronously.
+type Creator[T any] interface {
+	Getter
+	CreateOrUpdateAsync(ctx context.Context, spec azure.ResourceSpecGetter, resumeToken string, parameters any) (result any, poller *runtime.Poller[T], err error)
 }
 
-// Reconciler is a generic interface used to perform asynchronous reconciliation of Azure resources.
+// Deleter deletes a resource asynchronously.
+type Deleter[T any] interface {
+	DeleteAsync(ctx context.Context, spec azure.ResourceSpecGetter, resumeToken string) (poller *runtime.Poller[T], err error)
+}
+
+// Reconciler reconciles a resource.
 type Reconciler interface {
-	CreateResource(ctx context.Context, spec azure.ResourceSpecGetter, serviceName string) (result interface{}, err error)
+	CreateOrUpdateResource(ctx context.Context, spec azure.ResourceSpecGetter, serviceName string) (result any, err error)
 	DeleteResource(ctx context.Context, spec azure.ResourceSpecGetter, serviceName string) (err error)
 }

@@ -19,8 +19,7 @@ package v1beta1
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
-	"sigs.k8s.io/cluster-api/errors"
+	clusterv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 )
@@ -46,7 +45,7 @@ type (
 	// AzureMachinePoolMachineTemplate defines the template for an AzureMachine.
 	AzureMachinePoolMachineTemplate struct {
 		// VMSize is the size of the Virtual Machine to build.
-		// See https://docs.microsoft.com/en-us/rest/api/compute/virtualmachines/createorupdate#virtualmachinesizetypes
+		// See https://learn.microsoft.com/rest/api/compute/virtualmachines/createorupdate#virtualmachinesizetypes
 		VMSize string `json:"vmSize"`
 
 		// Image is used to provide details of an image to use during VM creation.
@@ -63,14 +62,23 @@ type (
 		// +optional
 		DataDisks []infrav1.DataDisk `json:"dataDisks,omitempty"`
 
-		// SSHPublicKey is the SSH public key string base64 encoded to add to a Virtual Machine
+		// SSHPublicKey is the SSH public key string, base64-encoded to add to a Virtual Machine. Linux only.
+		// Refer to documentation on how to set up SSH access on Windows instances.
+		// +optional
 		SSHPublicKey string `json:"sshPublicKey"`
 
-		// AcceleratedNetworking enables or disables Azure accelerated networking. If omitted, it will be set based on
-		// whether the requested VMSize supports accelerated networking.
-		// If AcceleratedNetworking is set to true with a VMSize that does not support it, Azure will return an error.
+		// Deprecated: AcceleratedNetworking should be set in the networkInterfaces field.
 		// +optional
 		AcceleratedNetworking *bool `json:"acceleratedNetworking,omitempty"`
+
+		// AdditionalCapabilities specifies additional capabilities enabled or disabled on the virtual machine.
+		// +optional
+		AdditionalCapabilities *infrav1.AdditionalCapabilities `json:"additionalCapabilities,omitempty"`
+
+		// Diagnostics specifies the diagnostics settings for a virtual machine.
+		// If not specified then Boot diagnostics (Managed) will be enabled.
+		// +optional
+		Diagnostics *infrav1.Diagnostics `json:"diagnostics,omitempty"`
 
 		// TerminateNotificationTimeout enables or disables VMSS scheduled events termination notification with specified timeout
 		// allowed values are between 5 and 15 (mins)
@@ -85,9 +93,28 @@ type (
 		// +optional
 		SpotVMOptions *infrav1.SpotVMOptions `json:"spotVMOptions,omitempty"`
 
-		// SubnetName selects the Subnet where the VMSS will be placed
+		// Deprecated: SubnetName should be set in the networkInterfaces field.
 		// +optional
 		SubnetName string `json:"subnetName,omitempty"`
+
+		// VMExtensions specifies a list of extensions to be added to the scale set.
+		// +optional
+		VMExtensions []infrav1.VMExtension `json:"vmExtensions,omitempty"`
+
+		// DisableVMBootstrapExtension specifies whether the VM bootstrap extension should be disabled on the virtual machine scale set.
+		// Use this setting if you want to disable only the bootstrapping extension and not all extensions.
+		// If unset, CAPZ treats this as true during reconciliation, meaning the bootstrap extension is not installed on new VMSSes.
+		// Set to false to opt back in to the bootstrap extension. Changing this field on an existing AzureMachinePool only takes
+		// effect on the next model-changing update of the underlying VMSS (e.g. image, identity, zones, or SKU change).
+		// +optional
+		DisableVMBootstrapExtension *bool `json:"disableVMBootstrapExtension,omitempty"`
+
+		// NetworkInterfaces specifies a list of network interface configurations.
+		// If left unspecified, the VM will get a single network interface with a
+		// single IPConfig in the subnet specified in the cluster's node subnet field.
+		// The primary interface will be the first networkInterface specified (index 0) in the list.
+		// +optional
+		NetworkInterfaces []infrav1.NetworkInterface `json:"networkInterfaces,omitempty"`
 	}
 
 	// AzureMachinePoolSpec defines the desired state of AzureMachinePool.
@@ -122,15 +149,18 @@ type (
 		// +optional
 		Identity infrav1.VMIdentity `json:"identity,omitempty"`
 
+		// SystemAssignedIdentityRole defines the role and scope to assign to the system assigned identity.
+		// +optional
+		SystemAssignedIdentityRole *infrav1.SystemAssignedIdentityRole `json:"systemAssignedIdentityRole,omitempty"`
+
 		// UserAssignedIdentities is a list of standalone Azure identities provided by the user
 		// The lifecycle of a user-assigned identity is managed separately from the lifecycle of
 		// the AzureMachinePool.
-		// See https://docs.microsoft.com/en-us/azure/active-directory/managed-identities-azure-resources/how-to-manage-ua-identity-cli
+		// See https://learn.microsoft.com/azure/active-directory/managed-identities-azure-resources/how-to-manage-ua-identity-cli
 		// +optional
 		UserAssignedIdentities []infrav1.UserAssignedIdentity `json:"userAssignedIdentities,omitempty"`
 
-		// RoleAssignmentName is the name of the role assignment to create for a system assigned identity. It can be any valid GUID.
-		// If not specified, a random GUID will be generated.
+		// Deprecated: RoleAssignmentName should be set in the systemAssignedIdentityRole field.
 		// +optional
 		RoleAssignmentName string `json:"roleAssignmentName,omitempty"`
 
@@ -139,11 +169,18 @@ type (
 		// +kubebuilder:default={type: "RollingUpdate", rollingUpdate: {maxSurge: 1, maxUnavailable: 0, deletePolicy: Oldest}}
 		Strategy AzureMachinePoolDeploymentStrategy `json:"strategy,omitempty"`
 
-		// NodeDrainTimeout is the total amount of time that the controller will spend on draining a node.
-		// The default value is 0, meaning that the node can be drained without any time limitations.
-		// NOTE: NodeDrainTimeout is different from `kubectl drain --timeout`
+		// OrchestrationMode specifies the orchestration mode for the Virtual Machine Scale Set
+		// +kubebuilder:default=Uniform
+		OrchestrationMode infrav1.OrchestrationModeType `json:"orchestrationMode,omitempty"`
+
+		// PlatformFaultDomainCount specifies the number of fault domains that the Virtual Machine Scale Set can use.
+		// The count determines the spreading algorithm of the Azure fault domain.
 		// +optional
-		NodeDrainTimeout *metav1.Duration `json:"nodeDrainTimeout,omitempty"`
+		PlatformFaultDomainCount *int32 `json:"platformFaultDomainCount,omitempty"`
+
+		// ZoneBalane dictates whether to force strictly even Virtual Machine distribution cross x-zones in case there is zone outage.
+		// +optional
+		ZoneBalance *bool `json:"zoneBalance,omitempty"`
 	}
 
 	// AzureMachinePoolDeploymentStrategyType is the type of deployment strategy employed to rollout a new version of
@@ -155,7 +192,6 @@ type (
 		// Type of deployment. Currently the only supported strategy is RollingUpdate
 		// +optional
 		// +kubebuilder:validation:Enum=RollingUpdate
-		// +optional
 		// +kubebuilder:default=RollingUpdate
 		Type AzureMachinePoolDeploymentStrategyType `json:"type,omitempty"`
 
@@ -223,6 +259,13 @@ type (
 		// +optional
 		Replicas int32 `json:"replicas"`
 
+		// LastReconciledReplicas is the desired replica count that was most recently reconciled onto the
+		// VMSS. It is used to tell an explicit scale-down (the desired count dropped below this value)
+		// apart from a rollout, where the desired count is unchanged and the extra instances come from
+		// surge capacity. Those two states are otherwise indistinguishable from the instance list alone.
+		// +optional
+		LastReconciledReplicas *int32 `json:"lastReconciledReplicas,omitempty"`
+
 		// Instances is the VM instance status for each VM in the VMSS
 		// +optional
 		Instances []*AzureMachinePoolInstanceStatus `json:"instances,omitempty"`
@@ -257,7 +300,7 @@ type (
 		// can be added as events to the MachinePool object and/or logged in the
 		// controller's output.
 		// +optional
-		FailureReason *errors.MachineStatusError `json:"failureReason,omitempty"`
+		FailureReason *string `json:"failureReason,omitempty"`
 
 		// FailureMessage will be set in the event that there is a terminal problem
 		// reconciling the MachinePool and will contain a more verbose string suitable
@@ -280,12 +323,16 @@ type (
 
 		// Conditions defines current service state of the AzureMachinePool.
 		// +optional
-		Conditions clusterv1.Conditions `json:"conditions,omitempty"`
+		Conditions clusterv1beta1.Conditions `json:"conditions,omitempty"`
 
 		// LongRunningOperationStates saves the state for Azure long-running operations so they can be continued on the
 		// next reconciliation loop.
 		// +optional
 		LongRunningOperationStates infrav1.Futures `json:"longRunningOperationStates,omitempty"`
+
+		// InfrastructureMachineKind is the kind of the infrastructure resources behind MachinePool Machines.
+		// +optional
+		InfrastructureMachineKind string `json:"infrastructureMachineKind,omitempty"`
 	}
 
 	// AzureMachinePoolInstanceStatus provides status information for each instance in the VMSS.
@@ -327,6 +374,7 @@ type (
 	// +kubebuilder:printcolumn:name="MachinePool",type="string",priority=1,JSONPath=".metadata.ownerReferences[?(@.kind==\"MachinePool\")].name",description="MachinePool object to which this AzureMachinePool belongs"
 	// +kubebuilder:printcolumn:name="VMSS ID",type="string",priority=1,JSONPath=".spec.providerID",description="Azure VMSS ID"
 	// +kubebuilder:printcolumn:name="VM Size",type="string",priority=1,JSONPath=".spec.template.vmSize",description="Azure VM Size"
+	// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp",description="Time duration since creation of this AzureMachinePool"
 
 	// AzureMachinePool is the Schema for the azuremachinepools API.
 	AzureMachinePool struct {
@@ -348,12 +396,12 @@ type (
 )
 
 // GetConditions returns the list of conditions for an AzureMachinePool API object.
-func (amp *AzureMachinePool) GetConditions() clusterv1.Conditions {
+func (amp *AzureMachinePool) GetConditions() clusterv1beta1.Conditions {
 	return amp.Status.Conditions
 }
 
 // SetConditions will set the given conditions on an AzureMachinePool object.
-func (amp *AzureMachinePool) SetConditions(conditions clusterv1.Conditions) {
+func (amp *AzureMachinePool) SetConditions(conditions clusterv1beta1.Conditions) {
 	amp.Status.Conditions = conditions
 }
 
@@ -368,5 +416,5 @@ func (amp *AzureMachinePool) SetFutures(futures infrav1.Futures) {
 }
 
 func init() {
-	SchemeBuilder.Register(&AzureMachinePool{}, &AzureMachinePoolList{})
+	objectTypes = append(objectTypes, &AzureMachinePool{}, &AzureMachinePoolList{})
 }

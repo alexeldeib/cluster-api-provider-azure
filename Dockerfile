@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.1-experimental
+# syntax=docker/dockerfile:1
 
 # Copyright 2019 The Kubernetes Authors.
 #
@@ -14,30 +14,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Build architecture
+ARG ARCH
+
 # Build the manager binary
-FROM golang:1.17 as builder
+FROM golang:1.26.10@sha256:670bb5aa5349ae03b8516764718486f4f16399134bdc9acd0c46a23f043ab05c AS builder
 WORKDIR /workspace
 
 # Run this with docker build --build_arg $(go env GOPROXY) to override the goproxy
 ARG goproxy=https://proxy.golang.org
 ENV GOPROXY=$goproxy
 
-# Copy the Go Modules manifests
-COPY go.mod go.mod
-COPY go.sum go.sum
-
-# Cache deps before building and copying source so that we don't need to re-download as much
-# and so that source changes don't invalidate our downloaded layer
-RUN --mount=type=cache,target=/go/pkg/mod \
-    go mod download
-
 # Copy the sources
 COPY ./ ./
-
-# Cache the go build into the the Go’s compiler cache folder so we take benefits of compiler caching across docker build calls
-RUN --mount=type=cache,target=/root/.cache/go-build \
-    --mount=type=cache,target=/go/pkg/mod \
-    go build .
 
 # Build
 ARG package=.
@@ -45,14 +34,15 @@ ARG ARCH
 ARG ldflags
 
 # Do not force rebuild of up-to-date packages (do not use -a) and use the compiler cache folder
+# TODO: Remove fieldsv1string once it becomes the apimachinery default (https://github.com/kubernetes/kubernetes/issues/137109)
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=linux GOARCH=${ARCH} \
-    go build -ldflags "${ldflags} -extldflags '-static'" \
+    go build -tags=fieldsv1string -ldflags "${ldflags} -extldflags '-static'" \
     -o manager ${package}
 
 # Production image
-FROM gcr.io/distroless/static:nonroot
+FROM gcr.io/distroless/static:nonroot-${ARCH}
 WORKDIR /
 COPY --from=builder /workspace/manager .
 # Use uid of nonroot user (65532) because kubernetes expects numeric user when applying pod security policies

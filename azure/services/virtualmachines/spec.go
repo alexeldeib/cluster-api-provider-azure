@@ -17,44 +17,51 @@ limitations under the License.
 package virtualmachines
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
+	"github.com/pkg/errors"
+	"k8s.io/utils/ptr"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
+	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/converters"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/resourceskus"
 	"sigs.k8s.io/cluster-api-provider-azure/util/generators"
-
-	"sigs.k8s.io/cluster-api-provider-azure/azure"
-
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2021-04-01/compute"
-	"github.com/Azure/go-autorest/autorest/to"
-	"github.com/pkg/errors"
 )
 
 // VMSpec defines the specification for a Virtual Machine.
 type VMSpec struct {
-	Name                   string
-	ResourceGroup          string
-	Location               string
-	ClusterName            string
-	Role                   string
-	NICIDs                 []string
-	SSHKeyData             string
-	Size                   string
-	AvailabilitySetID      string
-	Zone                   string
-	Identity               infrav1.VMIdentity
-	OSDisk                 infrav1.OSDisk
-	DataDisks              []infrav1.DataDisk
-	UserAssignedIdentities []infrav1.UserAssignedIdentity
-	SpotVMOptions          *infrav1.SpotVMOptions
-	SecurityProfile        *infrav1.SecurityProfile
-	AdditionalTags         infrav1.Tags
-	SKU                    resourceskus.SKU
-	Image                  *infrav1.Image
-	BootstrapData          string
-	ProviderID             string
+	Name                        string
+	ResourceGroup               string
+	Location                    string
+	ExtendedLocation            *infrav1.ExtendedLocationSpec
+	ClusterName                 string
+	Role                        string
+	NICIDs                      []string
+	SSHKeyData                  string
+	Size                        string
+	AvailabilitySetID           string
+	VirtualMachineScaleSetID    string
+	Zone                        string
+	Identity                    infrav1.VMIdentity
+	OSDisk                      infrav1.OSDisk
+	DataDisks                   []infrav1.DataDisk
+	UserAssignedIdentities      []infrav1.UserAssignedIdentity
+	SpotVMOptions               *infrav1.SpotVMOptions
+	SecurityProfile             *infrav1.SecurityProfile
+	AdditionalTags              infrav1.Tags
+	AdditionalCapabilities      *infrav1.AdditionalCapabilities
+	DiagnosticsProfile          *infrav1.Diagnostics
+	DisableExtensionOperations  bool
+	DisableVMBootstrapExtension bool
+	CapacityReservationGroupID  string
+	SKU                         resourceskus.SKU
+	Image                       *infrav1.Image
+	BootstrapData               string
+	ProviderID                  string
 }
 
 // ResourceName returns the name of the virtual machine.
@@ -73,10 +80,10 @@ func (s *VMSpec) OwnerResourceName() string {
 }
 
 // Parameters returns the parameters for the virtual machine.
-func (s *VMSpec) Parameters(existing interface{}) (params interface{}, err error) {
+func (s *VMSpec) Parameters(_ context.Context, existing any) (params any, err error) {
 	if existing != nil {
-		if _, ok := existing.(compute.VirtualMachine); !ok {
-			return nil, errors.Errorf("%T is not a compute.VirtualMachine", existing)
+		if _, ok := existing.(armcompute.VirtualMachine); !ok {
+			return nil, errors.Errorf("%T is not an armcompute.VirtualMachine", existing)
 		}
 		// vm already exists
 		return nil, nil
@@ -87,12 +94,16 @@ func (s *VMSpec) Parameters(existing interface{}) (params interface{}, err error
 		return nil, azure.VMDeletedError{ProviderID: s.ProviderID}
 	}
 
+	if s.AvailabilitySetID != "" && s.VirtualMachineScaleSetID != "" {
+		return nil, azure.WithTerminalError(errors.New("availabilitySetID and virtualMachineScaleSetID cannot both be set"))
+	}
+
 	storageProfile, err := s.generateStorageProfile()
 	if err != nil {
 		return nil, err
 	}
 
-	securityProfile, err := s.generateSecurityProfile()
+	securityProfile, err := s.generateSecurityProfile(storageProfile)
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +113,7 @@ func (s *VMSpec) Parameters(existing interface{}) (params interface{}, err error
 		return nil, errors.Wrap(err, "failed to generate OS Profile")
 	}
 
-	priority, evictionPolicy, billingProfile, err := converters.GetSpotVMOptions(s.SpotVMOptions)
+	priority, evictionPolicy, billingProfile, err := converters.GetSpotVMOptions(s.SpotVMOptions, s.OSDisk.DiffDiskSettings)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get Spot VM options")
 	}
@@ -112,52 +123,54 @@ func (s *VMSpec) Parameters(existing interface{}) (params interface{}, err error
 		return nil, errors.Wrap(err, "failed to generate VM identity")
 	}
 
-	return compute.VirtualMachine{
-		Plan:     converters.ImageToPlan(s.Image),
-		Location: to.StringPtr(s.Location),
+	return armcompute.VirtualMachine{
+		Plan:             converters.ImageToPlan(s.Image),
+		Location:         ptr.To(s.Location),
+		ExtendedLocation: converters.ExtendedLocationToComputeSDK(s.ExtendedLocation),
 		Tags: converters.TagsToMap(infrav1.Build(infrav1.BuildParams{
 			ClusterName: s.ClusterName,
 			Lifecycle:   infrav1.ResourceLifecycleOwned,
-			Name:        to.StringPtr(s.Name),
-			Role:        to.StringPtr(s.Role),
+			Name:        ptr.To(s.Name),
+			Role:        ptr.To(s.Role),
 			Additional:  s.AdditionalTags,
 		})),
-		VirtualMachineProperties: &compute.VirtualMachineProperties{
+		Properties: &armcompute.VirtualMachineProperties{
 			AdditionalCapabilities: s.generateAdditionalCapabilities(),
 			AvailabilitySet:        s.getAvailabilitySet(),
-			HardwareProfile: &compute.HardwareProfile{
-				VMSize: compute.VirtualMachineSizeTypes(s.Size),
+			VirtualMachineScaleSet: s.getVirtualMachineScaleSet(),
+			HardwareProfile: &armcompute.HardwareProfile{
+				VMSize: ptr.To(armcompute.VirtualMachineSizeTypes(s.Size)),
 			},
 			StorageProfile:  storageProfile,
 			SecurityProfile: securityProfile,
-			OsProfile:       osProfile,
-			NetworkProfile: &compute.NetworkProfile{
+			OSProfile:       osProfile,
+			NetworkProfile: &armcompute.NetworkProfile{
 				NetworkInterfaces: s.generateNICRefs(),
 			},
-			Priority:       priority,
-			EvictionPolicy: evictionPolicy,
-			BillingProfile: billingProfile,
-			DiagnosticsProfile: &compute.DiagnosticsProfile{
-				BootDiagnostics: &compute.BootDiagnostics{
-					Enabled: to.BoolPtr(true),
-				},
-			},
+			Priority:            priority,
+			EvictionPolicy:      evictionPolicy,
+			BillingProfile:      billingProfile,
+			DiagnosticsProfile:  converters.GetDiagnosticsProfile(s.DiagnosticsProfile),
+			CapacityReservation: s.getCapacityReservationProfile(),
 		},
 		Identity: identity,
 		Zones:    s.getZones(),
 	}, nil
 }
 
-// generateStorageProfile generates a pointer to a compute.StorageProfile which can utilized for VM creation.
-func (s *VMSpec) generateStorageProfile() (*compute.StorageProfile, error) {
-	storageProfile := &compute.StorageProfile{
-		OsDisk: &compute.OSDisk{
-			Name:         to.StringPtr(azure.GenerateOSDiskName(s.Name)),
-			OsType:       compute.OperatingSystemTypes(s.OSDisk.OSType),
-			CreateOption: compute.DiskCreateOptionTypesFromImage,
-			DiskSizeGB:   s.OSDisk.DiskSizeGB,
-			Caching:      compute.CachingTypes(s.OSDisk.CachingType),
-		},
+// generateStorageProfile generates a pointer to an armcompute.StorageProfile which can utilized for VM creation.
+func (s *VMSpec) generateStorageProfile() (*armcompute.StorageProfile, error) {
+	osDisk := &armcompute.OSDisk{
+		Name:         ptr.To(azure.GenerateOSDiskName(s.Name)),
+		OSType:       ptr.To(armcompute.OperatingSystemTypes(s.OSDisk.OSType)),
+		CreateOption: ptr.To(armcompute.DiskCreateOptionTypesFromImage),
+		DiskSizeGB:   s.OSDisk.DiskSizeGB,
+	}
+	if s.OSDisk.CachingType != "" {
+		osDisk.Caching = ptr.To(armcompute.CachingTypes(s.OSDisk.CachingType))
+	}
+	storageProfile := &armcompute.StorageProfile{
+		OSDisk: osDisk,
 	}
 
 	// Checking if the requested VM size has at least 2 vCPUS
@@ -166,7 +179,7 @@ func (s *VMSpec) generateStorageProfile() (*compute.StorageProfile, error) {
 		return nil, azure.WithTerminalError(errors.Wrap(err, "failed to validate the vCPU capability"))
 	}
 	if !vCPUCapability {
-		return nil, azure.WithTerminalError(errors.New("vm size should be bigger or equal to at least 2 vCPUs"))
+		return nil, azure.WithTerminalError(errors.New("VM size should be bigger or equal to at least 2 vCPUs"))
 	}
 
 	// Checking if the requested VM size has at least 2 Gi of memory
@@ -176,55 +189,76 @@ func (s *VMSpec) generateStorageProfile() (*compute.StorageProfile, error) {
 	}
 
 	if !MemoryCapability {
-		return nil, azure.WithTerminalError(errors.New("vm memory should be bigger or equal to at least 2Gi"))
+		return nil, azure.WithTerminalError(errors.New("VM memory should be bigger or equal to at least 2Gi"))
 	}
+
 	// enable ephemeral OS
 	if s.OSDisk.DiffDiskSettings != nil {
 		if !s.SKU.HasCapability(resourceskus.EphemeralOSDisk) {
-			return nil, azure.WithTerminalError(fmt.Errorf("vm size %s does not support ephemeral os. select a different vm size or disable ephemeral os", s.Size))
+			return nil, azure.WithTerminalError(fmt.Errorf("VM size %s does not support ephemeral os. Select a different VM size or disable ephemeral os", s.Size))
 		}
 
-		storageProfile.OsDisk.DiffDiskSettings = &compute.DiffDiskSettings{
-			Option: compute.DiffDiskOptions(s.OSDisk.DiffDiskSettings.Option),
+		storageProfile.OSDisk.DiffDiskSettings = &armcompute.DiffDiskSettings{
+			Option: ptr.To(armcompute.DiffDiskOptions(s.OSDisk.DiffDiskSettings.Option)),
+		}
+
+		if s.OSDisk.DiffDiskSettings.Placement != nil {
+			storageProfile.OSDisk.DiffDiskSettings.Placement = ptr.To(armcompute.DiffDiskPlacement(*s.OSDisk.DiffDiskSettings.Placement))
 		}
 	}
 
 	if s.OSDisk.ManagedDisk != nil {
-		storageProfile.OsDisk.ManagedDisk = &compute.ManagedDiskParameters{}
+		storageProfile.OSDisk.ManagedDisk = &armcompute.ManagedDiskParameters{}
 		if s.OSDisk.ManagedDisk.StorageAccountType != "" {
-			storageProfile.OsDisk.ManagedDisk.StorageAccountType = compute.StorageAccountTypes(s.OSDisk.ManagedDisk.StorageAccountType)
+			storageProfile.OSDisk.ManagedDisk.StorageAccountType = ptr.To(armcompute.StorageAccountTypes(s.OSDisk.ManagedDisk.StorageAccountType))
 		}
 		if s.OSDisk.ManagedDisk.DiskEncryptionSet != nil {
-			storageProfile.OsDisk.ManagedDisk.DiskEncryptionSet = &compute.DiskEncryptionSetParameters{ID: to.StringPtr(s.OSDisk.ManagedDisk.DiskEncryptionSet.ID)}
+			storageProfile.OSDisk.ManagedDisk.DiskEncryptionSet = &armcompute.DiskEncryptionSetParameters{ID: ptr.To(s.OSDisk.ManagedDisk.DiskEncryptionSet.ID)}
+		}
+		if s.OSDisk.ManagedDisk.SecurityProfile != nil {
+			if _, exists := s.SKU.GetCapability(resourceskus.ConfidentialComputingType); !exists {
+				return nil, azure.WithTerminalError(fmt.Errorf("VM size %s does not support confidential computing. Select a different VM size or remove the security profile of the OS disk", s.Size))
+			}
+
+			storageProfile.OSDisk.ManagedDisk.SecurityProfile = &armcompute.VMDiskSecurityProfile{}
+
+			if s.OSDisk.ManagedDisk.SecurityProfile.DiskEncryptionSet != nil {
+				storageProfile.OSDisk.ManagedDisk.SecurityProfile.DiskEncryptionSet = &armcompute.DiskEncryptionSetParameters{ID: ptr.To(s.OSDisk.ManagedDisk.SecurityProfile.DiskEncryptionSet.ID)}
+			}
+			if s.OSDisk.ManagedDisk.SecurityProfile.SecurityEncryptionType != "" {
+				storageProfile.OSDisk.ManagedDisk.SecurityProfile.SecurityEncryptionType = ptr.To(armcompute.SecurityEncryptionTypes(string(s.OSDisk.ManagedDisk.SecurityProfile.SecurityEncryptionType)))
+			}
 		}
 	}
 
-	dataDisks := make([]compute.DataDisk, len(s.DataDisks))
+	dataDisks := make([]*armcompute.DataDisk, len(s.DataDisks))
 	for i, disk := range s.DataDisks {
-		dataDisks[i] = compute.DataDisk{
-			CreateOption: compute.DiskCreateOptionTypesEmpty,
-			DiskSizeGB:   to.Int32Ptr(disk.DiskSizeGB),
+		dataDisks[i] = &armcompute.DataDisk{
+			CreateOption: ptr.To(armcompute.DiskCreateOptionTypesEmpty),
+			DiskSizeGB:   ptr.To[int32](disk.DiskSizeGB),
 			Lun:          disk.Lun,
-			Name:         to.StringPtr(azure.GenerateDataDiskName(s.Name, disk.NameSuffix)),
-			Caching:      compute.CachingTypes(disk.CachingType),
+			Name:         ptr.To(azure.GenerateDataDiskName(s.Name, disk.NameSuffix)),
+		}
+		if disk.CachingType != "" {
+			dataDisks[i].Caching = ptr.To(armcompute.CachingTypes(disk.CachingType))
 		}
 
 		if disk.ManagedDisk != nil {
-			dataDisks[i].ManagedDisk = &compute.ManagedDiskParameters{
-				StorageAccountType: compute.StorageAccountTypes(disk.ManagedDisk.StorageAccountType),
+			dataDisks[i].ManagedDisk = &armcompute.ManagedDiskParameters{
+				StorageAccountType: ptr.To(armcompute.StorageAccountTypes(disk.ManagedDisk.StorageAccountType)),
 			}
 
 			if disk.ManagedDisk.DiskEncryptionSet != nil {
-				dataDisks[i].ManagedDisk.DiskEncryptionSet = &compute.DiskEncryptionSetParameters{ID: to.StringPtr(disk.ManagedDisk.DiskEncryptionSet.ID)}
+				dataDisks[i].ManagedDisk.DiskEncryptionSet = &armcompute.DiskEncryptionSetParameters{ID: ptr.To(disk.ManagedDisk.DiskEncryptionSet.ID)}
 			}
 
 			// check the support for ultra disks based on location and vm size
-			if disk.ManagedDisk.StorageAccountType == string(compute.StorageAccountTypesUltraSSDLRS) && !s.SKU.HasLocationCapability(resourceskus.UltraSSDAvailable, s.Location, s.Zone) {
-				return nil, azure.WithTerminalError(fmt.Errorf("vm size %s does not support ultra disks in location %s. select a different vm size or disable ultra disks", s.Size, s.Location))
+			if disk.ManagedDisk.StorageAccountType == string(armcompute.StorageAccountTypesUltraSSDLRS) && !s.SKU.HasLocationCapability(resourceskus.UltraSSDAvailable, s.Location, s.Zone) {
+				return nil, azure.WithTerminalError(fmt.Errorf("VM size %s does not support ultra disks in location %s. Select a different VM size or disable ultra disks", s.Size, s.Location))
 			}
 		}
 	}
-	storageProfile.DataDisks = &dataDisks
+	storageProfile.DataDisks = dataDisks
 
 	imageRef, err := converters.ImageToSDK(s.Image)
 	if err != nil {
@@ -236,20 +270,21 @@ func (s *VMSpec) generateStorageProfile() (*compute.StorageProfile, error) {
 	return storageProfile, nil
 }
 
-func (s *VMSpec) generateOSProfile() (*compute.OSProfile, error) {
+func (s *VMSpec) generateOSProfile() (*armcompute.OSProfile, error) {
 	sshKey, err := base64.StdEncoding.DecodeString(s.SSHKeyData)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to decode ssh public key")
 	}
 
-	osProfile := &compute.OSProfile{
-		ComputerName:  to.StringPtr(s.Name),
-		AdminUsername: to.StringPtr(azure.DefaultUserName),
-		CustomData:    to.StringPtr(s.BootstrapData),
+	osProfile := &armcompute.OSProfile{
+		ComputerName:             ptr.To(s.Name),
+		AdminUsername:            ptr.To(azure.DefaultUserName),
+		CustomData:               ptr.To(s.BootstrapData),
+		AllowExtensionOperations: ptr.To(!s.DisableExtensionOperations),
 	}
 
 	switch s.OSDisk.OSType {
-	case string(compute.OperatingSystemTypesWindows):
+	case string(armcompute.OperatingSystemTypesWindows):
 		// Cloudbase-init is used to generate a password.
 		// https://cloudbase-init.readthedocs.io/en/latest/plugins.html#setting-password-main
 		//
@@ -257,18 +292,18 @@ func (s *VMSpec) generateOSProfile() (*compute.OSProfile, error) {
 		// but the password on the VM will NOT be the same as created here.
 		// Access is provided via SSH public key that is set during deployment
 		// Azure also provides a way to reset user passwords in the case of need.
-		osProfile.AdminPassword = to.StringPtr(generators.SudoRandomPassword(123))
-		osProfile.WindowsConfiguration = &compute.WindowsConfiguration{
-			EnableAutomaticUpdates: to.BoolPtr(false),
+		osProfile.AdminPassword = ptr.To(generators.SudoRandomPassword(123))
+		osProfile.WindowsConfiguration = &armcompute.WindowsConfiguration{
+			EnableAutomaticUpdates: ptr.To(false),
 		}
 	default:
-		osProfile.LinuxConfiguration = &compute.LinuxConfiguration{
-			DisablePasswordAuthentication: to.BoolPtr(true),
-			SSH: &compute.SSHConfiguration{
-				PublicKeys: &[]compute.SSHPublicKey{
+		osProfile.LinuxConfiguration = &armcompute.LinuxConfiguration{
+			DisablePasswordAuthentication: ptr.To(true),
+			SSH: &armcompute.SSHConfiguration{
+				PublicKeys: []*armcompute.SSHPublicKey{
 					{
-						Path:    to.StringPtr(fmt.Sprintf("/home/%s/.ssh/authorized_keys", azure.DefaultUserName)),
-						KeyData: to.StringPtr(string(sshKey)),
+						Path:    ptr.To(fmt.Sprintf("/home/%s/.ssh/authorized_keys", azure.DefaultUserName)),
+						KeyData: ptr.To(string(sshKey)),
 					},
 				},
 			},
@@ -278,59 +313,171 @@ func (s *VMSpec) generateOSProfile() (*compute.OSProfile, error) {
 	return osProfile, nil
 }
 
-func (s *VMSpec) generateSecurityProfile() (*compute.SecurityProfile, error) {
+func (s *VMSpec) generateSecurityProfile(storageProfile *armcompute.StorageProfile) (*armcompute.SecurityProfile, error) {
 	if s.SecurityProfile == nil {
 		return nil, nil
 	}
 
-	if !s.SKU.HasCapability(resourceskus.EncryptionAtHost) {
-		return nil, azure.WithTerminalError(errors.Errorf("encryption at host is not supported for VM type %s", s.Size))
+	securityProfile := &armcompute.SecurityProfile{}
+
+	if storageProfile.OSDisk.ManagedDisk != nil &&
+		storageProfile.OSDisk.ManagedDisk.SecurityProfile != nil &&
+		ptr.Deref(storageProfile.OSDisk.ManagedDisk.SecurityProfile.SecurityEncryptionType, "") != "" {
+		if s.SecurityProfile.EncryptionAtHost != nil && *s.SecurityProfile.EncryptionAtHost &&
+			*storageProfile.OSDisk.ManagedDisk.SecurityProfile.SecurityEncryptionType == armcompute.SecurityEncryptionTypesDiskWithVMGuestState {
+			return nil, azure.WithTerminalError(errors.Errorf("encryption at host is not supported when securityEncryptionType is set to %s", armcompute.SecurityEncryptionTypesDiskWithVMGuestState))
+		}
+
+		if s.SecurityProfile.SecurityType != infrav1.SecurityTypesConfidentialVM {
+			return nil, azure.WithTerminalError(errors.Errorf("securityType should be set to %s when securityEncryptionType is set", infrav1.SecurityTypesConfidentialVM))
+		}
+
+		if s.SecurityProfile.UefiSettings == nil {
+			return nil, azure.WithTerminalError(errors.New("vTpmEnabled should be true when securityEncryptionType is set"))
+		}
+
+		if ptr.Deref(storageProfile.OSDisk.ManagedDisk.SecurityProfile.SecurityEncryptionType, "") == armcompute.SecurityEncryptionTypesDiskWithVMGuestState &&
+			!*s.SecurityProfile.UefiSettings.SecureBootEnabled {
+			return nil, azure.WithTerminalError(errors.Errorf("secureBootEnabled should be true when securityEncryptionType is set to %s", armcompute.SecurityEncryptionTypesDiskWithVMGuestState))
+		}
+
+		if s.SecurityProfile.UefiSettings.VTpmEnabled != nil && !*s.SecurityProfile.UefiSettings.VTpmEnabled {
+			return nil, azure.WithTerminalError(errors.New("vTpmEnabled should be true when securityEncryptionType is set"))
+		}
+
+		securityProfile.SecurityType = ptr.To(armcompute.SecurityTypesConfidentialVM)
+
+		securityProfile.UefiSettings = &armcompute.UefiSettings{
+			SecureBootEnabled: s.SecurityProfile.UefiSettings.SecureBootEnabled,
+			VTpmEnabled:       s.SecurityProfile.UefiSettings.VTpmEnabled,
+		}
+
+		if s.SecurityProfile.EncryptionAtHost != nil {
+			if !s.SKU.HasCapability(resourceskus.EncryptionAtHost) && *s.SecurityProfile.EncryptionAtHost {
+				return nil, azure.WithTerminalError(errors.Errorf("encryption at host is not supported for VM type %s", s.Size))
+			}
+
+			securityProfile.EncryptionAtHost = s.SecurityProfile.EncryptionAtHost
+		}
+
+		return securityProfile, nil
 	}
 
-	return &compute.SecurityProfile{
-		EncryptionAtHost: s.SecurityProfile.EncryptionAtHost,
-	}, nil
+	if s.SecurityProfile.EncryptionAtHost != nil {
+		if !s.SKU.HasCapability(resourceskus.EncryptionAtHost) && *s.SecurityProfile.EncryptionAtHost {
+			return nil, azure.WithTerminalError(errors.Errorf("encryption at host is not supported for VM type %s", s.Size))
+		}
+
+		securityProfile.EncryptionAtHost = s.SecurityProfile.EncryptionAtHost
+	}
+
+	hasTrustedLaunchDisabled := s.SKU.HasCapability(resourceskus.TrustedLaunchDisabled)
+
+	if s.SecurityProfile.UefiSettings != nil {
+		securityProfile.UefiSettings = &armcompute.UefiSettings{}
+
+		if s.SecurityProfile.UefiSettings.SecureBootEnabled != nil && *s.SecurityProfile.UefiSettings.SecureBootEnabled {
+			if hasTrustedLaunchDisabled {
+				return nil, azure.WithTerminalError(errors.Errorf("secure boot is not supported for VM type %s", s.Size))
+			}
+
+			if s.SecurityProfile.SecurityType != infrav1.SecurityTypesTrustedLaunch {
+				return nil, azure.WithTerminalError(errors.Errorf("securityType should be set to %s when secureBootEnabled is true", infrav1.SecurityTypesTrustedLaunch))
+			}
+
+			securityProfile.SecurityType = ptr.To(armcompute.SecurityTypesTrustedLaunch)
+			securityProfile.UefiSettings.SecureBootEnabled = ptr.To(true)
+		}
+
+		if s.SecurityProfile.UefiSettings.VTpmEnabled != nil && *s.SecurityProfile.UefiSettings.VTpmEnabled {
+			if hasTrustedLaunchDisabled {
+				return nil, azure.WithTerminalError(errors.Errorf("vTPM is not supported for VM type %s", s.Size))
+			}
+
+			if s.SecurityProfile.SecurityType != infrav1.SecurityTypesTrustedLaunch {
+				return nil, azure.WithTerminalError(errors.Errorf("securityType should be set to %s when vTpmEnabled is true", infrav1.SecurityTypesTrustedLaunch))
+			}
+
+			securityProfile.SecurityType = ptr.To(armcompute.SecurityTypesTrustedLaunch)
+			securityProfile.UefiSettings.VTpmEnabled = ptr.To(true)
+		}
+	}
+
+	return securityProfile, nil
 }
 
-func (s *VMSpec) generateNICRefs() *[]compute.NetworkInterfaceReference {
-	nicRefs := make([]compute.NetworkInterfaceReference, len(s.NICIDs))
+func (s *VMSpec) generateNICRefs() []*armcompute.NetworkInterfaceReference {
+	nicRefs := make([]*armcompute.NetworkInterfaceReference, len(s.NICIDs))
 	for i, id := range s.NICIDs {
 		primary := i == 0
-		nicRefs[i] = compute.NetworkInterfaceReference{
-			ID: to.StringPtr(id),
-			NetworkInterfaceReferenceProperties: &compute.NetworkInterfaceReferenceProperties{
-				Primary: to.BoolPtr(primary),
+		nicRefs[i] = &armcompute.NetworkInterfaceReference{
+			ID: ptr.To(id),
+			Properties: &armcompute.NetworkInterfaceReferenceProperties{
+				Primary: ptr.To(primary),
 			},
 		}
 	}
-	return &nicRefs
+	return nicRefs
 }
 
-func (s *VMSpec) generateAdditionalCapabilities() *compute.AdditionalCapabilities {
-	var capabilities *compute.AdditionalCapabilities
+func (s *VMSpec) generateAdditionalCapabilities() *armcompute.AdditionalCapabilities {
+	var capabilities *armcompute.AdditionalCapabilities
+
+	// Provisionally detect whether there is any Data Disk defined which uses UltraSSDs.
+	// If that's the case, enable the UltraSSD capability.
 	for _, dataDisk := range s.DataDisks {
-		if dataDisk.ManagedDisk != nil && dataDisk.ManagedDisk.StorageAccountType == string(compute.StorageAccountTypesUltraSSDLRS) {
-			capabilities = &compute.AdditionalCapabilities{
-				UltraSSDEnabled: to.BoolPtr(true),
+		if dataDisk.ManagedDisk != nil && dataDisk.ManagedDisk.StorageAccountType == string(armcompute.StorageAccountTypesUltraSSDLRS) {
+			capabilities = &armcompute.AdditionalCapabilities{
+				UltraSSDEnabled: ptr.To(true),
 			}
 			break
 		}
 	}
+
+	// Set Additional Capabilities if any is present on the spec.
+	if s.AdditionalCapabilities != nil {
+		if capabilities == nil {
+			capabilities = &armcompute.AdditionalCapabilities{}
+		}
+		// Set UltraSSDEnabled if a specific value is set on the spec for it.
+		if s.AdditionalCapabilities.UltraSSDEnabled != nil {
+			capabilities.UltraSSDEnabled = s.AdditionalCapabilities.UltraSSDEnabled
+		}
+	}
+
 	return capabilities
 }
 
-func (s *VMSpec) getAvailabilitySet() *compute.SubResource {
-	var as *compute.SubResource
+func (s *VMSpec) getAvailabilitySet() *armcompute.SubResource {
+	var as *armcompute.SubResource
 	if s.AvailabilitySetID != "" {
-		as = &compute.SubResource{ID: &s.AvailabilitySetID}
+		as = &armcompute.SubResource{ID: &s.AvailabilitySetID}
 	}
 	return as
 }
 
-func (s *VMSpec) getZones() *[]string {
-	var zones *[]string
+func (s *VMSpec) getVirtualMachineScaleSet() *armcompute.SubResource {
+	var vmss *armcompute.SubResource
+	if s.VirtualMachineScaleSetID != "" {
+		vmss = &armcompute.SubResource{ID: &s.VirtualMachineScaleSetID}
+	}
+	return vmss
+}
+
+func (s *VMSpec) getZones() []*string {
+	var zones []*string
 	if s.Zone != "" {
-		zones = &[]string{s.Zone}
+		zones = []*string{ptr.To(s.Zone)}
 	}
 	return zones
+}
+
+func (s *VMSpec) getCapacityReservationProfile() *armcompute.CapacityReservationProfile {
+	var crf *armcompute.CapacityReservationProfile
+	if s.CapacityReservationGroupID != "" {
+		crf = &armcompute.CapacityReservationProfile{
+			CapacityReservationGroup: &armcompute.SubResource{ID: &s.CapacityReservationGroupID},
+		}
+	}
+	return crf
 }

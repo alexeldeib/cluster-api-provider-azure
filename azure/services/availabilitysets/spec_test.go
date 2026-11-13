@@ -19,9 +19,10 @@ package availabilitysets
 import (
 	"testing"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2021-04-01/compute"
-	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
 	. "github.com/onsi/gomega"
+	"k8s.io/utils/ptr"
+
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/resourceskus"
 )
 
@@ -40,15 +41,15 @@ func TestParameters(t *testing.T) {
 	testcases := []struct {
 		name          string
 		spec          *AvailabilitySetSpec
-		existing      interface{}
-		expect        func(g *WithT, result interface{})
+		existing      any
+		expect        func(g *WithT, result any)
 		expectedError string
 	}{
 		{
 			name:     "error when no SKU is present",
 			spec:     &fakeSetSpecMissing,
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
+			expect: func(g *WithT, result any) {
 				g.Expect(result).To(BeNil())
 			},
 			expectedError: "unable to get required availability set SKU from machine cache",
@@ -57,7 +58,7 @@ func TestParameters(t *testing.T) {
 			name:     "error when SKU capability is missing",
 			spec:     &fakeSetSpecMissingCap,
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
+			expect: func(g *WithT, result any) {
 				g.Expect(result).To(BeNil())
 			},
 			expectedError: "unable to get required availability set SKU capability MaximumPlatformFaultDomainCount",
@@ -66,20 +67,19 @@ func TestParameters(t *testing.T) {
 			name:     "get parameters when all values are present",
 			spec:     &fakeSetSpec,
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(compute.AvailabilitySet{}))
-				g.Expect(result.(compute.AvailabilitySet).PlatformFaultDomainCount).To(Equal(to.Int32Ptr(int32(fakeFaultDomainCount))))
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.AvailabilitySet{}))
+				g.Expect(result.(armcompute.AvailabilitySet).Properties.PlatformFaultDomainCount).To(Equal(ptr.To[int32](int32(fakeFaultDomainCount))))
 			},
 			expectedError: "",
 		},
 	}
 	for _, tc := range testcases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 			t.Parallel()
 
-			result, err := tc.spec.Parameters(tc.existing)
+			result, err := tc.spec.Parameters(t.Context(), tc.existing)
 			if tc.expectedError != "" {
 				g.Expect(err).To(HaveOccurred())
 				g.Expect(err).To(MatchError(tc.expectedError))

@@ -19,14 +19,12 @@ package controllers
 import (
 	"testing"
 
-	"github.com/Azure/go-autorest/autorest/to"
-	"github.com/golang/mock/gomock"
 	. "github.com/onsi/gomega"
-	corev1 "k8s.io/api/core/v1"
+	"go.uber.org/mock/gomock"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
-	clusterv1exp "sigs.k8s.io/cluster-api/exp/api/v1beta1"
+	"k8s.io/utils/ptr"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/mock_azure"
@@ -50,9 +48,13 @@ func Test_newAzureMachinePoolService(t *testing.T) {
 	clusterMock := mock_azure.NewMockClusterScoper(mockCtrl)
 	clusterMock.EXPECT().SubscriptionID().AnyTimes()
 	clusterMock.EXPECT().BaseURI().AnyTimes()
-	clusterMock.EXPECT().Authorizer().AnyTimes()
+	clusterMock.EXPECT().CloudEnvironment().AnyTimes()
+	clusterMock.EXPECT().Token().AnyTimes()
 	clusterMock.EXPECT().Location().Return(cluster.Spec.Location)
 	clusterMock.EXPECT().HashKey().Return("fakeCluster")
+	clusterMock.EXPECT().CloudEnvironment().AnyTimes()
+	clusterMock.EXPECT().Token().AnyTimes()
+	clusterMock.EXPECT().DefaultedAzureCallTimeout().AnyTimes()
 
 	mps := &scope.MachinePoolScope{
 		ClusterScoper: clusterMock,
@@ -68,7 +70,7 @@ func Test_newAzureMachinePoolService(t *testing.T) {
 	g := NewWithT(t)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(subject).NotTo(BeNil())
-	g.Expect(subject.virtualMachinesScaleSetSvc).NotTo(BeNil())
+	g.Expect(subject.services).NotTo(BeEmpty())
 	g.Expect(subject.skuCache).NotTo(BeNil())
 }
 
@@ -76,26 +78,25 @@ func newScheme(g *GomegaWithT) *runtime.Scheme {
 	scheme := runtime.NewScheme()
 	for _, f := range []func(*runtime.Scheme) error{
 		clusterv1.AddToScheme,
-		clusterv1exp.AddToScheme,
 		infrav1.AddToScheme,
 		infrav1exp.AddToScheme,
 	} {
-		g.Expect(f(scheme)).ToNot(HaveOccurred())
+		g.Expect(f(scheme)).To(Succeed())
 	}
 	return scheme
 }
 
-func newMachinePool(clusterName, poolName string) *clusterv1exp.MachinePool {
-	return &clusterv1exp.MachinePool{
+func newMachinePool(clusterName, poolName string) *clusterv1.MachinePool {
+	return &clusterv1.MachinePool{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{
-				clusterv1.ClusterLabelName: clusterName,
+				clusterv1.ClusterNameLabel: clusterName,
 			},
 			Name:      poolName,
 			Namespace: "default",
 		},
-		Spec: clusterv1exp.MachinePoolSpec{
-			Replicas: to.Int32Ptr(2),
+		Spec: clusterv1.MachinePoolSpec{
+			Replicas: ptr.To[int32](2),
 		},
 	}
 }
@@ -104,7 +105,7 @@ func newAzureMachinePool(clusterName, poolName string) *infrav1exp.AzureMachineP
 	return &infrav1exp.AzureMachinePool{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{
-				clusterv1.ClusterLabelName: clusterName,
+				clusterv1.ClusterNameLabel: clusterName,
 			},
 			Name:      poolName,
 			Namespace: "default",
@@ -112,24 +113,12 @@ func newAzureMachinePool(clusterName, poolName string) *infrav1exp.AzureMachineP
 	}
 }
 
-func newMachinePoolWithInfrastructureRef(clusterName, poolName string) *clusterv1exp.MachinePool {
+func newMachinePoolWithInfrastructureRef(clusterName, poolName string) *clusterv1.MachinePool {
 	m := newMachinePool(clusterName, poolName)
-	m.Spec.Template.Spec.InfrastructureRef = corev1.ObjectReference{
-		Kind:       "AzureMachinePool",
-		Namespace:  m.Namespace,
-		Name:       "azure" + poolName,
-		APIVersion: infrav1exp.GroupVersion.String(),
-	}
-	return m
-}
-
-func newManagedMachinePoolWithInfrastructureRef(clusterName, poolName string) *clusterv1exp.MachinePool {
-	m := newMachinePool(clusterName, poolName)
-	m.Spec.Template.Spec.InfrastructureRef = corev1.ObjectReference{
-		Kind:       "AzureManagedMachinePool",
-		Namespace:  m.Namespace,
-		Name:       "azure" + poolName,
-		APIVersion: infrav1exp.GroupVersion.String(),
+	m.Spec.Template.Spec.InfrastructureRef = clusterv1.ContractVersionedObjectReference{
+		Kind:     infrav1.AzureMachinePoolKind,
+		Name:     "azure" + poolName,
+		APIGroup: infrav1exp.GroupVersion.Group,
 	}
 	return m
 }

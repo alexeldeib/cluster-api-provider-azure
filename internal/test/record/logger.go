@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 
 	"github.com/go-logr/logr"
@@ -39,7 +40,7 @@ type LogEntry struct {
 	Level int
 
 	// Values of the log line, composed of the concatenation of log.WithValues and KeyValue pairs passed to log.Info.
-	Values []interface{}
+	Values []any
 }
 
 // Option is a configuration option supplied to NewLogger.
@@ -74,12 +75,12 @@ func NewLogger(options ...Option) *Logger {
 var _ logr.LogSink = (*Logger)(nil)
 
 type (
-	// Logger defines a test friendly logr.Logger.
+	// Logger defines a test-friendly logr.Logger.
 	Logger struct {
 		threshold  *int
 		level      int
 		prefix     string
-		values     []interface{}
+		values     []any
 		listenerMu sync.Mutex
 		listeners  map[string]*Listener
 		writer     io.Writer
@@ -88,6 +89,7 @@ type (
 		info       logr.RuntimeInfo
 	}
 
+	// Listener defines a listener for log entries.
 	Listener struct {
 		logger    *Logger
 		entriesMu sync.RWMutex
@@ -95,16 +97,19 @@ type (
 	}
 )
 
+// NewListener returns a new listener with the specified logger.
 func NewListener(logger *Logger) *Listener {
 	return &Listener{
 		logger: logger,
 	}
 }
 
+// Listen adds this listener to its logger.
 func (li *Listener) Listen() func() {
 	return li.logger.addListener(li)
 }
 
+// GetEntries returns a copy of the list of log entries.
 func (li *Listener) GetEntries() []LogEntry {
 	li.entriesMu.RLock()
 	defer li.entriesMu.RUnlock()
@@ -143,17 +148,18 @@ func (l *Logger) removeListener(id string) {
 	delete(l.listeners, id)
 }
 
+// Init initializes the logger from runtime information.
 func (l *Logger) Init(info logr.RuntimeInfo) {
 	l.info = info
 }
 
 // Enabled is always enabled.
-func (l *Logger) Enabled(v int) bool {
+func (l *Logger) Enabled(_ int) bool {
 	return true
 }
 
 // Info logs a non-error message with the given key/value pairs as context.
-func (l *Logger) Info(level int, msg string, kvs ...interface{}) {
+func (l *Logger) Info(_ int, msg string, kvs ...any) {
 	values := copySlice(l.values)
 	values = append(values, kvs...)
 	values = append(values, "msg", msg)
@@ -161,7 +167,7 @@ func (l *Logger) Info(level int, msg string, kvs ...interface{}) {
 }
 
 // Error logs an error message with the given key/value pairs as context.
-func (l *Logger) Error(err error, msg string, kvs ...interface{}) {
+func (l *Logger) Error(err error, msg string, kvs ...any) {
 	values := copySlice(l.values)
 	values = append(values, kvs...)
 	values = append(values, "msg", msg, "error", err)
@@ -178,7 +184,7 @@ func (l *Logger) V(level int) logr.LogSink {
 // WithName adds a new element to the logger's name.
 func (l *Logger) WithName(name string) logr.LogSink {
 	nl := l.clone()
-	if len(l.prefix) > 0 {
+	if l.prefix != "" {
 		nl.prefix = l.prefix + "/"
 	}
 	nl.prefix += name
@@ -186,13 +192,13 @@ func (l *Logger) WithName(name string) logr.LogSink {
 }
 
 // WithValues adds some key-value pairs of context to a logger.
-func (l *Logger) WithValues(kvList ...interface{}) logr.LogSink {
+func (l *Logger) WithValues(kvList ...any) logr.LogSink {
 	nl := l.clone()
 	nl.values = append(nl.values, kvList...)
 	return nl
 }
 
-func (l *Logger) write(logFunc string, values []interface{}) {
+func (l *Logger) write(logFunc string, values []any) {
 	entry := LogEntry{
 		Prefix:  l.prefix,
 		LogFunc: logFunc,
@@ -256,19 +262,19 @@ func copyLogEntries(in []LogEntry) []LogEntry {
 	return out
 }
 
-func copySlice(in []interface{}) []interface{} {
-	out := make([]interface{}, len(in))
+func copySlice(in []any) []any {
+	out := make([]any, len(in))
 	copy(out, in)
 	return out
 }
 
 // flatten returns a human readable/machine parsable text representing the LogEntry.
 // Most notable difference with the klog implementation are:
-// - The message is printed at the beginning of the line, without the Msg= variable name e.g.
-//   "Msg"="This is a message" --> This is a message
-// - Variables name are not quoted, eg.
-//   This is a message "Var1"="value" --> This is a message Var1="value"
-// - Variables are not sorted, thus allowing full control to the developer on the output.
+//   - The message is printed at the beginning of the line, without the Msg= variable name e.g.
+//     "Msg"="This is a message" --> This is a message
+//   - Variables name are not quoted, eg.
+//     This is a message "Var1"="value" --> This is a message Var1="value"
+//   - Variables are not sorted, thus allowing full control to the developer on the output.
 func flatten(entry LogEntry) (string, error) {
 	var msgValue string
 	var errorValue error
@@ -277,13 +283,13 @@ func flatten(entry LogEntry) (string, error) {
 	}
 
 	keys := make([]string, 0, len(entry.Values)/2)
-	values := make(map[string]interface{}, len(entry.Values)/2)
+	values := make(map[string]any, len(entry.Values)/2)
 	for i := 0; i < len(entry.Values); i += 2 {
 		k, ok := entry.Values[i].(string)
 		if !ok {
 			panic(fmt.Sprintf("key is not a string: %s", entry.Values[i]))
 		}
-		var v interface{}
+		var v any
 		if i+1 < len(entry.Values) {
 			v = entry.Values[i+1]
 		}
@@ -305,28 +311,28 @@ func flatten(entry LogEntry) (string, error) {
 			values[k] = v
 		}
 	}
-	str := ""
+	var str strings.Builder
 	if entry.Prefix != "" {
-		str += fmt.Sprintf("[%s] ", entry.Prefix)
+		str.WriteString(fmt.Sprintf("[%s] ", entry.Prefix))
 	}
-	str += msgValue
+	str.WriteString(msgValue)
 	if errorValue != nil {
 		if msgValue != "" {
-			str += ": "
+			str.WriteString(": ")
 		}
-		str += errorValue.Error()
+		str.WriteString(errorValue.Error())
 	}
 	for _, k := range keys {
 		prettyValue, err := pretty(values[k])
 		if err != nil {
 			return "", err
 		}
-		str += fmt.Sprintf(" %s=%s", k, prettyValue)
+		str.WriteString(fmt.Sprintf(" %s=%s", k, prettyValue))
 	}
-	return str, nil
+	return str.String(), nil
 }
 
-func pretty(value interface{}) (string, error) {
+func pretty(value any) (string, error) {
 	jb, err := json.Marshal(value)
 	if err != nil {
 		return "", errors.Wrapf(err, "Failed to marshal %s", value)

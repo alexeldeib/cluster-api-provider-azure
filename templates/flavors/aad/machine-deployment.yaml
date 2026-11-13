@@ -5,7 +5,7 @@ metadata:
   name: "${CLUSTER_NAME}-md-0"
 spec:
   clusterName: "${CLUSTER_NAME}"
-  replicas: ${WORKER_MACHINE_COUNT}
+  replicas: ${WORKER_MACHINE_COUNT:=2}
   selector:
     matchLabels:
   template:
@@ -44,14 +44,11 @@ metadata:
 spec:
   template:
     spec:
-      useExperimentalRetryJoin: true
       joinConfiguration:
         nodeRegistration:
           name: '{{ ds.meta_data["local_hostname"] }}'
           kubeletExtraArgs:
-            cloud-provider: azure
-            cloud-config: /etc/kubernetes/azure.json
-            azure-container-registry-config: /etc/kubernetes/azure.json
+            cloud-provider: external
       files:
       - contentFrom:
           secret:

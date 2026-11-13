@@ -17,28 +17,39 @@ limitations under the License.
 package controllers
 
 import (
-	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 
-	"github.com/Azure/go-autorest/autorest"
-	"github.com/Azure/go-autorest/autorest/azure/auth"
 	"github.com/go-logr/logr"
-	"github.com/golang/mock/gomock"
 	"github.com/google/go-cmp/cmp"
 	. "github.com/onsi/gomega"
+	"go.uber.org/mock/gomock"
+	"golang.org/x/exp/maps"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	clusterctlv1 "sigs.k8s.io/cluster-api/cmd/clusterctl/api/v1alpha3"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
+	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/scope"
 	"sigs.k8s.io/cluster-api-provider-azure/internal/test/mock_log"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/cluster-api-provider-azure/internal/webhooks"
+)
+
+var (
+	cpName      = "my-managed-cp"
+	clusterName = "my-cluster"
 )
 
 func TestAzureClusterToAzureMachinesMapper(t *testing.T) {
@@ -60,10 +71,10 @@ func TestAzureClusterToAzureMachinesMapper(t *testing.T) {
 	sink := mock_log.NewMockLogSink(mockCtrl)
 	sink.EXPECT().Init(logr.RuntimeInfo{CallDepth: 1})
 	sink.EXPECT().WithValues("AzureCluster", "my-cluster", "Namespace", "default")
-	mapper, err := AzureClusterToAzureMachinesMapper(context.Background(), client, &infrav1.AzureMachine{}, scheme, logr.New(sink))
+	mapper, err := AzureClusterToAzureMachinesMapper(t.Context(), client, &infrav1.AzureMachine{}, scheme, logr.New(sink))
 	g.Expect(err).NotTo(HaveOccurred())
 
-	requests := mapper(&infrav1.AzureCluster{
+	requests := mapper(t.Context(), &infrav1.AzureCluster{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      clusterName,
 			Namespace: "default",
@@ -84,13 +95,15 @@ func TestGetCloudProviderConfig(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = clusterv1.AddToScheme(scheme)
 	_ = infrav1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
 
 	cluster := newCluster("foo")
-	cluster.Default()
 	azureCluster := newAzureCluster("bar")
-	azureCluster.Default()
+
+	g.Expect((&webhooks.AzureClusterWebhook{}).Default(t.Context(), azureCluster)).To(Succeed())
+
 	azureClusterCustomVnet := newAzureClusterWithCustomVnet("bar")
-	azureClusterCustomVnet.Default()
+	g.Expect((&webhooks.AzureClusterWebhook{}).Default(t.Context(), azureClusterCustomVnet)).NotTo(HaveOccurred())
 
 	cases := map[string]struct {
 		cluster                    *clusterv1.Cluster
@@ -143,24 +156,55 @@ func TestGetCloudProviderConfig(t *testing.T) {
 			expectedControlPlaneConfig: backOffCloudConfig,
 			expectedWorkerNodeConfig:   backOffCloudConfig,
 		},
+		"with machinepools": {
+			cluster:                    cluster,
+			azureCluster:               azureCluster,
+			identityType:               infrav1.VMIdentityNone,
+			expectedControlPlaneConfig: vmssCloudConfig,
+			expectedWorkerNodeConfig:   vmssCloudConfig,
+		},
 	}
 
-	os.Setenv(auth.ClientID, "fooClient")
-	os.Setenv(auth.ClientSecret, "fooSecret")
-	os.Setenv(auth.TenantID, "fooTenant")
+	os.Setenv("AZURE_CLIENT_ID", "fooClient")     //nolint:gosec,usetesting // we want to use os.Setenv here instead of t.Setenv
+	os.Setenv("AZURE_CLIENT_SECRET", "fooSecret") //nolint:gosec,usetesting // we want to use os.Setenv here instead of t.Setenv
+	os.Setenv("AZURE_TENANT_ID", "fooTenant")     //nolint:gosec,usetesting // we want to use os.Setenv here instead of t.Setenv
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			initObjects := []runtime.Object{tc.cluster, tc.azureCluster}
-			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(initObjects...).Build()
-
-			clusterScope, err := scope.NewClusterScope(context.Background(), scope.ClusterScopeParams{
-				AzureClients: scope.AzureClients{
-					Authorizer: autorest.NullAuthorizer{},
+			fakeIdentity := &infrav1.AzureClusterIdentity{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "fake-identity",
+					Namespace: "default",
 				},
-				Cluster:      tc.cluster,
-				AzureCluster: tc.azureCluster,
-				Client:       fakeClient,
+				Spec: infrav1.AzureClusterIdentitySpec{
+					Type:         infrav1.ServicePrincipal,
+					ClientID:     "fooClient",
+					TenantID:     "fooTenant",
+					ClientSecret: corev1.SecretReference{Name: "fooSecret", Namespace: "default"},
+				},
+			}
+			fakeSecret := getASOSecret(tc.cluster, func(s *corev1.Secret) {
+				s.ObjectMeta.Name = "fooSecret"
+				s.Data = map[string][]byte{
+					"AZURE_SUBSCRIPTION_ID": []byte("fooSubscription"),
+					"AZURE_TENANT_ID":       []byte("fooTenant"),
+					"AZURE_CLIENT_ID":       []byte("fooClient"),
+					"AZURE_CLIENT_SECRET":   []byte("fooSecret"),
+					"clientSecret":          []byte("fooSecret"),
+				}
+			})
+
+			initObjects := []runtime.Object{tc.cluster, tc.azureCluster, fakeIdentity, fakeSecret}
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(initObjects...).Build()
+			resultSecret := &corev1.Secret{}
+			key := client.ObjectKey{Name: fakeSecret.Name, Namespace: fakeSecret.Namespace}
+			g.Expect(fakeClient.Get(t.Context(), key, resultSecret)).To(Succeed())
+
+			clusterScope, err := scope.NewClusterScope(t.Context(), scope.ClusterScopeParams{
+				Cluster:         tc.cluster,
+				AzureCluster:    tc.azureCluster,
+				Client:          fakeClient,
+				CredentialCache: azure.NewCredentialCache(),
 			})
 			g.Expect(err).NotTo(HaveOccurred())
 
@@ -169,13 +213,13 @@ func TestGetCloudProviderConfig(t *testing.T) {
 			g.Expect(cloudConfig.Data).NotTo(BeNil())
 
 			if diff := cmp.Diff(tc.expectedControlPlaneConfig, string(cloudConfig.Data["control-plane-azure.json"])); diff != "" {
-				t.Errorf(diff)
+				t.Errorf("%s", diff)
 			}
 			if diff := cmp.Diff(tc.expectedWorkerNodeConfig, string(cloudConfig.Data["worker-node-azure.json"])); diff != "" {
-				t.Errorf(diff)
+				t.Errorf("%s", diff)
 			}
 			if diff := cmp.Diff(tc.expectedControlPlaneConfig, string(cloudConfig.Data["azure.json"])); diff != "" {
-				t.Errorf(diff)
+				t.Errorf("%s", diff)
 			}
 		})
 	}
@@ -197,7 +241,7 @@ func TestReconcileAzureSecret(t *testing.T) {
 			ownerName:  "azureMachineName",
 		},
 		"azuremachinepool should reconcile secret successfully": {
-			kind:       "AzureMachinePool",
+			kind:       infrav1.AzureMachinePoolKind,
 			apiVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 			ownerName:  "azureMachinePoolName",
 		},
@@ -257,30 +301,41 @@ func TestReconcileAzureSecret(t *testing.T) {
 	cluster := newCluster("foo")
 	azureCluster := newAzureCluster("bar")
 
-	cluster.Default()
-	azureCluster.Default()
-	azureCluster.ClusterName = "testCluster"
+	err := (&webhooks.AzureClusterWebhook{}).Default(t.Context(), azureCluster)
+	g.Expect(err).NotTo(HaveOccurred())
+	cluster.Name = "testCluster"
+
+	fakeIdentity := &infrav1.AzureClusterIdentity{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "fake-identity",
+			Namespace: "default",
+		},
+		Spec: infrav1.AzureClusterIdentitySpec{
+			Type:     infrav1.ServicePrincipal,
+			TenantID: "fake-tenantid",
+		},
+	}
+	fakeSecret := &corev1.Secret{Data: map[string][]byte{"clientSecret": []byte("fooSecret")}}
+	initObjects := []runtime.Object{fakeIdentity, fakeSecret}
 
 	scheme := setupScheme(g)
-	kubeclient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	kubeclient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(initObjects...).Build()
 
-	clusterScope, err := scope.NewClusterScope(context.Background(), scope.ClusterScopeParams{
-		AzureClients: scope.AzureClients{
-			Authorizer: autorest.NullAuthorizer{},
-		},
-		Cluster:      cluster,
-		AzureCluster: azureCluster,
-		Client:       kubeclient,
+	clusterScope, err := scope.NewClusterScope(t.Context(), scope.ClusterScopeParams{
+		Cluster:         cluster,
+		AzureCluster:    azureCluster,
+		Client:          kubeclient,
+		CredentialCache: azure.NewCredentialCache(),
 	})
 	g.Expect(err).NotTo(HaveOccurred())
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			if tc.existingSecret != nil {
-				_ = kubeclient.Delete(context.Background(), tc.existingSecret)
-				_ = kubeclient.Create(context.Background(), tc.existingSecret)
+				_ = kubeclient.Delete(t.Context(), tc.existingSecret)
+				_ = kubeclient.Create(t.Context(), tc.existingSecret)
 				defer func() {
-					_ = kubeclient.Delete(context.Background(), tc.existingSecret)
+					_ = kubeclient.Delete(t.Context(), tc.existingSecret)
 				}()
 			}
 
@@ -293,7 +348,7 @@ func TestReconcileAzureSecret(t *testing.T) {
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(cloudConfig.Data).NotTo(BeNil())
 
-			if err := reconcileAzureSecret(context.Background(), kubeclient, owner, cloudConfig, azureCluster.ClusterName); err != nil {
+			if err := reconcileAzureSecret(t.Context(), kubeclient, owner, cloudConfig, cluster.Name); err != nil {
 				t.Error(err)
 			}
 
@@ -302,7 +357,7 @@ func TestReconcileAzureSecret(t *testing.T) {
 				Name:      fmt.Sprintf("%s-azure-json", tc.ownerName),
 			}
 			found := &corev1.Secret{}
-			if err := kubeclient.Get(context.Background(), key, found); err != nil {
+			if err := kubeclient.Get(t.Context(), key, found); err != nil {
 				t.Error(err)
 			}
 
@@ -318,9 +373,9 @@ func TestReconcileAzureSecret(t *testing.T) {
 
 func setupScheme(g *WithT) *runtime.Scheme {
 	scheme := runtime.NewScheme()
-	g.Expect(clientgoscheme.AddToScheme(scheme)).ToNot(HaveOccurred())
-	g.Expect(infrav1.AddToScheme(scheme)).ToNot(HaveOccurred())
-	g.Expect(clusterv1.AddToScheme(scheme)).ToNot(HaveOccurred())
+	g.Expect(clientgoscheme.AddToScheme(scheme)).To(Succeed())
+	g.Expect(infrav1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(clusterv1.AddToScheme(scheme)).To(Succeed())
 	return scheme
 }
 
@@ -328,7 +383,7 @@ func newMachine(clusterName, machineName string) *clusterv1.Machine {
 	return &clusterv1.Machine{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{
-				clusterv1.ClusterLabelName: clusterName,
+				clusterv1.ClusterNameLabel: clusterName,
 			},
 			Name:      machineName,
 			Namespace: "default",
@@ -338,11 +393,10 @@ func newMachine(clusterName, machineName string) *clusterv1.Machine {
 
 func newMachineWithInfrastructureRef(clusterName, machineName string) *clusterv1.Machine {
 	m := newMachine(clusterName, machineName)
-	m.Spec.InfrastructureRef = corev1.ObjectReference{
-		Kind:       "AzureMachine",
-		Namespace:  "default",
-		Name:       "azure" + machineName,
-		APIVersion: infrav1.GroupVersion.String(),
+	m.Spec.InfrastructureRef = clusterv1.ContractVersionedObjectReference{
+		Kind:     "AzureMachine",
+		Name:     "azure" + machineName,
+		APIGroup: infrav1.GroupVersion.Group,
 	}
 	return m
 }
@@ -363,12 +417,19 @@ func newAzureCluster(location string) *infrav1.AzureCluster {
 			Namespace: "default",
 		},
 		Spec: infrav1.AzureClusterSpec{
-			Location: location,
+			AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+				Location:       location,
+				SubscriptionID: "baz",
+				IdentityRef: &corev1.ObjectReference{
+					Kind:      "AzureClusterIdentity",
+					Name:      "fake-identity",
+					Namespace: "default",
+				},
+			},
 			NetworkSpec: infrav1.NetworkSpec{
 				Vnet: infrav1.VnetSpec{},
 			},
-			ResourceGroup:  "bar",
-			SubscriptionID: "baz",
+			ResourceGroup: "bar",
 		},
 	}
 }
@@ -414,7 +475,15 @@ func newAzureClusterWithCustomVnet(location string) *infrav1.AzureCluster {
 			Namespace: "default",
 		},
 		Spec: infrav1.AzureClusterSpec{
-			Location: location,
+			AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+				Location:       location,
+				SubscriptionID: "baz",
+				IdentityRef: &corev1.ObjectReference{
+					Kind:      "AzureClusterIdentity",
+					Name:      "fake-identity",
+					Namespace: "default",
+				},
+			},
 			NetworkSpec: infrav1.NetworkSpec{
 				Vnet: infrav1.VnetSpec{
 					Name:          "custom-vnet",
@@ -422,17 +491,20 @@ func newAzureClusterWithCustomVnet(location string) *infrav1.AzureCluster {
 				},
 				Subnets: infrav1.Subnets{
 					infrav1.SubnetSpec{
-						Name: "foo-controlplane-subnet",
-						Role: infrav1.SubnetControlPlane,
+						SubnetClassSpec: infrav1.SubnetClassSpec{
+							Name: "foo-controlplane-subnet",
+							Role: infrav1.SubnetControlPlane,
+						},
 					},
 					infrav1.SubnetSpec{
-						Name: "foo-node-subnet",
-						Role: infrav1.SubnetNode,
+						SubnetClassSpec: infrav1.SubnetClassSpec{
+							Name: "foo-node-subnet",
+							Role: infrav1.SubnetNode,
+						},
 					},
 				},
 			},
-			ResourceGroup:  "bar",
-			SubscriptionID: "baz",
+			ResourceGroup: "bar",
 		},
 	}
 }
@@ -454,11 +526,12 @@ const (
     "subnetName": "foo-node-subnet",
     "routeTableName": "foo-node-routetable",
     "loadBalancerSku": "Standard",
+    "loadBalancerName": "",
     "maximumLoadBalancerRuleCount": 250,
     "useManagedIdentityExtension": false,
-    "useInstanceMetadata": true
+    "useInstanceMetadata": true,
+    "enableVmssFlexNodes": true
 }`
-	//nolint:gosec
 	spWorkerNodeCloudConfig = `{
     "cloud": "AzurePublicCloud",
     "tenantId": "fooTenant",
@@ -475,9 +548,11 @@ const (
     "subnetName": "foo-node-subnet",
     "routeTableName": "foo-node-routetable",
     "loadBalancerSku": "Standard",
+    "loadBalancerName": "",
     "maximumLoadBalancerRuleCount": 250,
     "useManagedIdentityExtension": false,
-    "useInstanceMetadata": true
+    "useInstanceMetadata": true,
+    "enableVmssFlexNodes": true
 }`
 
 	systemAssignedControlPlaneCloudConfig = `{
@@ -494,9 +569,11 @@ const (
     "subnetName": "foo-node-subnet",
     "routeTableName": "foo-node-routetable",
     "loadBalancerSku": "Standard",
+    "loadBalancerName": "",
     "maximumLoadBalancerRuleCount": 250,
     "useManagedIdentityExtension": true,
-    "useInstanceMetadata": true
+    "useInstanceMetadata": true,
+    "enableVmssFlexNodes": true
 }`
 	systemAssignedWorkerNodeCloudConfig = `{
     "cloud": "AzurePublicCloud",
@@ -512,9 +589,11 @@ const (
     "subnetName": "foo-node-subnet",
     "routeTableName": "foo-node-routetable",
     "loadBalancerSku": "Standard",
+    "loadBalancerName": "",
     "maximumLoadBalancerRuleCount": 250,
     "useManagedIdentityExtension": true,
-    "useInstanceMetadata": true
+    "useInstanceMetadata": true,
+    "enableVmssFlexNodes": true
 }`
 
 	userAssignedControlPlaneCloudConfig = `{
@@ -531,10 +610,12 @@ const (
     "subnetName": "foo-node-subnet",
     "routeTableName": "foo-node-routetable",
     "loadBalancerSku": "Standard",
+    "loadBalancerName": "",
     "maximumLoadBalancerRuleCount": 250,
     "useManagedIdentityExtension": true,
     "useInstanceMetadata": true,
-    "userAssignedIdentityId": "foobar"
+    "enableVmssFlexNodes": true,
+    "userAssignedIdentityID": "foobar"
 }`
 	userAssignedWorkerNodeCloudConfig = `{
     "cloud": "AzurePublicCloud",
@@ -550,10 +631,12 @@ const (
     "subnetName": "foo-node-subnet",
     "routeTableName": "foo-node-routetable",
     "loadBalancerSku": "Standard",
+    "loadBalancerName": "",
     "maximumLoadBalancerRuleCount": 250,
     "useManagedIdentityExtension": true,
     "useInstanceMetadata": true,
-    "userAssignedIdentityId": "foobar"
+    "enableVmssFlexNodes": true,
+    "userAssignedIdentityID": "foobar"
 }`
 	spCustomVnetControlPlaneCloudConfig = `{
     "cloud": "AzurePublicCloud",
@@ -571,9 +654,11 @@ const (
     "subnetName": "foo-node-subnet",
     "routeTableName": "foo-node-routetable",
     "loadBalancerSku": "Standard",
+    "loadBalancerName": "",
     "maximumLoadBalancerRuleCount": 250,
     "useManagedIdentityExtension": false,
-    "useInstanceMetadata": true
+    "useInstanceMetadata": true,
+    "enableVmssFlexNodes": true
 }`
 	spCustomVnetWorkerNodeCloudConfig = `{
     "cloud": "AzurePublicCloud",
@@ -591,9 +676,11 @@ const (
     "subnetName": "foo-node-subnet",
     "routeTableName": "foo-node-routetable",
     "loadBalancerSku": "Standard",
+    "loadBalancerName": "",
     "maximumLoadBalancerRuleCount": 250,
     "useManagedIdentityExtension": false,
-    "useInstanceMetadata": true
+    "useInstanceMetadata": true,
+    "enableVmssFlexNodes": true
 }`
 	rateLimitsControlPlaneCloudConfig = `{
     "cloud": "AzurePublicCloud",
@@ -611,9 +698,11 @@ const (
     "subnetName": "foo-node-subnet",
     "routeTableName": "foo-node-routetable",
     "loadBalancerSku": "Standard",
+    "loadBalancerName": "",
     "maximumLoadBalancerRuleCount": 250,
     "useManagedIdentityExtension": false,
     "useInstanceMetadata": true,
+    "enableVmssFlexNodes": true,
     "cloudProviderRateLimit": true,
     "cloudProviderRateLimitQPS": 1.2,
     "loadBalancerRateLimit": {
@@ -636,9 +725,11 @@ const (
     "subnetName": "foo-node-subnet",
     "routeTableName": "foo-node-routetable",
     "loadBalancerSku": "Standard",
+    "loadBalancerName": "",
     "maximumLoadBalancerRuleCount": 250,
     "useManagedIdentityExtension": false,
     "useInstanceMetadata": true,
+    "enableVmssFlexNodes": true,
     "cloudProviderRateLimit": true,
     "cloudProviderRateLimitQPS": 1.2,
     "loadBalancerRateLimit": {
@@ -661,13 +752,933 @@ const (
     "subnetName": "foo-node-subnet",
     "routeTableName": "foo-node-routetable",
     "loadBalancerSku": "Standard",
+    "loadBalancerName": "",
     "maximumLoadBalancerRuleCount": 250,
     "useManagedIdentityExtension": false,
     "useInstanceMetadata": true,
+    "enableVmssFlexNodes": true,
     "cloudProviderBackoff": true,
     "cloudProviderBackoffRetries": 1,
     "cloudProviderBackoffExponent": 1.2000000000000002,
     "cloudProviderBackoffDuration": 60,
     "cloudProviderBackoffJitter": 1.2000000000000002
 }`
+	vmssCloudConfig = `{
+    "cloud": "AzurePublicCloud",
+    "tenantId": "fooTenant",
+    "subscriptionId": "baz",
+    "aadClientId": "fooClient",
+    "aadClientSecret": "fooSecret",
+    "resourceGroup": "bar",
+    "securityGroupName": "foo-node-nsg",
+    "securityGroupResourceGroup": "bar",
+    "location": "bar",
+    "vmType": "vmss",
+    "vnetName": "foo-vnet",
+    "vnetResourceGroup": "bar",
+    "subnetName": "foo-node-subnet",
+    "routeTableName": "foo-node-routetable",
+    "loadBalancerSku": "Standard",
+    "loadBalancerName": "",
+    "maximumLoadBalancerRuleCount": 250,
+    "useManagedIdentityExtension": false,
+    "useInstanceMetadata": true,
+    "enableVmssFlexNodes": true
+}`
 )
+
+func Test_clusterIdentityFinalizer(t *testing.T) {
+	type args struct {
+		prefix           string
+		clusterNamespace string
+		clusterName      string
+	}
+	tests := []struct {
+		name string
+		args args
+		want string
+	}{
+		{
+			name: "cluster identity finalizer should be deterministic",
+			args: args{
+				prefix:           infrav1.ClusterFinalizer,
+				clusterNamespace: "foo",
+				clusterName:      "bar",
+			},
+			want: "azurecluster.infrastructure.cluster.x-k8s.io/48998dbcd8fb929369c78981cbfb6f26145ea0412e6e05a1423941a6",
+		},
+		{
+			name: "long cluster name and namespace",
+			args: args{
+				prefix:           infrav1.ClusterFinalizer,
+				clusterNamespace: "this-is-a-very-very-very-very-very-very-very-very-very-long-namespace-name",
+				clusterName:      "this-is-a-very-very-very-very-very-very-very-very-very-long-cluster-name",
+			},
+			want: "azurecluster.infrastructure.cluster.x-k8s.io/557d064144d2b495db694dedc53c9a1e9bd8575bdf06b5b151972614",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := clusterIdentityFinalizer(tt.args.prefix, tt.args.clusterNamespace, tt.args.clusterName)
+			if got != tt.want {
+				t.Errorf("clusterIdentityFinalizer() = %v, want %v", got, tt.want)
+			}
+			key := strings.Split(got, "/")[1]
+			if len(key) > 63 {
+				t.Errorf("clusterIdentityFinalizer() name %v length = %v should be less than 63 characters", key, len(key))
+			}
+		})
+	}
+}
+
+func Test_deprecatedClusterIdentityFinalizer(t *testing.T) {
+	type args struct {
+		prefix           string
+		clusterNamespace string
+		clusterName      string
+	}
+	tests := []struct {
+		name string
+		args args
+		want string
+	}{
+		{
+			name: "cluster identity finalizer should be deterministic",
+			args: args{
+				prefix:           infrav1.ClusterFinalizer,
+				clusterNamespace: "foo",
+				clusterName:      "bar",
+			},
+			want: "azurecluster.infrastructure.cluster.x-k8s.io/foo-bar",
+		},
+		{
+			name: "long cluster name and namespace",
+			args: args{
+				prefix:           infrav1.ClusterFinalizer,
+				clusterNamespace: "this-is-a-very-very-very-very-very-very-very-very-very-long-namespace-name",
+				clusterName:      "this-is-a-very-very-very-very-very-very-very-very-very-long-cluster-name",
+			},
+			want: "azurecluster.infrastructure.cluster.x-k8s.io/this-is-a-very-very-very-very-very-very-very-very-very-long-namespace-name-this-is-a-very-very-very-very-very-very-very-very-very-long-cluster-name",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := deprecatedClusterIdentityFinalizer(tt.args.prefix, tt.args.clusterNamespace, tt.args.clusterName); got != tt.want {
+				t.Errorf("deprecatedClusterIdentityFinalizer() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAzureManagedClusterToAzureManagedMachinePoolsMapper(t *testing.T) {
+	g := NewWithT(t)
+	scheme, err := newScheme()
+	g.Expect(err).NotTo(HaveOccurred())
+	initObjects := []runtime.Object{
+		newCluster(clusterName),
+		// Create two Machines with an infrastructure ref and one without.
+		newManagedMachinePoolInfraReference(clusterName, "my-mmp-0"),
+		newManagedMachinePoolInfraReference(clusterName, "my-mmp-1"),
+		newManagedMachinePoolInfraReference(clusterName, "my-mmp-2"),
+		newMachinePool(clusterName, "my-machine-2"),
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(initObjects...).Build()
+
+	sink := mock_log.NewMockLogSink(gomock.NewController(t))
+	sink.EXPECT().Init(logr.RuntimeInfo{CallDepth: 1})
+	sink.EXPECT().Enabled(4).Return(true)
+	sink.EXPECT().WithValues("AzureManagedCluster", "my-cluster", "Namespace", "default").Return(sink)
+	sink.EXPECT().Info(4, "gk does not match", "gk", gomock.Any(), "infraGK", gomock.Any())
+	mapper, err := AzureManagedClusterToAzureManagedMachinePoolsMapper(t.Context(), fakeClient, scheme, logr.New(sink))
+	g.Expect(err).NotTo(HaveOccurred())
+
+	requests := mapper(t.Context(), &infrav1.AzureManagedCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      clusterName,
+			Namespace: "default",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					Name:       clusterName,
+					Kind:       "Cluster",
+					APIVersion: clusterv1.GroupVersion.String(),
+				},
+			},
+		},
+	})
+	g.Expect(requests).To(ConsistOf([]reconcile.Request{
+		{
+			NamespacedName: types.NamespacedName{
+				Name:      "azuremy-mmp-0",
+				Namespace: "default",
+			},
+		},
+		{
+			NamespacedName: types.NamespacedName{
+				Name:      "azuremy-mmp-1",
+				Namespace: "default",
+			},
+		},
+		{
+			NamespacedName: types.NamespacedName{
+				Name:      "azuremy-mmp-2",
+				Namespace: "default",
+			},
+		},
+	}))
+}
+
+func TestAzureManagedControlPlaneToAzureManagedMachinePoolsMapper(t *testing.T) {
+	g := NewWithT(t)
+	scheme, err := newScheme()
+	g.Expect(err).NotTo(HaveOccurred())
+	cluster := newCluster("my-cluster")
+	cluster.Spec.ControlPlaneRef = clusterv1.ContractVersionedObjectReference{
+		APIGroup: infrav1.GroupVersion.Group,
+		Kind:     infrav1.AzureManagedControlPlaneKind,
+		Name:     cpName,
+	}
+	initObjects := []runtime.Object{
+		cluster,
+		newAzureManagedControlPlane(cpName),
+		// Create two Machines with an infrastructure ref and one without.
+		newManagedMachinePoolInfraReference(clusterName, "my-mmp-0"),
+		newManagedMachinePoolInfraReference(clusterName, "my-mmp-1"),
+		newManagedMachinePoolInfraReference(clusterName, "my-mmp-2"),
+		newMachinePool(clusterName, "my-machine-2"),
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(initObjects...).Build()
+
+	sink := mock_log.NewMockLogSink(gomock.NewController(t))
+	sink.EXPECT().Init(logr.RuntimeInfo{CallDepth: 1})
+	sink.EXPECT().Enabled(4).Return(true)
+	sink.EXPECT().WithValues("AzureManagedControlPlane", cpName, "Namespace", cluster.Namespace).Return(sink)
+	sink.EXPECT().Info(4, "gk does not match", "gk", gomock.Any(), "infraGK", gomock.Any())
+	mapper, err := AzureManagedControlPlaneToAzureManagedMachinePoolsMapper(t.Context(), fakeClient, scheme, logr.New(sink))
+	g.Expect(err).NotTo(HaveOccurred())
+
+	requests := mapper(t.Context(), &infrav1.AzureManagedControlPlane{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cpName,
+			Namespace: cluster.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					Name:       cluster.Name,
+					Kind:       "Cluster",
+					APIVersion: clusterv1.GroupVersion.String(),
+				},
+			},
+		},
+	})
+	g.Expect(requests).To(ConsistOf([]reconcile.Request{
+		{
+			NamespacedName: types.NamespacedName{
+				Name:      "azuremy-mmp-0",
+				Namespace: "default",
+			},
+		},
+		{
+			NamespacedName: types.NamespacedName{
+				Name:      "azuremy-mmp-1",
+				Namespace: "default",
+			},
+		},
+		{
+			NamespacedName: types.NamespacedName{
+				Name:      "azuremy-mmp-2",
+				Namespace: "default",
+			},
+		},
+	}))
+}
+
+func TestMachinePoolToAzureManagedControlPlaneMapFuncSuccess(t *testing.T) {
+	g := NewWithT(t)
+	scheme, err := newScheme()
+	g.Expect(err).NotTo(HaveOccurred())
+	cluster := newCluster(clusterName)
+	controlPlane := newAzureManagedControlPlane(cpName)
+	cluster.Spec.ControlPlaneRef = clusterv1.ContractVersionedObjectReference{
+		APIGroup: infrav1.GroupVersion.Group,
+		Kind:     infrav1.AzureManagedControlPlaneKind,
+		Name:     cpName,
+	}
+
+	managedMachinePool0 := newManagedMachinePoolInfraReference(clusterName, "my-mmp-0")
+	azureManagedMachinePool0 := newAzureManagedMachinePool(clusterName, "azuremy-mmp-0", "System")
+	managedMachinePool0.Spec.ClusterName = clusterName
+
+	managedMachinePool1 := newManagedMachinePoolInfraReference(clusterName, "my-mmp-1")
+	azureManagedMachinePool1 := newAzureManagedMachinePool(clusterName, "azuremy-mmp-1", "User")
+	managedMachinePool1.Spec.ClusterName = clusterName
+
+	initObjects := []runtime.Object{
+		cluster,
+		controlPlane,
+		managedMachinePool0,
+		azureManagedMachinePool0,
+		// Create two Machines with an infrastructure ref and one without.
+		managedMachinePool1,
+		azureManagedMachinePool1,
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(initObjects...).Build()
+
+	sink := mock_log.NewMockLogSink(gomock.NewController(t))
+	sink.EXPECT().Init(logr.RuntimeInfo{CallDepth: 1})
+	mapper := MachinePoolToAzureManagedControlPlaneMapFunc(t.Context(), fakeClient, infrav1.GroupVersion.WithKind(infrav1.AzureManagedControlPlaneKind), logr.New(sink))
+
+	// system pool should trigger
+	requests := mapper(t.Context(), newManagedMachinePoolInfraReference(clusterName, "my-mmp-0"))
+	g.Expect(requests).To(ConsistOf([]reconcile.Request{
+		{
+			NamespacedName: types.NamespacedName{
+				Name:      "my-managed-cp",
+				Namespace: "default",
+			},
+		},
+	}))
+
+	// any other pool should not trigger
+	requests = mapper(t.Context(), newManagedMachinePoolInfraReference(clusterName, "my-mmp-1"))
+	g.Expect(requests).To(BeNil())
+}
+
+func TestMachinePoolToAzureManagedControlPlaneMapFuncFailure(t *testing.T) {
+	g := NewWithT(t)
+	scheme, err := newScheme()
+	g.Expect(err).NotTo(HaveOccurred())
+	cluster := newCluster(clusterName)
+	cluster.Spec.ControlPlaneRef = clusterv1.ContractVersionedObjectReference{
+		APIGroup: infrav1.GroupVersion.Group,
+		Kind:     infrav1.AzureManagedControlPlaneKind,
+		Name:     cpName,
+	}
+	managedMachinePool := newManagedMachinePoolInfraReference(clusterName, "my-mmp-0")
+	managedMachinePool.Spec.ClusterName = clusterName
+	initObjects := []runtime.Object{
+		cluster,
+		managedMachinePool,
+		// Create two Machines with an infrastructure ref and one without.
+		newManagedMachinePoolInfraReference(clusterName, "my-mmp-1"),
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(initObjects...).Build()
+
+	sink := mock_log.NewMockLogSink(gomock.NewController(t))
+	sink.EXPECT().Init(logr.RuntimeInfo{CallDepth: 1})
+	sink.EXPECT().Error(gomock.Any(), "failed to fetch default pool reference")
+	sink.EXPECT().Error(gomock.Any(), "failed to fetch default pool reference") // twice because we are testing two calls
+
+	mapper := MachinePoolToAzureManagedControlPlaneMapFunc(t.Context(), fakeClient, infrav1.GroupVersion.WithKind(infrav1.AzureManagedControlPlaneKind), logr.New(sink))
+
+	// default pool should trigger if owned cluster could not be fetched
+	requests := mapper(t.Context(), newManagedMachinePoolInfraReference(clusterName, "my-mmp-0"))
+	g.Expect(requests).To(ConsistOf([]reconcile.Request{
+		{
+			NamespacedName: types.NamespacedName{
+				Name:      "my-managed-cp",
+				Namespace: "default",
+			},
+		},
+	}))
+
+	// any other pool should also trigger if owned cluster could not be fetched
+	requests = mapper(t.Context(), newManagedMachinePoolInfraReference(clusterName, "my-mmp-1"))
+	g.Expect(requests).To(ConsistOf([]reconcile.Request{
+		{
+			NamespacedName: types.NamespacedName{
+				Name:      "my-managed-cp",
+				Namespace: "default",
+			},
+		},
+	}))
+}
+
+func TestAzureManagedClusterToAzureManagedControlPlaneMapper(t *testing.T) {
+	g := NewWithT(t)
+	scheme, err := newScheme()
+	g.Expect(err).NotTo(HaveOccurred())
+	cluster := newCluster("my-cluster")
+	cluster.Spec.ControlPlaneRef = clusterv1.ContractVersionedObjectReference{
+		APIGroup: infrav1.GroupVersion.Group,
+		Kind:     infrav1.AzureManagedControlPlaneKind,
+		Name:     cpName,
+	}
+
+	initObjects := []runtime.Object{
+		cluster,
+		newAzureManagedControlPlane(cpName),
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(initObjects...).Build()
+
+	sink := mock_log.NewMockLogSink(gomock.NewController(t))
+	sink.EXPECT().Init(logr.RuntimeInfo{CallDepth: 1})
+	sink.EXPECT().WithValues("AzureManagedCluster", "az-"+cluster.Name, "Namespace", "default")
+
+	mapper, err := AzureManagedClusterToAzureManagedControlPlaneMapper(t.Context(), fakeClient, logr.New(sink))
+	g.Expect(err).NotTo(HaveOccurred())
+	requests := mapper(t.Context(), &infrav1.AzureManagedCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "az-" + cluster.Name,
+			Namespace: "default",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					Name:       cluster.Name,
+					Kind:       "Cluster",
+					APIVersion: clusterv1.GroupVersion.String(),
+				},
+			},
+		},
+	})
+	g.Expect(requests).To(HaveLen(1))
+	g.Expect(requests).To(Equal([]reconcile.Request{
+		{
+			NamespacedName: types.NamespacedName{
+				Name:      cpName,
+				Namespace: cluster.Namespace,
+			},
+		},
+	}))
+}
+
+func TestAzureManagedControlPlaneToAzureManagedClusterMapper(t *testing.T) {
+	g := NewWithT(t)
+	scheme, err := newScheme()
+	g.Expect(err).NotTo(HaveOccurred())
+	cluster := newCluster("my-cluster")
+	azManagedCluster := &infrav1.AzureManagedCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "az-" + cluster.Name,
+			Namespace: "default",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					Name:       cluster.Name,
+					Kind:       "Cluster",
+					APIVersion: clusterv1.GroupVersion.String(),
+				},
+			},
+		},
+	}
+
+	cluster.Spec.ControlPlaneRef = clusterv1.ContractVersionedObjectReference{
+		APIGroup: infrav1.GroupVersion.Group,
+		Kind:     infrav1.AzureManagedControlPlaneKind,
+		Name:     cpName,
+	}
+	cluster.Spec.InfrastructureRef = clusterv1.ContractVersionedObjectReference{
+		APIGroup: infrav1.GroupVersion.Group,
+		Kind:     infrav1.AzureManagedClusterKind,
+		Name:     azManagedCluster.Name,
+	}
+
+	initObjects := []runtime.Object{
+		cluster,
+		newAzureManagedControlPlane(cpName),
+		azManagedCluster,
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(initObjects...).Build()
+
+	sink := mock_log.NewMockLogSink(gomock.NewController(t))
+	sink.EXPECT().Init(logr.RuntimeInfo{CallDepth: 1})
+	sink.EXPECT().WithValues("AzureManagedControlPlane", cpName, "Namespace", cluster.Namespace)
+
+	mapper, err := AzureManagedControlPlaneToAzureManagedClusterMapper(t.Context(), fakeClient, logr.New(sink))
+	g.Expect(err).NotTo(HaveOccurred())
+	requests := mapper(t.Context(), &infrav1.AzureManagedControlPlane{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cpName,
+			Namespace: cluster.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					Name:       cluster.Name,
+					Kind:       "Cluster",
+					APIVersion: clusterv1.GroupVersion.String(),
+				},
+			},
+		},
+	})
+	g.Expect(requests).To(HaveLen(1))
+	g.Expect(requests).To(Equal([]reconcile.Request{
+		{
+			NamespacedName: types.NamespacedName{
+				Name:      azManagedCluster.Name,
+				Namespace: azManagedCluster.Namespace,
+			},
+		},
+	}))
+}
+
+func newAzureManagedControlPlane(cpName string) *infrav1.AzureManagedControlPlane {
+	return &infrav1.AzureManagedControlPlane{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cpName,
+			Namespace: "default",
+		},
+	}
+}
+
+func newManagedMachinePoolInfraReference(clusterName, poolName string) *clusterv1.MachinePool {
+	m := newMachinePool(clusterName, poolName)
+	m.Spec.ClusterName = clusterName
+	m.Spec.Template.Spec.InfrastructureRef = clusterv1.ContractVersionedObjectReference{
+		Kind:     "AzureManagedMachinePool",
+		Name:     "azure" + poolName,
+		APIGroup: infrav1.GroupVersion.Group,
+	}
+	return m
+}
+
+func newAzureManagedMachinePool(clusterName, poolName, mode string) *infrav1.AzureManagedMachinePool {
+	var cpuManagerPolicyStatic = infrav1.CPUManagerPolicyStatic
+	var topologyManagerPolicy = infrav1.TopologyManagerPolicyBestEffort
+	var transparentHugePageDefragMAdvise = infrav1.TransparentHugePageOptionMadvise
+	var transparentHugePageEnabledAlways = infrav1.TransparentHugePageOptionAlways
+	return &infrav1.AzureManagedMachinePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{
+				clusterv1.ClusterNameLabel: clusterName,
+			},
+			Name:      poolName,
+			Namespace: "default",
+		},
+		Spec: infrav1.AzureManagedMachinePoolSpec{
+			AzureManagedMachinePoolClassSpec: infrav1.AzureManagedMachinePoolClassSpec{
+				Mode:         mode,
+				SKU:          "Standard_B2s",
+				OSDiskSizeGB: ptr.To(512),
+				KubeletConfig: &infrav1.KubeletConfig{
+					CPUManagerPolicy:      &cpuManagerPolicyStatic,
+					TopologyManagerPolicy: &topologyManagerPolicy,
+				},
+				LinuxOSConfig: &infrav1.LinuxOSConfig{
+					TransparentHugePageDefrag:  &transparentHugePageDefragMAdvise,
+					TransparentHugePageEnabled: &transparentHugePageEnabledAlways,
+				},
+			},
+		},
+	}
+}
+
+func newMachinePool(clusterName, poolName string) *clusterv1.MachinePool {
+	return &clusterv1.MachinePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{
+				clusterv1.ClusterNameLabel: clusterName,
+			},
+			Name:      poolName,
+			Namespace: "default",
+		},
+		Spec: clusterv1.MachinePoolSpec{
+			Replicas: ptr.To[int32](2),
+		},
+	}
+}
+
+func newManagedMachinePoolWithInfrastructureRef(clusterName, poolName string) *clusterv1.MachinePool {
+	m := newMachinePool(clusterName, poolName)
+	m.Spec.Template.Spec.InfrastructureRef = clusterv1.ContractVersionedObjectReference{
+		Kind:     "AzureManagedMachinePool",
+		Name:     "azure" + poolName,
+		APIGroup: infrav1.GroupVersion.Group,
+	}
+	return m
+}
+
+func Test_ManagedMachinePoolToInfrastructureMapFunc(t *testing.T) {
+	cases := []struct {
+		Name             string
+		Setup            func(logMock *mock_log.MockLogSink)
+		MapObjectFactory func(*GomegaWithT) client.Object
+		Expect           func(*GomegaWithT, []reconcile.Request)
+	}{
+		{
+			Name: "MachinePoolToAzureManagedMachinePool",
+			MapObjectFactory: func(g *GomegaWithT) client.Object {
+				return newManagedMachinePoolWithInfrastructureRef("azureManagedCluster", "ManagedMachinePool")
+			},
+			Setup: func(logMock *mock_log.MockLogSink) {
+				logMock.EXPECT().Init(logr.RuntimeInfo{CallDepth: 1})
+			},
+			Expect: func(g *GomegaWithT, reqs []reconcile.Request) {
+				g.Expect(reqs).To(HaveLen(1))
+				g.Expect(reqs[0]).To(Equal(reconcile.Request{
+					NamespacedName: types.NamespacedName{
+						Name:      "azureManagedMachinePool",
+						Namespace: "default",
+					},
+				}))
+			},
+		},
+		{
+			Name: "MachinePoolWithoutMatchingInfraRef",
+			MapObjectFactory: func(g *GomegaWithT) client.Object {
+				return newMachinePool("azureManagedCluster", "machinePool")
+			},
+			Setup: func(logMock *mock_log.MockLogSink) {
+				ampGK := infrav1.GroupVersion.WithKind("AzureManagedMachinePool").GroupKind()
+				logMock.EXPECT().Init(logr.RuntimeInfo{CallDepth: 1})
+				logMock.EXPECT().Enabled(4).Return(true)
+				logMock.EXPECT().Info(4, "gk does not match", "gk", ampGK, "infraGK", gomock.Any())
+			},
+			Expect: func(g *GomegaWithT, reqs []reconcile.Request) {
+				g.Expect(reqs).To(BeEmpty())
+			},
+		},
+		{
+			Name: "NotAMachinePool",
+			MapObjectFactory: func(g *GomegaWithT) client.Object {
+				return newCluster("azureManagedCluster")
+			},
+			Setup: func(logMock *mock_log.MockLogSink) {
+				logMock.EXPECT().Init(logr.RuntimeInfo{CallDepth: 1})
+				logMock.EXPECT().Enabled(4).Return(true)
+				logMock.EXPECT().Info(4, "attempt to map incorrect type", "type", "*v1beta2.Cluster")
+			},
+			Expect: func(g *GomegaWithT, reqs []reconcile.Request) {
+				g.Expect(reqs).To(BeEmpty())
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.Name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			mockCtrl := gomock.NewController(t)
+			defer mockCtrl.Finish()
+
+			sink := mock_log.NewMockLogSink(mockCtrl)
+			if c.Setup != nil {
+				c.Setup(sink)
+			}
+			f := MachinePoolToInfrastructureMapFunc(infrav1.GroupVersion.WithKind("AzureManagedMachinePool"), logr.New(sink))
+			reqs := f(t.Context(), c.MapObjectFactory(g))
+			c.Expect(g, reqs)
+		})
+	}
+}
+
+func TestAddBlockMoveAnnotation(t *testing.T) {
+	tests := []struct {
+		name                string
+		annotations         map[string]string
+		expectedAnnotations map[string]string
+		expected            bool
+	}{
+		{
+			name:                "annotation does not exist",
+			annotations:         nil,
+			expectedAnnotations: map[string]string{clusterctlv1.BlockMoveAnnotation: "true"},
+			expected:            true,
+		},
+		{
+			name:                "annotation already exists",
+			annotations:         map[string]string{clusterctlv1.BlockMoveAnnotation: "this value might be different but it doesn't matter"},
+			expectedAnnotations: map[string]string{clusterctlv1.BlockMoveAnnotation: "this value might be different but it doesn't matter"},
+			expected:            false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			obj := &metav1.ObjectMeta{
+				Annotations: test.annotations,
+			}
+			actual := AddBlockMoveAnnotation(obj)
+			if test.expected != actual {
+				t.Errorf("expected %v, got %v", test.expected, actual)
+			}
+			if !maps.Equal(test.expectedAnnotations, obj.GetAnnotations()) {
+				t.Errorf("expected %v, got %v", test.expectedAnnotations, obj.GetAnnotations())
+			}
+		})
+	}
+}
+
+func TestRemoveBlockMoveAnnotation(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		expected    map[string]string
+	}{
+		{
+			name:        "nil",
+			annotations: nil,
+			expected:    nil,
+		},
+		{
+			name:        "annotation not present",
+			annotations: map[string]string{"another": "annotation"},
+			expected:    map[string]string{"another": "annotation"},
+		},
+		{
+			name: "annotation present",
+			annotations: map[string]string{
+				clusterctlv1.BlockMoveAnnotation: "any value",
+				"another":                        "annotation",
+			},
+			expected: map[string]string{
+				"another": "annotation",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			obj := &metav1.ObjectMeta{
+				Annotations: maps.Clone(test.annotations),
+			}
+			RemoveBlockMoveAnnotation(obj)
+			actual := obj.GetAnnotations()
+			if !maps.Equal(test.expected, actual) {
+				t.Errorf("expected %v, got %v", test.expected, actual)
+			}
+		})
+	}
+}
+
+func TestIsUsingSPCredentials(t *testing.T) {
+	tests := []struct {
+		name         string
+		azureCluster *infrav1.AzureCluster
+		identity     *infrav1.AzureClusterIdentity
+		expected     bool
+	}{
+		{
+			name: "ServicePrincipal returns true",
+			azureCluster: &infrav1.AzureCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "default"},
+				Spec: infrav1.AzureClusterSpec{
+					AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+						IdentityRef: &corev1.ObjectReference{Name: "identity", Namespace: "default"},
+					},
+				},
+			},
+			identity: &infrav1.AzureClusterIdentity{
+				ObjectMeta: metav1.ObjectMeta{Name: "identity", Namespace: "default"},
+				Spec:       infrav1.AzureClusterIdentitySpec{Type: infrav1.ServicePrincipal},
+			},
+			expected: true,
+		},
+		{
+			name: "ManualServicePrincipal returns true",
+			azureCluster: &infrav1.AzureCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "default"},
+				Spec: infrav1.AzureClusterSpec{
+					AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+						IdentityRef: &corev1.ObjectReference{Name: "identity", Namespace: "default"},
+					},
+				},
+			},
+			identity: &infrav1.AzureClusterIdentity{
+				ObjectMeta: metav1.ObjectMeta{Name: "identity", Namespace: "default"},
+				Spec:       infrav1.AzureClusterIdentitySpec{Type: infrav1.ManualServicePrincipal},
+			},
+			expected: true,
+		},
+		{
+			name: "ServicePrincipalCertificate returns true",
+			azureCluster: &infrav1.AzureCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "default"},
+				Spec: infrav1.AzureClusterSpec{
+					AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+						IdentityRef: &corev1.ObjectReference{Name: "identity", Namespace: "default"},
+					},
+				},
+			},
+			identity: &infrav1.AzureClusterIdentity{
+				ObjectMeta: metav1.ObjectMeta{Name: "identity", Namespace: "default"},
+				Spec:       infrav1.AzureClusterIdentitySpec{Type: infrav1.ServicePrincipalCertificate},
+			},
+			expected: true,
+		},
+		{
+			name: "WorkloadIdentity returns false",
+			azureCluster: &infrav1.AzureCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "default"},
+				Spec: infrav1.AzureClusterSpec{
+					AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+						IdentityRef: &corev1.ObjectReference{Name: "identity", Namespace: "default"},
+					},
+				},
+			},
+			identity: &infrav1.AzureClusterIdentity{
+				ObjectMeta: metav1.ObjectMeta{Name: "identity", Namespace: "default"},
+				Spec:       infrav1.AzureClusterIdentitySpec{Type: infrav1.WorkloadIdentity},
+			},
+			expected: false,
+		},
+		{
+			name: "UserAssignedMSI returns false",
+			azureCluster: &infrav1.AzureCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "default"},
+				Spec: infrav1.AzureClusterSpec{
+					AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+						IdentityRef: &corev1.ObjectReference{Name: "identity", Namespace: "default"},
+					},
+				},
+			},
+			identity: &infrav1.AzureClusterIdentity{
+				ObjectMeta: metav1.ObjectMeta{Name: "identity", Namespace: "default"},
+				Spec:       infrav1.AzureClusterIdentitySpec{Type: infrav1.UserAssignedMSI},
+			},
+			expected: false,
+		},
+		{
+			name: "UserAssignedIdentityCredential returns false",
+			azureCluster: &infrav1.AzureCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "default"},
+				Spec: infrav1.AzureClusterSpec{
+					AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+						IdentityRef: &corev1.ObjectReference{Name: "identity", Namespace: "default"},
+					},
+				},
+			},
+			identity: &infrav1.AzureClusterIdentity{
+				ObjectMeta: metav1.ObjectMeta{Name: "identity", Namespace: "default"},
+				Spec:       infrav1.AzureClusterIdentitySpec{Type: infrav1.UserAssignedIdentityCredential},
+			},
+			expected: false,
+		},
+		{
+			name: "nil IdentityRef returns false",
+			azureCluster: &infrav1.AzureCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "default"},
+				Spec:       infrav1.AzureClusterSpec{},
+			},
+			identity: nil,
+			expected: false,
+		},
+		{
+			name: "empty IdentityRef namespace falls back to cluster namespace",
+			azureCluster: &infrav1.AzureCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "my-namespace"},
+				Spec: infrav1.AzureClusterSpec{
+					AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+						IdentityRef: &corev1.ObjectReference{Name: "identity", Namespace: ""},
+					},
+				},
+			},
+			identity: &infrav1.AzureClusterIdentity{
+				ObjectMeta: metav1.ObjectMeta{Name: "identity", Namespace: "my-namespace"},
+				Spec:       infrav1.AzureClusterIdentitySpec{Type: infrav1.ServicePrincipal},
+			},
+			expected: true,
+		},
+		{
+			name: "identity not found returns false",
+			azureCluster: &infrav1.AzureCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "default"},
+				Spec: infrav1.AzureClusterSpec{
+					AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+						IdentityRef: &corev1.ObjectReference{Name: "missing-identity", Namespace: "default"},
+					},
+				},
+			},
+			identity: nil,
+			expected: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			scheme := setupScheme(g)
+
+			var initObjects []runtime.Object
+			if tc.identity != nil {
+				initObjects = append(initObjects, tc.identity)
+			}
+
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(initObjects...).Build()
+			result := isUsingSPCredentials(t.Context(), fakeClient, tc.azureCluster)
+			g.Expect(result).To(Equal(tc.expected))
+		})
+	}
+}
+
+func TestGetAzureClusterFromCluster(t *testing.T) {
+	tests := []struct {
+		name         string
+		cluster      *clusterv1.Cluster
+		azureCluster *infrav1.AzureCluster
+		expectNil    bool
+	}{
+		{
+			name: "returns AzureCluster when infraRef is AzureCluster",
+			cluster: &clusterv1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "default"},
+				Spec: clusterv1.ClusterSpec{
+					InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+						Kind:     infrav1.AzureClusterKind,
+						Name:     "azure-cluster",
+						APIGroup: infrav1.GroupVersion.Group,
+					},
+				},
+			},
+			azureCluster: &infrav1.AzureCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "azure-cluster", Namespace: "default"},
+			},
+			expectNil: false,
+		},
+		{
+			name: "returns nil when infraRef is nil",
+			cluster: &clusterv1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "default"},
+				Spec:       clusterv1.ClusterSpec{},
+			},
+			azureCluster: nil,
+			expectNil:    true,
+		},
+		{
+			name: "returns nil when infraRef is AzureManagedCluster",
+			cluster: &clusterv1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "default"},
+				Spec: clusterv1.ClusterSpec{
+					InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+						Kind:     infrav1.AzureManagedClusterKind,
+						Name:     "azure-managed-cluster",
+						APIGroup: infrav1.GroupVersion.Group,
+					},
+				},
+			},
+			azureCluster: nil,
+			expectNil:    true,
+		},
+		{
+			name: "returns nil when AzureCluster not found",
+			cluster: &clusterv1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "default"},
+				Spec: clusterv1.ClusterSpec{
+					InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+						Kind:     infrav1.AzureClusterKind,
+						Name:     "missing-cluster",
+						APIGroup: infrav1.GroupVersion.Group,
+					},
+				},
+			},
+			azureCluster: nil,
+			expectNil:    true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			scheme := setupScheme(g)
+
+			var initObjects []runtime.Object
+			if tc.azureCluster != nil {
+				initObjects = append(initObjects, tc.azureCluster)
+			}
+
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(initObjects...).Build()
+			result := getAzureClusterFromCluster(t.Context(), fakeClient, tc.cluster)
+
+			if tc.expectNil {
+				g.Expect(result).To(BeNil())
+			} else {
+				g.Expect(result).NotTo(BeNil())
+				g.Expect(result.Name).To(Equal(tc.azureCluster.Name))
+			}
+		})
+	}
+}

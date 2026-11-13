@@ -1,7 +1,10 @@
 # Netlify build instructions
 [build]
     command = "./docs/book/install-and-build.sh"
-    publish = "docs/book/book"
+    publish = "docs/book/bookout"
+
+[build.environment]
+    GO_VERSION = "1.26.x"
 
 # Standard Netlify redirects
 [[redirects]]

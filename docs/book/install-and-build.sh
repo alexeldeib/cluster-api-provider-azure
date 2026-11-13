@@ -23,7 +23,8 @@ cd "${KUBE_ROOT}" || exit 1
 
 os=$(go env GOOS)
 arch=$(go env GOARCH)
-mdBookVersion="v0.4.5"
+mdBookVersion="v0.4.40"
+genCRDAPIReferenceDocsVersion="ee012b7016522a56d9cef3ea9baed3e0cfc8ff0e"
 
 # translate arch to rust's conventions (if we can)
 if [[ ${arch} == "amd64" ]]; then
@@ -43,6 +44,7 @@ case ${os} in
         ;;
     darwin)
         target="apple-darwin"
+        arch="x86_64" # mdbook isn't packaged for arm64 darwin yet
         ;;
     linux)
         # works for linux, too
@@ -57,9 +59,24 @@ esac
 # we hardcode linux/amd64 since rust uses a different naming scheme
 echo "downloading mdBook-${mdBookVersion}-${arch}-${target}.${ext}"
 set -x
-curl -sL -o /tmp/mdbook.${ext} "https://github.com/rust-lang-nursery/mdBook/releases/download/${mdBookVersion}/mdBook-${mdBookVersion}-${arch}-${target}.${ext}"
+curl --retry 3 -sL -o /tmp/mdbook.${ext} "https://github.com/rust-lang/mdBook/releases/download/${mdBookVersion}/mdBook-${mdBookVersion}-${arch}-${target}.${ext}"
 ${cmd} /tmp/mdbook.${ext}
 chmod +x /tmp/mdbook
+
+# Generate API docs
+genCRDAPIReferenceDocsPath="/tmp/crddoc-${genCRDAPIReferenceDocsVersion}"
+genCRDAPIReferenceDocs="${genCRDAPIReferenceDocsPath}/crddoc document crds"
+(
+  cd /tmp
+  curl --retry 3 -sL -o crddoc.zip "https://github.com/theunrepentantgeek/crddoc/archive/${genCRDAPIReferenceDocsVersion}.zip"
+  unzip crddoc.zip
+  cd "crddoc-${genCRDAPIReferenceDocsVersion}"
+  go build .
+)
+
+${genCRDAPIReferenceDocs} --config "${genCRDAPIReferenceDocsPath}/docs/config/crddoc-config.yaml" --template "${genCRDAPIReferenceDocsPath}/templates" --output ./docs/book/src/reference/v1beta1-api-raw.html ./api/v1beta1
+${genCRDAPIReferenceDocs} --config "${genCRDAPIReferenceDocsPath}/docs/config/crddoc-config.yaml" --template "${genCRDAPIReferenceDocsPath}/templates" --output ./docs/book/src/reference/v1beta1-exp-api-raw.html ./exp/api/v1beta1
+${genCRDAPIReferenceDocs} --config "${genCRDAPIReferenceDocsPath}/docs/config/crddoc-config.yaml" --template "${genCRDAPIReferenceDocsPath}/templates" --output ./docs/book/src/reference/v1alpha1-api-raw.html ./api/v1alpha1
 
 # Finally build the book.
 (cd docs/book && /tmp/mdbook build)

@@ -17,11 +17,8 @@ limitations under the License.
 package controllers
 
 import (
-	"context"
-	"os"
 	"testing"
 
-	"github.com/Azure/go-autorest/autorest/azure/auth"
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,13 +26,14 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
-	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
-	infraexpv1 "sigs.k8s.io/cluster-api-provider-azure/exp/api/v1beta1"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
-	clusterexpv1 "sigs.k8s.io/cluster-api/exp/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+
+	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
+	"sigs.k8s.io/cluster-api-provider-azure/azure"
+	infrav1exp "sigs.k8s.io/cluster-api-provider-azure/exp/api/v1beta1"
 )
 
 func TestUnclonedMachinesPredicate(t *testing.T) {
@@ -52,7 +50,7 @@ func TestUnclonedMachinesPredicate(t *testing.T) {
 		"uncloned control plane node should return true": {
 			expected: true,
 			labels: map[string]string{
-				clusterv1.MachineControlPlaneLabelName: "",
+				clusterv1.MachineControlPlaneLabel: "",
 			},
 			annotations: nil,
 		},
@@ -66,7 +64,6 @@ func TestUnclonedMachinesPredicate(t *testing.T) {
 	}
 
 	for name, tc := range cases {
-		tc := tc
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			machine := &infrav1.AzureMachine{
@@ -97,10 +94,10 @@ func TestAzureJSONMachineReconciler(t *testing.T) {
 			Name: "my-cluster",
 		},
 		Spec: clusterv1.ClusterSpec{
-			InfrastructureRef: &corev1.ObjectReference{
-				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
-				Kind:       "AzureCluster",
-				Name:       "my-azure-cluster",
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				APIGroup: infrav1.GroupVersion.Group,
+				Kind:     infrav1.AzureClusterKind,
+				Name:     "my-azure-cluster",
 			},
 		},
 	}
@@ -117,12 +114,20 @@ func TestAzureJSONMachineReconciler(t *testing.T) {
 			},
 		},
 		Spec: infrav1.AzureClusterSpec{
-			SubscriptionID: "123",
+			AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+				SubscriptionID: "123",
+				IdentityRef: &corev1.ObjectReference{
+					Name:      "fake-identity",
+					Namespace: "default",
+				},
+			},
 			NetworkSpec: infrav1.NetworkSpec{
 				Subnets: infrav1.Subnets{
 					{
-						Name: "node",
-						Role: infrav1.SubnetNode,
+						SubnetClassSpec: infrav1.SubnetClassSpec{
+							Name: "node",
+							Role: infrav1.SubnetNode,
+						},
 					},
 				},
 			},
@@ -133,7 +138,7 @@ func TestAzureJSONMachineReconciler(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "my-machine",
 			Labels: map[string]string{
-				clusterv1.ClusterLabelName: "my-cluster",
+				clusterv1.ClusterNameLabel: "my-cluster",
 			},
 			OwnerReferences: []metav1.OwnerReference{
 				{
@@ -145,6 +150,18 @@ func TestAzureJSONMachineReconciler(t *testing.T) {
 		},
 	}
 
+	fakeIdentity := &infrav1.AzureClusterIdentity{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "fake-identity",
+			Namespace: "default",
+		},
+		Spec: infrav1.AzureClusterIdentitySpec{
+			Type:     infrav1.ServicePrincipal,
+			TenantID: "fake-tenantid",
+		},
+	}
+	fakeSecret := &corev1.Secret{Data: map[string][]byte{"clientSecret": []byte("fooSecret")}}
+
 	cases := map[string]struct {
 		objects []runtime.Object
 		fail    bool
@@ -155,6 +172,8 @@ func TestAzureJSONMachineReconciler(t *testing.T) {
 				cluster,
 				azureCluster,
 				azureMachine,
+				fakeIdentity,
+				fakeSecret,
 			},
 		},
 		"missing azure cluster should return error": {
@@ -165,22 +184,57 @@ func TestAzureJSONMachineReconciler(t *testing.T) {
 			fail: true,
 			err:  "azureclusters.infrastructure.cluster.x-k8s.io \"my-azure-cluster\" not found",
 		},
+		"infra ref is nil": {
+			objects: []runtime.Object{
+				&clusterv1.Cluster{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "my-cluster",
+					},
+					Spec: clusterv1.ClusterSpec{
+						InfrastructureRef: clusterv1.ContractVersionedObjectReference{},
+					},
+				},
+				azureCluster,
+				azureMachine,
+				fakeIdentity,
+				fakeSecret,
+			},
+			fail: false,
+		},
+		"infra ref is not an azure cluster": {
+			objects: []runtime.Object{
+				&clusterv1.Cluster{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "my-cluster",
+					},
+					Spec: clusterv1.ClusterSpec{
+						InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+							APIGroup: infrav1.GroupVersion.Group,
+							Kind:     "FooCluster",
+							Name:     "my-foo-cluster",
+						},
+					},
+				},
+				azureCluster,
+				azureMachine,
+				fakeIdentity,
+				fakeSecret,
+			},
+			fail: false,
+		},
 	}
-
-	os.Setenv(auth.ClientID, "fooClient")
-	os.Setenv(auth.ClientSecret, "fooSecret")
-	os.Setenv(auth.TenantID, "fooTenant")
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			client := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tc.objects...).Build()
 
 			reconciler := &AzureJSONMachineReconciler{
-				Client:   client,
-				Recorder: record.NewFakeRecorder(128),
+				Client:          client,
+				Recorder:        record.NewFakeRecorder(128),
+				CredentialCache: azure.NewCredentialCache(),
 			}
 
-			_, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+			_, err := reconciler.Reconcile(t.Context(), ctrl.Request{
 				NamespacedName: types.NamespacedName{
 					Namespace: "",
 					Name:      "my-machine",
@@ -205,11 +259,10 @@ func newScheme() (*runtime.Scheme, error) {
 		clientgoscheme.AddToScheme,
 		infrav1.AddToScheme,
 		clusterv1.AddToScheme,
-		infraexpv1.AddToScheme,
-		clusterexpv1.AddToScheme,
+		infrav1exp.AddToScheme,
+		corev1.AddToScheme,
 	}
 	for _, fn := range schemeFn {
-		fn := fn
 		if err := fn(scheme); err != nil {
 			return nil, err
 		}

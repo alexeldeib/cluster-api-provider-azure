@@ -17,7 +17,7 @@
 ###############################################################################
 
 # This script is executed by presubmit `pull-cluster-api-provider-azure-e2e`
-# To run locally, set AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_SUBSCRIPTION_ID, AZURE_TENANT_ID
+# To run locally, set AZURE_CLIENT_ID, AZURE_SUBSCRIPTION_ID, AZURE_TENANT_ID
 
 set -o errexit
 set -o nounset
@@ -26,35 +26,25 @@ set -o pipefail
 # Install kubectl
 REPO_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
 KUBECTL="${REPO_ROOT}/hack/tools/bin/kubectl"
-cd "${REPO_ROOT}" && make "${KUBECTL##*/}"
+KIND="${REPO_ROOT}/hack/tools/bin/kind"
+KUSTOMIZE="${REPO_ROOT}/hack/tools/bin/kustomize"
+make --directory="${REPO_ROOT}" "${KUBECTL##*/}" "${KIND##*/}" "${KUSTOMIZE##*/}"
+
+WORKER_MACHINE_COUNT="${WORKER_MACHINE_COUNT:-2}"
 
 # shellcheck source=hack/ensure-go.sh
 source "${REPO_ROOT}/hack/ensure-go.sh"
-# shellcheck source=hack/ensure-kind.sh
-source "${REPO_ROOT}/hack/ensure-kind.sh"
-# shellcheck source=hack/ensure-kustomize.sh
-source "${REPO_ROOT}/hack/ensure-kustomize.sh"
 # shellcheck source=hack/ensure-tags.sh
 source "${REPO_ROOT}/hack/ensure-tags.sh"
-# shellcheck source=hack/parse-prow-creds.sh
-source "${REPO_ROOT}/hack/parse-prow-creds.sh"
 # shellcheck source=hack/util.sh
 source "${REPO_ROOT}/hack/util.sh"
 
 # Verify the required Environment Variables are present.
-: "${AZURE_SUBSCRIPTION_ID:?Environment variable empty or not defined.}"
-: "${AZURE_TENANT_ID:?Environment variable empty or not defined.}"
-: "${AZURE_CLIENT_ID:?Environment variable empty or not defined.}"
-: "${AZURE_CLIENT_SECRET:?Environment variable empty or not defined.}"
+capz::util::ensure_azure_envs
 
-get_random_region() {
-    local REGIONS=("eastus" "eastus2" "northcentralus" "northeurope" "uksouth" "westeurope" "westus2")
-    echo "${REGIONS[${RANDOM} % ${#REGIONS[@]}]}"
-}
+export USE_LOCAL_KIND_REGISTRY=${USE_LOCAL_KIND_REGISTRY:-"true"}
 
-export LOCAL_ONLY=${LOCAL_ONLY:-"true"}
-
-if [[ "${LOCAL_ONLY}" == "true" ]]; then
+if [[ "${USE_LOCAL_KIND_REGISTRY}" == "true" ]]; then
   export REGISTRY="localhost:5000/ci-e2e"
 else
   : "${REGISTRY:?Environment variable empty or not defined.}"
@@ -64,37 +54,47 @@ else
     export KUBE_BUILD_CONFORMANCE="y"
     source "${REPO_ROOT}/scripts/ci-build-kubernetes.sh"
   fi
+
+  if [[ "$(capz::util::should_build_ccm)" == "true" ]]; then
+    # shellcheck source=scripts/ci-build-azure-ccm.sh
+    source "${REPO_ROOT}/scripts/ci-build-azure-ccm.sh"
+    echo "Will use the ${IMAGE_REGISTRY}/${CCM_IMAGE_NAME}:${IMAGE_TAG_CCM} cloud-controller-manager image for external cloud-provider-cluster"
+    echo "Will use the ${IMAGE_REGISTRY}/${CNM_IMAGE_NAME}:${IMAGE_TAG_CNM} cloud-node-manager image for external cloud-provider-azure cluster"
+  fi
 fi
 
 defaultTag=$(date -u '+%Y%m%d%H%M%S')
 export TAG="${defaultTag:-dev}"
 export GINKGO_NODES=1
 
-export AZURE_LOCATION="${AZURE_LOCATION:-$(get_random_region)}"
+if [ "${WORKER_MACHINE_COUNT}" -gt "10" ]; then
+    export AZURE_LOCATION="${AZURE_LOCATION:-$(capz::util::get_random_region_load)}"
+    echo "Using AZURE_LOCATION: ${AZURE_LOCATION}"
+else
+    export AZURE_LOCATION="${AZURE_LOCATION:-$(capz::util::get_random_region)}"
+    echo "Using AZURE_LOCATION: ${AZURE_LOCATION}"
+fi
+# TODO these AZURE_LOCATION_* overrides may have the effect of
+# disassociating VM regions from disks, leading to attachment failures.
+# Less likely with GPU scenarios but FYI.
+export AZURE_LOCATION_GPU="${AZURE_LOCATION_GPU:-$(capz::util::get_random_region_gpu)}"
+export AZURE_LOCATION_EDGEZONE="${AZURE_LOCATION_EDGEZONE:-$(capz::util::get_random_region_edgezone)}"
 export AZURE_CONTROL_PLANE_MACHINE_TYPE="${AZURE_CONTROL_PLANE_MACHINE_TYPE:-"Standard_D2s_v3"}"
-export AZURE_NODE_MACHINE_TYPE="${AZURE_NODE_MACHINE_TYPE:-"Standard_D2s_v3"}"
+export AZURE_NODE_MACHINE_TYPE="${AZURE_NODE_MACHINE_TYPE:-"Standard_B2s"}"
 export WINDOWS="${WINDOWS:-false}"
+export WINDOWS_SERVER_VERSION="${WINDOWS_SERVER_VERSION:-windows-2022}"
+AZWI_RESOURCE_GROUP="${AZWI_RESOURCE_GROUP:-capz-wi-$(capz::util::random_suffix)}"
+export AZWI_RESOURCE_GROUP
 
 # Generate SSH key.
-AZURE_SSH_PUBLIC_KEY_FILE=${AZURE_SSH_PUBLIC_KEY_FILE:-""}
-if [ -z "${AZURE_SSH_PUBLIC_KEY_FILE}" ]; then
-    SSH_KEY_FILE=.sshkey
-    rm -f "${SSH_KEY_FILE}" 2>/dev/null
-    ssh-keygen -t rsa -b 2048 -f "${SSH_KEY_FILE}" -N '' 1>/dev/null
-    AZURE_SSH_PUBLIC_KEY_FILE="${SSH_KEY_FILE}.pub"
-fi
-AZURE_SSH_PUBLIC_KEY_B64=$(base64 "${AZURE_SSH_PUBLIC_KEY_FILE}" | tr -d '\r\n')
-export AZURE_SSH_PUBLIC_KEY_B64
+capz::util::generate_ssh_key
 
-# Windows sets the public key via cloudbase-init which take the raw text as input
-AZURE_SSH_PUBLIC_KEY=$(< "${AZURE_SSH_PUBLIC_KEY_FILE}" tr -d '\r\n')
-export AZURE_SSH_PUBLIC_KEY
-
-cleanup() {
+capz::ci-conformance::cleanup() {
     "${REPO_ROOT}/hack/log/redact.sh" || true
+    make test-e2e-run-cleanup || true
 }
 
-trap cleanup EXIT
+trap capz::ci-conformance::cleanup EXIT
 
 if [[ "${WINDOWS}" == "true" ]]; then
   make test-windows-upstream

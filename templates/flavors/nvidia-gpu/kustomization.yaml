@@ -1,24 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
 namespace: default
 resources:
-  - ../base
-  - ../../azure-cluster-identity
-  - machine-deployment.yaml
-  - gpu-operator-resources-set.yaml
+- ../base
+- ../../azure-cluster-identity
+- machine-deployment.yaml
 
-patchesStrategicMerge:
-  - patches/cluster.yaml
-  - ../../azure-cluster-identity/azurecluster-identity-ref.yaml  
 
-configMapGenerator:
-  - name: nvidia-clusterpolicy-crd
-    files:
-      - clusterpolicy-crd.yaml
-  - name: nvidia-gpu-operator-components
-    files:
-      - gpu-operator-components.yaml
 generatorOptions:
+  annotations:
+    note: generated
   disableNameSuffixHash: true
   labels:
     type: generated
-  annotations:
-    note: generated
+patches:
+- path: ../../azure-cluster-identity/azurecluster-identity-ref.yaml
+
+sortOptions:
+  order: fifo

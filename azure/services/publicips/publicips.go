@@ -18,91 +18,68 @@ package publicips
 
 import (
 	"context"
-	"strings"
 
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-02-01/network"
-	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v4"
 	"github.com/pkg/errors"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/converters"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/async"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/tags"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
 )
 
+const serviceName = "publicips"
+
 // PublicIPScope defines the scope interface for a public IP service.
 type PublicIPScope interface {
+	azure.Authorizer
+	azure.AsyncStatusUpdater
 	azure.ClusterDescriber
-	PublicIPSpecs() []azure.PublicIPSpec
+	PublicIPSpecs() []azure.ResourceSpecGetter
 }
 
 // Service provides operations on Azure resources.
 type Service struct {
 	Scope PublicIPScope
-	Client
+	async.Reconciler
+	async.Getter
+	async.TagsGetter
 }
 
 // New creates a new service.
-func New(scope PublicIPScope) *Service {
-	return &Service{
-		Scope:  scope,
-		Client: NewClient(scope),
+func New(scope PublicIPScope) (*Service, error) {
+	client, err := NewClient(scope, scope.DefaultedAzureCallTimeout())
+	if err != nil {
+		return nil, err
 	}
+	tagsClient, err := tags.NewClient(scope)
+	if err != nil {
+		return nil, err
+	}
+	return &Service{
+		Scope:      scope,
+		Getter:     client,
+		TagsGetter: tagsClient,
+		Reconciler: async.New[armnetwork.PublicIPAddressesClientCreateOrUpdateResponse, armnetwork.PublicIPAddressesClientDeleteResponse](scope, client, client),
+	}, nil
 }
 
-// Reconcile gets/creates/updates a public ip.
+// Name returns the service name.
+func (s *Service) Name() string {
+	return serviceName
+}
+
+// Reconcile idempotently creates or updates a public IP.
 func (s *Service) Reconcile(ctx context.Context) error {
-	ctx, log, done := tele.StartSpanWithLogger(ctx, "publicips.Service.Reconcile")
+	ctx, _, done := tele.StartSpanWithLogger(ctx, "publicips.Service.Reconcile")
 	defer done()
 
-	for _, ip := range s.Scope.PublicIPSpecs() {
-		log.V(2).Info("creating public IP", "public ip", ip.Name)
+	ctx, cancel := context.WithTimeout(ctx, s.Scope.DefaultedAzureServiceReconcileTimeout())
+	defer cancel()
 
-		// only set DNS properties if there is a DNS name specified
-		addressVersion := network.IPVersionIPv4
-		if ip.IsIPv6 {
-			addressVersion = network.IPVersionIPv6
-		}
-
-		// only set DNS properties if there is a DNS name specified
-		var dnsSettings *network.PublicIPAddressDNSSettings
-		if ip.DNSName != "" {
-			dnsSettings = &network.PublicIPAddressDNSSettings{
-				DomainNameLabel: to.StringPtr(strings.Split(ip.DNSName, ".")[0]),
-				Fqdn:            to.StringPtr(ip.DNSName),
-			}
-		}
-
-		err := s.Client.CreateOrUpdate(
-			ctx,
-			s.Scope.ResourceGroup(),
-			ip.Name,
-			network.PublicIPAddress{
-				Tags: converters.TagsToMap(infrav1.Build(infrav1.BuildParams{
-					ClusterName: s.Scope.ClusterName(),
-					Lifecycle:   infrav1.ResourceLifecycleOwned,
-					Name:        to.StringPtr(ip.Name),
-					Additional:  s.Scope.AdditionalTags(),
-				})),
-				Sku:      &network.PublicIPAddressSku{Name: network.PublicIPAddressSkuNameStandard},
-				Name:     to.StringPtr(ip.Name),
-				Location: to.StringPtr(s.Scope.Location()),
-				PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
-					PublicIPAddressVersion:   addressVersion,
-					PublicIPAllocationMethod: network.IPAllocationMethodStatic,
-					DNSSettings:              dnsSettings,
-				},
-				Zones: to.StringSlicePtr(s.Scope.FailureDomains()),
-			},
-		)
-
-		if err != nil {
-			return errors.Wrap(err, "cannot create public IP")
-		}
-
-		log.V(2).Info("successfully created public IP", "public ip", ip.Name)
-	}
-
-	return nil
+	return azure.ReconcileAll(ctx, s.Reconciler, s.Scope, s.Scope.PublicIPSpecs(), serviceName, infrav1.PublicIPsReadyCondition)
 }
 
 // Delete deletes the public IP with the provided scope.
@@ -110,42 +87,68 @@ func (s *Service) Delete(ctx context.Context) error {
 	ctx, log, done := tele.StartSpanWithLogger(ctx, "publicips.Service.Delete")
 	defer done()
 
-	for _, ip := range s.Scope.PublicIPSpecs() {
-		managed, err := s.isIPManaged(ctx, ip.Name)
+	ctx, cancel := context.WithTimeout(ctx, s.Scope.DefaultedAzureServiceReconcileTimeout())
+	defer cancel()
+
+	specs := s.Scope.PublicIPSpecs()
+	if len(specs) == 0 {
+		return nil
+	}
+
+	hasManagedPublicIPs := false
+
+	// We go through the list of VnetPeeringSpecs to delete each one, independently of the result of the previous one.
+	// If multiple errors occur, we return the most pressing one.
+	//  Order of precedence (highest -> lowest) is: error that is not an operationNotDoneError (i.e. error deleting) -> operationNotDoneError (i.e. deleting in progress) -> no error (i.e. deleted)
+	var result error
+	for _, publicIPSpec := range specs {
+		managed, err := s.isIPManaged(ctx, publicIPSpec)
 		if err != nil && !azure.ResourceNotFound(err) {
 			return errors.Wrap(err, "could not get public IP management state")
 		}
 
 		if !managed {
-			log.V(2).Info("Skipping IP deletion for unmanaged public IP", "public ip", ip.Name)
+			log.V(2).Info("Skipping IP deletion for unmanaged public IP", "public ip", publicIPSpec.ResourceName())
 			continue
 		}
 
-		log.V(2).Info("deleting public IP", "public ip", ip.Name)
-		err = s.Client.Delete(ctx, s.Scope.ResourceGroup(), ip.Name)
-		if err != nil && azure.ResourceNotFound(err) {
-			// already deleted
-			continue
-		}
-		if err != nil {
-			return errors.Wrapf(err, "failed to delete public IP %s in resource group %s", ip.Name, s.Scope.ResourceGroup())
+		log.V(2).Info("deleting public IP", "public ip", publicIPSpec.ResourceName())
+		hasManagedPublicIPs = true
+		if err := s.DeleteResource(ctx, publicIPSpec, serviceName); err != nil {
+			if !azure.IsOperationNotDoneError(err) || result == nil {
+				result = err
+			}
 		}
 
-		log.V(2).Info("deleted public IP", "public ip", ip.Name)
+		log.V(2).Info("deleted public IP", "public ip", publicIPSpec.ResourceName())
 	}
-	return nil
+
+	if hasManagedPublicIPs {
+		s.Scope.UpdateDeleteStatus(infrav1.PublicIPsReadyCondition, serviceName, result)
+	}
+
+	return result
 }
 
 // isIPManaged returns true if the IP has an owned tag with the cluster name as value,
 // meaning that the IP's lifecycle is managed.
-func (s *Service) isIPManaged(ctx context.Context, ipName string) (bool, error) {
-	ctx, _, done := tele.StartSpanWithLogger(ctx, "publicips.Service.isIPManaged")
-	defer done()
-
-	ip, err := s.Client.Get(ctx, s.Scope.ResourceGroup(), ipName)
+func (s *Service) isIPManaged(ctx context.Context, spec azure.ResourceSpecGetter) (bool, error) {
+	scope := azure.PublicIPID(s.Scope.SubscriptionID(), spec.ResourceGroupName(), spec.ResourceName())
+	result, err := s.TagsGetter.GetAtScope(ctx, scope)
 	if err != nil {
 		return false, err
 	}
-	tags := converters.MapToTags(ip.Tags)
+
+	tagsMap := make(map[string]*string)
+	if result.Properties != nil && result.Properties.Tags != nil {
+		tagsMap = result.Properties.Tags
+	}
+
+	tags := converters.MapToTags(tagsMap)
 	return tags.HasOwned(s.Scope.ClusterName()), nil
+}
+
+// IsManaged returns always returns true as public IPs are managed on a one-by-one basis.
+func (s *Service) IsManaged(_ context.Context) (bool, error) {
+	return true, nil
 }

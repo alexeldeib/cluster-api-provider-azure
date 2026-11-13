@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"go/build"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -28,47 +27,42 @@ import (
 	goruntime "runtime"
 	"strings"
 
-	"github.com/Azure/go-autorest/autorest/to"
 	"github.com/go-logr/logr"
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	"k8s.io/apimachinery/pkg/runtime"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	clusterv1exp "sigs.k8s.io/cluster-api/exp/api/v1beta1"
-
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"k8s.io/utils/ptr"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	infrav1alpha3 "sigs.k8s.io/cluster-api-provider-azure/api/v1alpha3"
-	infrav1alpha4 "sigs.k8s.io/cluster-api-provider-azure/api/v1alpha4"
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
+	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	infrav1exp "sigs.k8s.io/cluster-api-provider-azure/exp/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/internal/test/record"
 )
 
 var (
-	logger                 = record.NewLogger(record.WithThreshold(to.IntPtr(1)), record.WithWriter(ginkgo.GinkgoWriter))
+	logger                 = record.NewLogger(record.WithThreshold(ptr.To(1)), record.WithWriter(ginkgo.GinkgoWriter))
 	scheme                 = runtime.NewScheme()
 	env                    *envtest.Environment
-	clusterAPIVersionRegex = regexp.MustCompile(`^(\W)sigs.k8s.io/cluster-api v(.+)`)
+	clusterAPIVersionRegex = regexp.MustCompile(`^(\W)sigs\.k8s\.io/cluster-api v(.+)`)
 )
 
 func init() {
 	// Calculate the scheme.
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(clusterv1.AddToScheme(scheme))
-	utilruntime.Must(clusterv1exp.AddToScheme(scheme))
 	utilruntime.Must(infrav1.AddToScheme(scheme))
 	utilruntime.Must(infrav1exp.AddToScheme(scheme))
-	utilruntime.Must(infrav1alpha3.AddToScheme(scheme))
-	utilruntime.Must(infrav1alpha4.AddToScheme(scheme))
 
 	// Get the root of the current file to use in CRD paths.
-	_, filename, _, _ := goruntime.Caller(0) //nolint
+	_, filename, _, _ := goruntime.Caller(0) //nolint:dogsled // Ignore "declaration has 3 blank identifiers" check.
 	root := path.Join(path.Dir(filename), "..", "..", "..")
 
 	crdPaths := []string{
@@ -91,10 +85,11 @@ type (
 	TestEnvironment struct {
 		manager.Manager
 		client.Client
-		Config      *rest.Config
-		Log         logr.LogSink
-		LogRecorder *record.Logger
-		doneMgr     chan struct{}
+		Config          *rest.Config
+		Log             logr.LogSink
+		LogRecorder     *record.Logger
+		CredentialCache azure.CredentialCache
+		doneMgr         chan struct{}
 	}
 )
 
@@ -108,39 +103,44 @@ func NewTestEnvironment() *TestEnvironment {
 	}
 
 	mgr, err := manager.New(env.Config, manager.Options{
-		Scheme:             scheme,
-		MetricsBindAddress: "0",
+		Scheme: scheme,
+		Metrics: server.Options{
+			BindAddress: "0",
+		},
 	})
 	if err != nil {
 		klog.Fatalf("Failed to start testenv manager: %v", err)
 	}
 
 	return &TestEnvironment{
-		Manager:     mgr,
-		Client:      mgr.GetClient(),
-		Config:      mgr.GetConfig(),
-		LogRecorder: logger,
-		Log:         logger,
-		doneMgr:     make(chan struct{}),
+		Manager:         mgr,
+		Client:          mgr.GetClient(),
+		Config:          mgr.GetConfig(),
+		LogRecorder:     logger,
+		Log:             logger,
+		CredentialCache: azure.NewCredentialCache(),
+		doneMgr:         make(chan struct{}),
 	}
 }
 
-func (t *TestEnvironment) StartManager() error {
-	return t.Manager.Start(context.Background())
+// StartManager starts the test environment manager and blocks until the context is canceled.
+func (t *TestEnvironment) StartManager(ctx context.Context) error {
+	return t.Manager.Start(ctx)
 }
 
+// Stop stops the test environment.
 func (t *TestEnvironment) Stop() error {
 	return env.Stop()
 }
 
 func getFilePathToCAPICRDs(root string) string {
-	modBits, err := ioutil.ReadFile(filepath.Join(root, "go.mod"))
+	modBits, err := os.ReadFile(filepath.Join(root, "go.mod")) //nolint:gosec // Ignore G304: Potential file inclusion via variable linter error.
 	if err != nil {
 		return ""
 	}
 
 	var clusterAPIVersion string
-	for _, line := range strings.Split(string(modBits), "\n") {
+	for line := range strings.SplitSeq(string(modBits), "\n") {
 		matches := clusterAPIVersionRegex.FindStringSubmatch(line)
 		if len(matches) == 3 {
 			clusterAPIVersion = matches[2]
@@ -152,7 +152,7 @@ func getFilePathToCAPICRDs(root string) string {
 	}
 
 	gopath := envOr("GOPATH", build.Default.GOPATH)
-	return filepath.Join(gopath, "pkg", "mod", "sigs.k8s.io", fmt.Sprintf("cluster-api@v%s", clusterAPIVersion), "config", "crd", "bases")
+	return filepath.Join(gopath, "pkg", "mod", "sigs.k8s.io", fmt.Sprintf("cluster-api@v%s", clusterAPIVersion), "core", "config", "crd", "bases")
 }
 
 func envOr(envKey, defaultValue string) string {

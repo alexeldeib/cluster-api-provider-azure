@@ -17,156 +17,175 @@ limitations under the License.
 package managedclusters
 
 import (
-	"context"
-	"net/http"
+	"errors"
 	"testing"
 
-	"github.com/Azure/azure-sdk-for-go/services/containerservice/mgmt/2021-05-01/containerservice"
-	"github.com/Azure/go-autorest/autorest"
-	"github.com/golang/mock/gomock"
+	asocontainerservicev1 "github.com/Azure/azure-service-operator/v2/api/containerservice/v1api20250801"
+	asocontainerservicev1preview "github.com/Azure/azure-service-operator/v2/api/containerservice/v20251002preview"
 	. "github.com/onsi/gomega"
-	"k8s.io/utils/pointer"
+	"go.uber.org/mock/gomock"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+	clusterv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1"
+	"sigs.k8s.io/cluster-api/util/secret"
+	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	"sigs.k8s.io/cluster-api-provider-azure/azure"
+	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/managedclusters/mock_managedclusters"
-	gomockinternal "sigs.k8s.io/cluster-api-provider-azure/internal/test/matchers/gomock"
 )
 
-func TestReconcile(t *testing.T) {
-	provisioningstatetestcases := []struct {
-		name                     string
-		provisioningStatesToTest []string
-		expectedError            string
-		expect                   func(m *mock_managedclusters.MockClientMockRecorder, provisioningstate string, s *mock_managedclusters.MockManagedClusterScopeMockRecorder)
-	}{
-		{
-			name:                     "managedcluster in terminal provisioning state",
-			provisioningStatesToTest: []string{"Canceled", "Succeeded", "Failed"},
-			expectedError:            "",
-			expect: func(m *mock_managedclusters.MockClientMockRecorder, provisioningstate string, s *mock_managedclusters.MockManagedClusterScopeMockRecorder) {
-				m.CreateOrUpdate(gomockinternal.AContext(), "my-rg", "my-managedcluster", gomock.Any()).Return(containerservice.ManagedCluster{ManagedClusterProperties: &containerservice.ManagedClusterProperties{
-					Fqdn:              pointer.String("my-managedcluster-fqdn"),
-					ProvisioningState: &provisioningstate,
-				}}, nil)
-				m.Get(gomockinternal.AContext(), "my-rg", "my-managedcluster").Return(containerservice.ManagedCluster{ManagedClusterProperties: &containerservice.ManagedClusterProperties{
-					Fqdn:              pointer.String("my-managedcluster-fqdn"),
-					ProvisioningState: &provisioningstate,
-					NetworkProfile:    &containerservice.NetworkProfile{},
-				}}, nil)
-				m.GetCredentials(gomockinternal.AContext(), "my-rg", "my-managedcluster").Times(1)
-				s.ClusterName().AnyTimes().Return("my-managedcluster")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
-				s.ManagedClusterSpec().AnyTimes().Return(azure.ManagedClusterSpec{
-					Name:              "my-managedcluster",
-					ResourceGroupName: "my-rg",
-				}, nil)
-				s.SetControlPlaneEndpoint(gomock.Any()).Times(1)
-				s.SetKubeConfigData(gomock.Any()).Times(1)
+func TestPostCreateOrUpdateResourceHook(t *testing.T) {
+	t.Run("error creating or updating", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		mockCtrl := gomock.NewController(t)
+		scope := mock_managedclusters.NewMockManagedClusterScope(mockCtrl)
+
+		err := postCreateOrUpdateResourceHook(t.Context(), scope, nil, errors.New("an error"))
+		g.Expect(err).To(HaveOccurred())
+	})
+
+	t.Run("successful create or update", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		namespace := "default"
+		scope := setupMockScope(t)
+
+		managedCluster := &asocontainerservicev1.ManagedCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace,
 			},
-		},
-		{
-			name:                     "managedcluster in nonterminal provisioning state",
-			provisioningStatesToTest: []string{"Deleting", "InProgress", "randomStringHere"},
-			expectedError:            "Unable to update existing managed cluster in non terminal state. Managed cluster must be in one of the following provisioning states: canceled, failed, or succeeded. Actual state",
-			expect: func(m *mock_managedclusters.MockClientMockRecorder, provisioningstate string, s *mock_managedclusters.MockManagedClusterScopeMockRecorder) {
-				m.Get(gomockinternal.AContext(), "my-rg", "my-managedcluster").Return(containerservice.ManagedCluster{ManagedClusterProperties: &containerservice.ManagedClusterProperties{
-					ProvisioningState: &provisioningstate,
-				}}, nil)
-				s.ClusterName().AnyTimes().Return("my-managedcluster")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
-				s.ManagedClusterSpec().AnyTimes().Return(azure.ManagedClusterSpec{
-					Name:              "my-managedcluster",
-					ResourceGroupName: "my-rg",
-				}, nil)
+			Spec: asocontainerservicev1.ManagedCluster_Spec{
+				KubernetesVersion: ptr.To("1.19.0"),
+				AutoUpgradeProfile: &asocontainerservicev1.ManagedClusterAutoUpgradeProfile{
+					UpgradeChannel: ptr.To(asocontainerservicev1.ManagedClusterAutoUpgradeProfile_UpgradeChannel_Stable),
+				},
 			},
-		},
-	}
-
-	for _, tc := range provisioningstatetestcases {
-		for _, provisioningstate := range tc.provisioningStatesToTest {
-			t.Logf("Testing managedcluster provision state: " + provisioningstate)
-			t.Run(tc.name, func(t *testing.T) {
-				g := NewWithT(t)
-
-				mockCtrl := gomock.NewController(t)
-				defer mockCtrl.Finish()
-				scopeMock := mock_managedclusters.NewMockManagedClusterScope(mockCtrl)
-				clientMock := mock_managedclusters.NewMockClient(mockCtrl)
-
-				tc.expect(clientMock.EXPECT(), provisioningstate, scopeMock.EXPECT())
-
-				s := &Service{
-					Scope:  scopeMock,
-					Client: clientMock,
-				}
-
-				err := s.Reconcile(context.TODO())
-				if tc.expectedError != "" {
-					g.Expect(err).To(HaveOccurred())
-					g.Expect(err.Error()).To(ContainSubstring(tc.expectedError))
-					g.Expect(err.Error()).To(ContainSubstring(provisioningstate))
-				} else {
-					g.Expect(err).NotTo(HaveOccurred())
-				}
-			})
+			Status: asocontainerservicev1.ManagedCluster_STATUS{
+				Fqdn:        ptr.To("fdqn"),
+				PrivateFQDN: ptr.To("private fqdn"),
+				OidcIssuerProfile: &asocontainerservicev1.ManagedClusterOIDCIssuerProfile_STATUS{
+					IssuerURL: ptr.To("oidc"),
+				},
+				CurrentKubernetesVersion: ptr.To("1.19.0"),
+			},
 		}
-	}
 
-	testcases := []struct {
-		name          string
-		expectedError string
-		expect        func(m *mock_managedclusters.MockClientMockRecorder, s *mock_managedclusters.MockManagedClusterScopeMockRecorder)
-	}{
-		{
-			name:          "no managedcluster exists",
-			expectedError: "",
-			expect: func(m *mock_managedclusters.MockClientMockRecorder, s *mock_managedclusters.MockManagedClusterScopeMockRecorder) {
-				m.CreateOrUpdate(gomockinternal.AContext(), "my-rg", "my-managedcluster", gomock.Any()).Return(containerservice.ManagedCluster{ManagedClusterProperties: &containerservice.ManagedClusterProperties{}}, nil)
-				m.Get(gomockinternal.AContext(), "my-rg", "my-managedcluster").Return(containerservice.ManagedCluster{}, autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not Found"))
-				m.GetCredentials(gomockinternal.AContext(), "my-rg", "my-managedcluster").Times(1)
-				s.ClusterName().AnyTimes().Return("my-managedcluster")
-				s.ResourceGroup().AnyTimes().Return("my-rg")
-				s.ManagedClusterSpec().AnyTimes().Return(azure.ManagedClusterSpec{
-					Name:              "my-managedcluster",
-					ResourceGroupName: "my-rg",
-				}, nil)
-				s.GetAllAgentPoolSpecs(gomockinternal.AContext()).AnyTimes().Return([]azure.AgentPoolSpec{
-					{
-						Name:         "my-agentpool",
-						SKU:          "Standard_D4s_v3",
-						Replicas:     1,
-						OSDiskSizeGB: 0,
-					},
-				}, nil)
-				s.SetKubeConfigData(gomock.Any()).Times(1)
+		err := postCreateOrUpdateResourceHook(t.Context(), scope, managedCluster, nil)
+		g.Expect(err).NotTo(HaveOccurred())
+	})
+
+	t.Run("successful create or update, preview enabled", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		namespace := "default"
+		scope := setupMockScope(t)
+
+		managedCluster := &asocontainerservicev1preview.ManagedCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace,
 			},
+			Spec: asocontainerservicev1preview.ManagedCluster_Spec{
+				KubernetesVersion: ptr.To("1.19.0"),
+				AutoUpgradeProfile: &asocontainerservicev1preview.ManagedClusterAutoUpgradeProfile{
+					UpgradeChannel: ptr.To(asocontainerservicev1preview.UpgradeChannel_Stable),
+				},
+			},
+			Status: asocontainerservicev1preview.ManagedCluster_STATUS{
+				Fqdn:        ptr.To("fdqn"),
+				PrivateFQDN: ptr.To("private fqdn"),
+				OidcIssuerProfile: &asocontainerservicev1preview.ManagedClusterOIDCIssuerProfile_STATUS{
+					IssuerURL: ptr.To("oidc"),
+				},
+				CurrentKubernetesVersion: ptr.To("1.19.0"),
+			},
+		}
+
+		err := postCreateOrUpdateResourceHook(t.Context(), scope, managedCluster, nil)
+		g.Expect(err).NotTo(HaveOccurred())
+	})
+
+	t.Run("private cluster fqdn", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		mockCtrl := gomock.NewController(t)
+		scope := mock_managedclusters.NewMockManagedClusterScope(mockCtrl)
+		namespace := "default"
+		clusterName := "cluster"
+
+		kclient := fakeclient.NewClientBuilder().
+			Build()
+		scope.EXPECT().GetClient().Return(kclient).AnyTimes()
+
+		scope.EXPECT().SetControlPlaneEndpoint(clusterv1beta1.APIEndpoint{
+			Host: "private fqdn",
+			Port: 443,
+		})
+		scope.EXPECT().ClusterName().Return(clusterName).AnyTimes()
+		scope.EXPECT().IsAADEnabled().Return(true)
+
+		managedCluster := &asocontainerservicev1.ManagedCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace,
+			},
+			Status: asocontainerservicev1.ManagedCluster_STATUS{
+				Fqdn:        ptr.To("fdqn"),
+				PrivateFQDN: ptr.To("private fqdn"),
+				ApiServerAccessProfile: &asocontainerservicev1.ManagedClusterAPIServerAccessProfile_STATUS{
+					EnablePrivateCluster:           ptr.To(true),
+					EnablePrivateClusterPublicFQDN: ptr.To(false),
+				},
+			},
+		}
+
+		err := postCreateOrUpdateResourceHook(t.Context(), scope, managedCluster, nil)
+		g.Expect(err).To(HaveOccurred())
+	})
+}
+
+func setupMockScope(t *testing.T) *mock_managedclusters.MockManagedClusterScope {
+	t.Helper()
+	mockCtrl := gomock.NewController(t)
+	scope := mock_managedclusters.NewMockManagedClusterScope(mockCtrl)
+	namespace := "default"
+	clusterName := "cluster"
+
+	adminASOKubeconfig := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      adminKubeconfigSecretName(clusterName),
+		},
+		Data: map[string][]byte{
+			secret.KubeconfigDataName: []byte("admin credentials"),
 		},
 	}
-
-	for _, tc := range testcases {
-		t.Logf("Testing " + tc.name)
-		t.Run(tc.name, func(t *testing.T) {
-			g := NewWithT(t)
-
-			mockCtrl := gomock.NewController(t)
-			defer mockCtrl.Finish()
-			scopeMock := mock_managedclusters.NewMockManagedClusterScope(mockCtrl)
-			clientMock := mock_managedclusters.NewMockClient(mockCtrl)
-
-			tc.expect(clientMock.EXPECT(), scopeMock.EXPECT())
-
-			s := &Service{
-				Scope:  scopeMock,
-				Client: clientMock,
-			}
-
-			err := s.Reconcile(context.TODO())
-			if tc.expectedError != "" {
-				g.Expect(err).To(HaveOccurred())
-				g.Expect(err).To(MatchError(tc.expectedError))
-			} else {
-				g.Expect(err).NotTo(HaveOccurred())
-			}
-		})
+	userASOKubeconfig := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      userKubeconfigSecretName(clusterName),
+		},
+		Data: map[string][]byte{
+			secret.KubeconfigDataName: []byte("user credentials"),
+		},
 	}
+	kclient := fakeclient.NewClientBuilder().
+		WithObjects(adminASOKubeconfig, userASOKubeconfig).
+		Build()
+	scope.EXPECT().GetClient().Return(kclient).AnyTimes()
+
+	scope.EXPECT().SetControlPlaneEndpoint(clusterv1beta1.APIEndpoint{
+		Host: "fdqn",
+		Port: 443,
+	})
+	scope.EXPECT().ClusterName().Return(clusterName).AnyTimes()
+	scope.EXPECT().IsAADEnabled().Return(true)
+	scope.EXPECT().AreLocalAccountsDisabled().Return(false)
+	scope.EXPECT().SetAdminKubeconfigData([]byte("admin credentials"))
+	scope.EXPECT().SetUserKubeconfigData([]byte("user credentials"))
+	scope.EXPECT().SetOIDCIssuerProfileStatus(gomock.Nil())
+	scope.EXPECT().SetOIDCIssuerProfileStatus(&infrav1.OIDCIssuerProfileStatus{
+		IssuerURL: ptr.To("oidc"),
+	})
+	scope.EXPECT().SetVersionStatus("v1.19.0")
+	scope.EXPECT().IsManagedVersionUpgrade().Return(true)
+	scope.EXPECT().SetAutoUpgradeVersionStatus("v1.19.0")
+
+	return scope
 }

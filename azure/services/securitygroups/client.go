@@ -18,94 +18,127 @@ package securitygroups
 
 import (
 	"context"
+	"time"
 
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-02-01/network"
-	"github.com/Azure/go-autorest/autorest"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v4"
+	"github.com/pkg/errors"
 
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/async"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
 )
 
-// client wraps go-sdk.
-type client interface {
-	Get(context.Context, string, string) (network.SecurityGroup, error)
-	CreateOrUpdate(context.Context, string, string, network.SecurityGroup) error
-	Delete(context.Context, string, string) error
-}
-
 // azureClient contains the Azure go-sdk Client.
 type azureClient struct {
-	securitygroups network.SecurityGroupsClient
+	securitygroups *armnetwork.SecurityGroupsClient
+	auth           azure.Authorizer
+	apiCallTimeout time.Duration
 }
 
-var _ client = (*azureClient)(nil)
-
-// newClient creates a new VM client from subscription ID.
-func newClient(auth azure.Authorizer) *azureClient {
-	c := newSecurityGroupsClient(auth.SubscriptionID(), auth.BaseURI(), auth.Authorizer())
-	return &azureClient{c}
-}
-
-// newSecurityGroupsClient creates a new security groups client from subscription ID.
-func newSecurityGroupsClient(subscriptionID string, baseURI string, authorizer autorest.Authorizer) network.SecurityGroupsClient {
-	securityGroupsClient := network.NewSecurityGroupsClientWithBaseURI(baseURI, subscriptionID)
-	azure.SetAutoRestClientDefaults(&securityGroupsClient.Client, authorizer)
-	return securityGroupsClient
+// newClient creates a new security groups client from an authorizer.
+func newClient(auth azure.Authorizer, apiCallTimeout time.Duration) (*azureClient, error) {
+	opts, err := azure.ARMClientOptionsForAuth(auth)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create securitygroups client options")
+	}
+	factory, err := armnetwork.NewClientFactory(auth.SubscriptionID(), auth.Token(), opts)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create armnetwork client factory")
+	}
+	return &azureClient{factory.NewSecurityGroupsClient(), auth, apiCallTimeout}, nil
 }
 
 // Get gets the specified network security group.
-func (ac *azureClient) Get(ctx context.Context, resourceGroupName, sgName string) (network.SecurityGroup, error) {
-	ctx, _, done := tele.StartSpanWithLogger(ctx, "securitygroups.AzureClient.Get")
+func (ac *azureClient) Get(ctx context.Context, spec azure.ResourceSpecGetter) (result any, err error) {
+	ctx, _, done := tele.StartSpanWithLogger(ctx, "securitygroups.azureClient.Get")
 	defer done()
 
-	return ac.securitygroups.Get(ctx, resourceGroupName, sgName, "")
+	resp, err := ac.securitygroups.Get(ctx, spec.ResourceGroupName(), spec.ResourceName(), nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp.SecurityGroup, nil
 }
 
-// CreateOrUpdate creates or updates a network security group in the specified resource group.
-func (ac *azureClient) CreateOrUpdate(ctx context.Context, resourceGroupName string, sgName string, sg network.SecurityGroup) error {
-	ctx, _, done := tele.StartSpanWithLogger(ctx, "securitygroups.AzureClient.CreateOrUpdate")
+// CreateOrUpdateAsync creates or updates a network security group in the specified resource group.
+// It sends a PUT request to Azure and if accepted without error, the func will return a Poller which can be used to track the ongoing
+// progress of the operation.
+func (ac *azureClient) CreateOrUpdateAsync(ctx context.Context, spec azure.ResourceSpecGetter, resumeToken string, parameters any) (result any, poller *runtime.Poller[armnetwork.SecurityGroupsClientCreateOrUpdateResponse], err error) {
+	ctx, _, done := tele.StartSpanWithLogger(ctx, "securitygroups.azureClient.CreateOrUpdate")
 	defer done()
 
-	var etag string
+	sg, ok := parameters.(armnetwork.SecurityGroup)
+	if !ok && parameters != nil {
+		return nil, nil, errors.Errorf("%T is not an armnetwork.SecurityGroup", parameters)
+	}
+
+	var extraPolicies []policy.Policy
 	if sg.Etag != nil {
-		etag = *sg.Etag
-	}
-	req, err := ac.securitygroups.CreateOrUpdatePreparer(ctx, resourceGroupName, sgName, sg)
-	if err != nil {
-		err = autorest.NewErrorWithError(err, "network.SecurityGroupsClient", "CreateOrUpdate", nil, "Failure preparing request")
-		return err
-	}
-	if etag != "" {
-		req.Header.Add("If-Match", etag)
+		extraPolicies = append(extraPolicies, azure.CustomPutPatchHeaderPolicy{
+			Headers: map[string]string{
+				"If-Match": *sg.Etag,
+			},
+		})
 	}
 
-	future, err := ac.securitygroups.CreateOrUpdateSender(req)
+	// Create a new client that knows how to add the etag header.
+	clientOpts, err := azure.ARMClientOptionsForAuth(ac.auth, extraPolicies...)
 	if err != nil {
-		err = autorest.NewErrorWithError(err, "network.SecurityGroupsClient", "CreateOrUpdate", future.Response(), "Failure sending request")
-		return err
+		return nil, nil, errors.Wrap(err, "failed to create securitygroups client options")
+	}
+	factory, err := armnetwork.NewClientFactory(ac.auth.SubscriptionID(), ac.auth.Token(), clientOpts)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "failed to create armnetwork client factory")
+	}
+	client := factory.NewSecurityGroupsClient()
+
+	opts := &armnetwork.SecurityGroupsClientBeginCreateOrUpdateOptions{ResumeToken: resumeToken}
+	poller, err = client.BeginCreateOrUpdate(ctx, spec.ResourceGroupName(), spec.ResourceName(), sg, opts)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	err = future.WaitForCompletionRef(ctx, ac.securitygroups.Client)
+	ctx, cancel := context.WithTimeout(ctx, ac.apiCallTimeout)
+	defer cancel()
+
+	pollOpts := &runtime.PollUntilDoneOptions{Frequency: async.DefaultPollerFrequency}
+	resp, err := poller.PollUntilDone(ctx, pollOpts)
 	if err != nil {
-		return err
+		// If an error occurs, return the poller.
+		// This means the long-running operation didn't finish in the specified timeout.
+		return nil, poller, err
 	}
-	_, err = future.Result(ac.securitygroups)
-	return err
+
+	// if the operation completed, return a nil poller
+	return resp.SecurityGroup, nil, err
 }
 
-// Delete deletes the specified network security group.
-func (ac *azureClient) Delete(ctx context.Context, resourceGroupName, sgName string) error {
-	ctx, _, done := tele.StartSpanWithLogger(ctx, "securitygroups.AzureClient.Delete")
+// DeleteAsync deletes the specified network security group. DeleteAsync sends a DELETE
+// request to Azure and if accepted without error, the func will return a Poller which can be used to track the ongoing
+// progress of the operation.
+func (ac *azureClient) DeleteAsync(ctx context.Context, spec azure.ResourceSpecGetter, resumeToken string) (poller *runtime.Poller[armnetwork.SecurityGroupsClientDeleteResponse], err error) {
+	ctx, _, done := tele.StartSpanWithLogger(ctx, "securitygroups.azureClient.Delete")
 	defer done()
 
-	future, err := ac.securitygroups.Delete(ctx, resourceGroupName, sgName)
+	opts := &armnetwork.SecurityGroupsClientBeginDeleteOptions{ResumeToken: resumeToken}
+	poller, err = ac.securitygroups.BeginDelete(ctx, spec.ResourceGroupName(), spec.ResourceName(), opts)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	err = future.WaitForCompletionRef(ctx, ac.securitygroups.Client)
+
+	ctx, cancel := context.WithTimeout(ctx, ac.apiCallTimeout)
+	defer cancel()
+
+	pollOpts := &runtime.PollUntilDoneOptions{Frequency: async.DefaultPollerFrequency}
+	_, err = poller.PollUntilDone(ctx, pollOpts)
 	if err != nil {
-		return err
+		// if an error occurs, return the poller.
+		// this means the long-running operation didn't finish in the specified timeout.
+		return poller, err
 	}
-	_, err = future.Result(ac.securitygroups)
-	return err
+
+	// if the operation completed, return a nil poller.
+	return nil, err
 }

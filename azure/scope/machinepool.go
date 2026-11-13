@@ -19,30 +19,39 @@ package scope
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"slices"
 	"strings"
-	"time"
 
-	"sigs.k8s.io/cluster-api-provider-azure/util/futures"
-
-	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/authorization/armauthorization/v2"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/pointer"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
-	"sigs.k8s.io/cluster-api/controllers/noderefutil"
-	capierrors "sigs.k8s.io/cluster-api/errors"
-	capiv1exp "sigs.k8s.io/cluster-api/exp/api/v1beta1"
-	"sigs.k8s.io/cluster-api/util/conditions"
-	"sigs.k8s.io/cluster-api/util/patch"
+	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
+	clusterv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/util"
+	"sigs.k8s.io/cluster-api/util/annotations"
+	v1beta1conditions "sigs.k8s.io/cluster-api/util/deprecated/v1beta1/conditions"
+	v1beta1patch "sigs.k8s.io/cluster-api/util/deprecated/v1beta1/patch"
+	"sigs.k8s.io/cluster-api/util/labels/format"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	machinepool "sigs.k8s.io/cluster-api-provider-azure/azure/scope/strategies/machinepool_deployments"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/resourceskus"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/roleassignments"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/scalesets"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/virtualmachineimages"
 	infrav1exp "sigs.k8s.io/cluster-api-provider-azure/exp/api/v1beta1"
+	"sigs.k8s.io/cluster-api-provider-azure/feature"
+	azureutil "sigs.k8s.io/cluster-api-provider-azure/util/azure"
+	"sigs.k8s.io/cluster-api-provider-azure/util/futures"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
 )
 
@@ -55,25 +64,37 @@ type (
 	// MachinePoolScopeParams defines the input parameters used to create a new MachinePoolScope.
 	MachinePoolScopeParams struct {
 		Client           client.Client
-		MachinePool      *capiv1exp.MachinePool
+		MachinePool      *clusterv1.MachinePool
 		AzureMachinePool *infrav1exp.AzureMachinePool
 		ClusterScope     azure.ClusterScoper
+		Cache            *MachinePoolCache
 	}
 
 	// MachinePoolScope defines a scope defined around a machine pool and its cluster.
 	MachinePoolScope struct {
 		azure.ClusterScoper
-		AzureMachinePool *infrav1exp.AzureMachinePool
-		MachinePool      *capiv1exp.MachinePool
-		client           client.Client
-		patchHelper      *patch.Helper
-		vmssState        *azure.VMSS
+		AzureMachinePool           *infrav1exp.AzureMachinePool
+		MachinePool                *clusterv1.MachinePool
+		client                     client.Client
+		patchHelper                *v1beta1patch.Helper
+		capiMachinePoolPatchHelper *v1beta1patch.Helper
+		vmssState                  *azure.VMSS
+		cache                      *MachinePoolCache
+		skuCache                   *resourceskus.Cache
 	}
 
 	// NodeStatus represents the status of a Kubernetes node.
 	NodeStatus struct {
 		Ready   bool
 		Version string
+	}
+
+	// MachinePoolCache stores common machine pool information so we don't have to hit the API multiple times within the same reconcile loop.
+	MachinePoolCache struct {
+		BootstrapData string
+		VMImage       *infrav1.Image
+		VMSKU         resourceskus.SKU
+		MaxSurge      int
 	}
 )
 
@@ -92,42 +113,123 @@ func NewMachinePoolScope(params MachinePoolScopeParams) (*MachinePoolScope, erro
 		return nil, errors.New("azure machine pool is required when creating a MachinePoolScope")
 	}
 
-	helper, err := patch.NewHelper(params.AzureMachinePool, params.Client)
+	helper, err := v1beta1patch.NewHelper(params.AzureMachinePool, params.Client)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to init patch helper")
 	}
 
+	capiMachinePoolPatchHelper, err := v1beta1patch.NewHelper(params.MachinePool, params.Client)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to init capi patch helper")
+	}
+
 	return &MachinePoolScope{
-		client:           params.Client,
-		MachinePool:      params.MachinePool,
-		AzureMachinePool: params.AzureMachinePool,
-		patchHelper:      helper,
-		ClusterScoper:    params.ClusterScope,
+		client:                     params.Client,
+		MachinePool:                params.MachinePool,
+		AzureMachinePool:           params.AzureMachinePool,
+		patchHelper:                helper,
+		capiMachinePoolPatchHelper: capiMachinePoolPatchHelper,
+		ClusterScoper:              params.ClusterScope,
 	}, nil
 }
 
+// InitMachinePoolCache sets cached information about the machine pool to be used in the scope.
+func (m *MachinePoolScope) InitMachinePoolCache(ctx context.Context) error {
+	ctx, _, done := tele.StartSpanWithLogger(ctx, "scope.MachinePoolScope.InitMachinePoolCache")
+	defer done()
+
+	if m.cache == nil {
+		var err error
+		m.cache = &MachinePoolCache{}
+
+		m.cache.BootstrapData, err = m.GetBootstrapData(ctx)
+		if err != nil {
+			return err
+		}
+
+		m.cache.VMImage, err = m.GetVMImage(ctx)
+		if err != nil {
+			return err
+		}
+		m.SaveVMImageToStatus(m.cache.VMImage)
+
+		m.cache.MaxSurge, err = m.MaxSurge()
+		if err != nil {
+			return err
+		}
+
+		if m.skuCache == nil {
+			skuCache, err := resourceskus.GetCache(m, m.Location())
+			if err != nil {
+				return errors.Wrap(err, "failed to init resourceskus cache")
+			}
+			m.skuCache = skuCache
+		}
+
+		m.cache.VMSKU, err = m.skuCache.Get(ctx, m.AzureMachinePool.Spec.Template.VMSize, resourceskus.VirtualMachines)
+		if err != nil {
+			return errors.Wrapf(err, "failed to get VM SKU %s in compute api", m.AzureMachinePool.Spec.Template.VMSize)
+		}
+	}
+
+	return nil
+}
+
 // ScaleSetSpec returns the scale set spec.
-func (m *MachinePoolScope) ScaleSetSpec() azure.ScaleSetSpec {
-	return azure.ScaleSetSpec{
+func (m *MachinePoolScope) ScaleSetSpec(ctx context.Context) azure.ResourceSpecGetter {
+	ctx, log, done := tele.StartSpanWithLogger(ctx, "scope.MachinePoolScope.ScaleSetSpec")
+	defer done()
+
+	spec := &scalesets.ScaleSetSpec{
 		Name:                         m.Name(),
+		ResourceGroup:                m.NodeResourceGroup(),
 		Size:                         m.AzureMachinePool.Spec.Template.VMSize,
-		Capacity:                     int64(to.Int32(m.MachinePool.Spec.Replicas)),
+		Capacity:                     int64(ptr.Deref[int32](m.MachinePool.Spec.Replicas, 0)),
 		SSHKeyData:                   m.AzureMachinePool.Spec.Template.SSHPublicKey,
 		OSDisk:                       m.AzureMachinePool.Spec.Template.OSDisk,
 		DataDisks:                    m.AzureMachinePool.Spec.Template.DataDisks,
-		SubnetName:                   m.AzureMachinePool.Spec.Template.SubnetName,
+		SubnetName:                   m.AzureMachinePool.Spec.Template.NetworkInterfaces[0].SubnetName,
 		VNetName:                     m.Vnet().Name,
 		VNetResourceGroup:            m.Vnet().ResourceGroup,
 		PublicLBName:                 m.OutboundLBName(infrav1.Node),
-		PublicLBAddressPoolName:      azure.GenerateOutboundBackendAddressPoolName(m.OutboundLBName(infrav1.Node)),
-		AcceleratedNetworking:        m.AzureMachinePool.Spec.Template.AcceleratedNetworking,
+		PublicLBAddressPoolName:      m.OutboundPoolName(infrav1.Node),
+		AcceleratedNetworking:        m.AzureMachinePool.Spec.Template.NetworkInterfaces[0].AcceleratedNetworking,
+		AdditionalCapabilities:       m.AzureMachinePool.Spec.Template.AdditionalCapabilities,
 		Identity:                     m.AzureMachinePool.Spec.Identity,
 		UserAssignedIdentities:       m.AzureMachinePool.Spec.UserAssignedIdentities,
+		DiagnosticsProfile:           m.AzureMachinePool.Spec.Template.Diagnostics,
 		SecurityProfile:              m.AzureMachinePool.Spec.Template.SecurityProfile,
 		SpotVMOptions:                m.AzureMachinePool.Spec.Template.SpotVMOptions,
 		FailureDomains:               m.MachinePool.Spec.FailureDomains,
 		TerminateNotificationTimeout: m.AzureMachinePool.Spec.Template.TerminateNotificationTimeout,
+		NetworkInterfaces:            m.AzureMachinePool.Spec.Template.NetworkInterfaces,
+		IPv6Enabled:                  m.IsIPv6Enabled(),
+		OrchestrationMode:            m.AzureMachinePool.Spec.OrchestrationMode,
+		Location:                     m.AzureMachinePool.Spec.Location,
+		SubscriptionID:               m.SubscriptionID(),
+		HasReplicasExternallyManaged: m.HasReplicasExternallyManaged(ctx),
+		ClusterName:                  m.ClusterName(),
+		AdditionalTags:               m.AdditionalTags(),
+		PlatformFaultDomainCount:     m.AzureMachinePool.Spec.PlatformFaultDomainCount,
+		ZoneBalance:                  m.AzureMachinePool.Spec.ZoneBalance,
 	}
+
+	if m.AzureMachinePool.Spec.ZoneBalance != nil && len(m.MachinePool.Spec.FailureDomains) <= 1 {
+		log.V(4).Info("zone balance is enabled but one or less failure domains are specified, zone balance will be disabled")
+		spec.ZoneBalance = nil
+	}
+
+	if m.cache != nil {
+		spec.VMSSExtensionSpecs = m.VMSSExtensionSpecs()
+		spec.SKU = m.cache.VMSKU
+		spec.VMImage = m.cache.VMImage
+		spec.BootstrapData = m.cache.BootstrapData
+		spec.MaxSurge = m.cache.MaxSurge
+	} else {
+		log.V(4).Info("machinepool cache is nil, this is only expected when deleting a machinepool")
+	}
+
+	return spec
 }
 
 // Name returns the Azure Machine Pool Name.
@@ -139,18 +241,54 @@ func (m *MachinePoolScope) Name() string {
 	return m.AzureMachinePool.Name
 }
 
-// ProviderID returns the AzureMachinePool ID by parsing Spec.FakeProviderID.
+// SetInfrastructureMachineKind sets the infrastructure machine kind in the status if it is not set already, returning
+// `true` if the status was updated. This supports MachinePool Machines.
+func (m *MachinePoolScope) SetInfrastructureMachineKind() bool {
+	if m.AzureMachinePool.Status.InfrastructureMachineKind != infrav1exp.AzureMachinePoolMachineKind {
+		m.AzureMachinePool.Status.InfrastructureMachineKind = infrav1exp.AzureMachinePoolMachineKind
+
+		return true
+	}
+
+	return false
+}
+
+// ProviderID returns the AzureMachinePool ID by parsing Spec.ProviderID.
 func (m *MachinePoolScope) ProviderID() string {
-	parsed, err := noderefutil.NewProviderID(m.AzureMachinePool.Spec.ProviderID)
+	resourceID, err := azureutil.ParseResourceID(m.AzureMachinePool.Spec.ProviderID)
 	if err != nil {
 		return ""
 	}
-	return parsed.ID()
+	return resourceID.Name
 }
 
 // SetProviderID sets the AzureMachinePool providerID in spec.
 func (m *MachinePoolScope) SetProviderID(v string) {
 	m.AzureMachinePool.Spec.ProviderID = v
+}
+
+// SystemAssignedIdentityName returns the scope for the system assigned identity.
+func (m *MachinePoolScope) SystemAssignedIdentityName() string {
+	if m.AzureMachinePool.Spec.SystemAssignedIdentityRole != nil {
+		return m.AzureMachinePool.Spec.SystemAssignedIdentityRole.Name
+	}
+	return ""
+}
+
+// SystemAssignedIdentityScope returns the scope for the system assigned identity.
+func (m *MachinePoolScope) SystemAssignedIdentityScope() string {
+	if m.AzureMachinePool.Spec.SystemAssignedIdentityRole != nil {
+		return m.AzureMachinePool.Spec.SystemAssignedIdentityRole.Scope
+	}
+	return ""
+}
+
+// SystemAssignedIdentityDefinitionID returns the role definition ID for the system assigned identity.
+func (m *MachinePoolScope) SystemAssignedIdentityDefinitionID() string {
+	if m.AzureMachinePool.Spec.SystemAssignedIdentityRole != nil {
+		return m.AzureMachinePool.Spec.SystemAssignedIdentityRole.DefinitionID
+	}
+	return ""
 }
 
 // ProvisioningState returns the AzureMachinePool provisioning state.
@@ -166,25 +304,51 @@ func (m *MachinePoolScope) SetVMSSState(vmssState *azure.VMSS) {
 	m.vmssState = vmssState
 }
 
-// NeedsRequeue return true if any machines are not on the latest model or the VMSS is not in a terminal provisioning
-// state.
+// NeedsRequeue returns true if the VMSS is not in a terminal provisioning state, desired replicas do not match actual,
+// or (when SkipMachinePoolModelReconciliation is disabled) any machines are not on the latest model.
 func (m *MachinePoolScope) NeedsRequeue() bool {
 	state := m.AzureMachinePool.Status.ProvisioningState
 	if m.vmssState == nil {
 		return state != nil && infrav1.IsTerminalProvisioningState(*state)
 	}
 
-	if !m.vmssState.HasLatestModelAppliedToAll() {
-		return true
+	// Skip requeue for model state when SkipMachinePoolModelReconciliation is enabled.
+	// This allows instances with stale models to persist until explicitly scaled.
+	if !feature.Gates.Enabled(feature.SkipMachinePoolModelReconciliation) {
+		if !m.vmssState.HasLatestModelAppliedToAll() {
+			return true
+		}
 	}
 
 	desiredMatchesActual := len(m.vmssState.Instances) == int(m.DesiredReplicas())
-	return !(state != nil && infrav1.IsTerminalProvisioningState(*state) && desiredMatchesActual)
+	return state == nil || !infrav1.IsTerminalProvisioningState(*state) || !desiredMatchesActual
 }
 
 // DesiredReplicas returns the replica count on machine pool or 0 if machine pool replicas is nil.
 func (m MachinePoolScope) DesiredReplicas() int32 {
-	return to.Int32(m.MachinePool.Spec.Replicas)
+	return ptr.Deref[int32](m.MachinePool.Spec.Replicas, 0)
+}
+
+// RolloutInProgress reports whether the pool is over-provisioned because the VMSS was surged to replace
+// instances after a model change, rather than because the replica count was explicitly lowered.
+//
+// The scaleset service surges VMSS capacity above the desired replica count when the model changes, and
+// leaves capacity alone on a scale-down (excess instances are removed by deleting AzureMachinePoolMachines
+// instead). Both therefore present as "more instances than desired", so the desired count is compared
+// against the count last reconciled onto the VMSS: only an explicit scale-down lowers it.
+func (m *MachinePoolScope) RolloutInProgress() bool {
+	if m.vmssState == nil {
+		return false
+	}
+
+	// The replica count dropped since the last successful reconcile, so the user is scaling down and the
+	// excess machines are pre-existing instances rather than replacements.
+	if last := m.AzureMachinePool.Status.LastReconciledReplicas; last != nil && m.DesiredReplicas() < *last {
+		return false
+	}
+
+	// Otherwise instances still running an older model are ones the VMSS is in the middle of replacing.
+	return !m.vmssState.HasLatestModelAppliedToAll()
 }
 
 // MaxSurge returns the number of machines to surge, or 0 if the deployment strategy does not support surge.
@@ -207,7 +371,7 @@ func (m *MachinePoolScope) updateReplicasAndProviderIDs(ctx context.Context) err
 	ctx, _, done := tele.StartSpanWithLogger(ctx, "scope.MachinePoolScope.UpdateInstanceStatuses")
 	defer done()
 
-	machines, err := m.getMachinePoolMachines(ctx)
+	machines, err := m.GetMachinePoolMachines(ctx)
 	if err != nil {
 		return errors.Wrap(err, "failed to get machine pool machines")
 	}
@@ -221,19 +385,29 @@ func (m *MachinePoolScope) updateReplicasAndProviderIDs(ctx context.Context) err
 		providerIDs[i] = machine.Spec.ProviderID
 	}
 
+	// Sort providerIDs to ensure deterministic ordering to prevent continuous reconciliation.
+	slices.Sort(providerIDs)
+
 	m.AzureMachinePool.Status.Replicas = readyReplicas
 	m.AzureMachinePool.Spec.ProviderIDList = providerIDs
 	return nil
 }
 
-func (m *MachinePoolScope) getMachinePoolMachines(ctx context.Context) ([]infrav1exp.AzureMachinePoolMachine, error) {
+func (m *MachinePoolScope) getMachinePoolMachineLabels() map[string]string {
+	return map[string]string{
+		clusterv1.ClusterNameLabel:      m.ClusterName(),
+		infrav1exp.MachinePoolNameLabel: m.AzureMachinePool.Name,
+		clusterv1.MachinePoolNameLabel:  format.MustFormatValue(m.MachinePool.Name),
+		m.ClusterName():                 string(infrav1.ResourceLifecycleOwned),
+	}
+}
+
+// GetMachinePoolMachines returns the list of AzureMachinePoolMachines associated with this AzureMachinePool.
+func (m *MachinePoolScope) GetMachinePoolMachines(ctx context.Context) ([]infrav1exp.AzureMachinePoolMachine, error) {
 	ctx, _, done := tele.StartSpanWithLogger(ctx, "scope.MachinePoolScope.getMachinePoolMachines")
 	defer done()
 
-	labels := map[string]string{
-		clusterv1.ClusterLabelName:      m.ClusterName(),
-		infrav1exp.MachinePoolNameLabel: m.AzureMachinePool.Name,
-	}
+	labels := m.getMachinePoolMachineLabels()
 	ampml := &infrav1exp.AzureMachinePoolMachineList{}
 	if err := m.client.List(ctx, ampml, client.InNamespace(m.AzureMachinePool.Namespace), client.MatchingLabels(labels)); err != nil {
 		return nil, errors.Wrap(err, "failed to list AzureMachinePoolMachines")
@@ -247,27 +421,49 @@ func (m *MachinePoolScope) applyAzureMachinePoolMachines(ctx context.Context) er
 	defer done()
 
 	if m.vmssState == nil {
-		log.Info("vmssState is nil")
 		return nil
 	}
 
-	labels := map[string]string{
-		clusterv1.ClusterLabelName:      m.ClusterName(),
-		infrav1exp.MachinePoolNameLabel: m.AzureMachinePool.Name,
-	}
-	ampml := &infrav1exp.AzureMachinePoolMachineList{}
-	if err := m.client.List(ctx, ampml, client.InNamespace(m.AzureMachinePool.Namespace), client.MatchingLabels(labels)); err != nil {
-		return errors.Wrap(err, "failed to list AzureMachinePoolMachines")
+	ampms, err := m.GetMachinePoolMachines(ctx)
+	if err != nil {
+		return err
 	}
 
-	existingMachinesByProviderID := make(map[string]infrav1exp.AzureMachinePoolMachine, len(ampml.Items))
-	for _, machine := range ampml.Items {
-		existingMachinesByProviderID[machine.Spec.ProviderID] = machine
+	existingMachinesByProviderID := make(map[string]infrav1exp.AzureMachinePoolMachine, len(ampms))
+	for _, ampm := range ampms {
+		machine, err := util.GetOwnerMachine(ctx, m.client, ampm.ObjectMeta)
+		if err != nil {
+			return fmt.Errorf("failed to find owner machine for %s/%s: %w", ampm.Namespace, ampm.Name, err)
+		}
+
+		if _, ampmHasDeleteAnnotation := ampm.Annotations[clusterv1.DeleteMachineAnnotation]; !ampmHasDeleteAnnotation {
+			// fetch Machine delete annotation from owner machine to AzureMachinePoolMachine.
+			// This ensures setting a deleteMachine annotation on the Machine has an effect on the AzureMachinePoolMachine
+			// and the deployment strategy, in case the automatic propagation of the annotation from Machine to AzureMachinePoolMachine
+			// hasn't been done yet.
+			if machine != nil && machine.Annotations != nil {
+				if _, hasDeleteAnnotation := machine.Annotations[clusterv1.DeleteMachineAnnotation]; hasDeleteAnnotation {
+					log.V(4).Info("fetched DeleteMachineAnnotation", "machine", ampm.Spec.ProviderID)
+					if ampm.Annotations == nil {
+						ampm.Annotations = make(map[string]string)
+					}
+					ampm.Annotations[clusterv1.DeleteMachineAnnotation] = machine.Annotations[clusterv1.DeleteMachineAnnotation]
+				}
+			}
+		} else {
+			log.V(4).Info("DeleteMachineAnnotation already set")
+		}
+
+		existingMachinesByProviderID[ampm.Spec.ProviderID] = ampm
 	}
 
 	// determine which machines need to be created to reflect the current state in Azure
-	azureMachinesByProviderID := m.vmssState.InstancesByProviderID()
+	azureMachinesByProviderID := m.vmssState.InstancesByProviderID(m.AzureMachinePool.Spec.OrchestrationMode)
 	for key, val := range azureMachinesByProviderID {
+		if val.State == infrav1.Deleting || val.State == infrav1.Deleted {
+			log.V(4).Info("not recreating AzureMachinePoolMachine because VMSS VM is deleting", "providerID", key)
+			continue
+		}
 		if _, ok := existingMachinesByProviderID[key]; !ok {
 			log.V(4).Info("creating AzureMachinePoolMachine", "providerID", key)
 			if err := m.createMachine(ctx, val); err != nil {
@@ -278,15 +474,14 @@ func (m *MachinePoolScope) applyAzureMachinePoolMachines(ctx context.Context) er
 	}
 
 	deleted := false
-	// delete machines that no longer exist in Azure
-	for key, machine := range existingMachinesByProviderID {
-		machine := machine
+	// Delete MachinePool Machines for instances that no longer exist in Azure, i.e. deleted out-of-band
+	for key, ampm := range existingMachinesByProviderID {
 		if _, ok := azureMachinesByProviderID[key]; !ok {
 			deleted = true
 			log.V(4).Info("deleting AzureMachinePoolMachine because it no longer exists in the VMSS", "providerID", key)
 			delete(existingMachinesByProviderID, key)
-			if err := m.client.Delete(ctx, &machine); err != nil {
-				return errors.Wrap(err, "failed deleting AzureMachinePoolMachine to reduce replica count")
+			if err := m.DeleteMachine(ctx, ampm); err != nil {
+				return errors.Wrap(err, "failed deleting AzureMachinePoolMachine no longer existing in Azure")
 			}
 		}
 	}
@@ -297,9 +492,17 @@ func (m *MachinePoolScope) applyAzureMachinePoolMachines(ctx context.Context) er
 		return nil
 	}
 
-	if futures.Has(m.AzureMachinePool, m.Name(), ScalesetsServiceName) {
+	if futures.Has(m.AzureMachinePool, m.Name(), ScalesetsServiceName, infrav1.PatchFuture) ||
+		futures.Has(m.AzureMachinePool, m.Name(), ScalesetsServiceName, infrav1.PutFuture) ||
+		futures.Has(m.AzureMachinePool, m.Name(), ScalesetsServiceName, infrav1.DeleteFuture) {
 		log.V(4).Info("exiting early due an in-progress long running operation on the ScaleSet")
 		// exit early to be less greedy about delete
+		return nil
+	}
+
+	// when replicas are externally managed, we do not want to scale down manually since that is handled by the external scaler.
+	if m.HasReplicasExternallyManaged(ctx) {
+		log.V(4).Info("exiting early due to replicas externally managed")
 		return nil
 	}
 
@@ -309,18 +512,35 @@ func (m *MachinePoolScope) applyAzureMachinePoolMachines(ctx context.Context) er
 		return nil
 	}
 
-	// select machines to delete to lower the replica count
-	toDelete, err := deleteSelector.SelectMachinesToDelete(ctx, m.DesiredReplicas(), existingMachinesByProviderID)
+	// Refresh LatestModelApplied from live VMSS state to avoid stale status causing incorrect deletion decisions.
+	// The AMPM reconciler may not run between an upgrade spec change and this reconciliation, leaving the
+	// LatestModelApplied status stale (e.g. true for old-model instances that have not yet been re-reconciled).
+	for key, ampm := range existingMachinesByProviderID {
+		if vm, ok := azureMachinesByProviderID[key]; ok {
+			ampm.Status.LatestModelApplied = m.vmssState.HasLatestModelApplied(vm)
+			existingMachinesByProviderID[key] = ampm
+		}
+	}
+
+	// Select Machines to delete to lower the replica count
+	toDelete, err := deleteSelector.SelectMachinesToDelete(ctx, m.DesiredReplicas(), existingMachinesByProviderID, m.RolloutInProgress())
 	if err != nil {
 		return errors.Wrap(err, "failed selecting AzureMachinePoolMachine(s) to delete")
 	}
 
-	for _, machine := range toDelete {
-		machine := machine
-		log.Info("deleting selected AzureMachinePoolMachine", "providerID", machine.Spec.ProviderID)
-		if err := m.client.Delete(ctx, &machine); err != nil {
+	// Delete MachinePool Machines as a part of scaling down
+	for i := range toDelete {
+		ampm := toDelete[i]
+		log.Info("deleting selected AzureMachinePoolMachine", "providerID", ampm.Spec.ProviderID)
+		if err := m.DeleteMachine(ctx, ampm); err != nil {
 			return errors.Wrap(err, "failed deleting AzureMachinePoolMachine to reduce replica count")
 		}
+	}
+
+	// Record the reconciled replica count only once the pool has converged, so that a scale-down still in
+	// progress keeps comparing against the higher pre-scale-down value on subsequent reconciles.
+	if len(existingMachinesByProviderID)-len(toDelete) <= int(m.DesiredReplicas()) {
+		m.AzureMachinePool.Status.LastReconciledReplicas = ptr.To(m.DesiredReplicas())
 	}
 
 	log.V(4).Info("done reconciling AzureMachinePoolMachine(s)")
@@ -328,32 +548,29 @@ func (m *MachinePoolScope) applyAzureMachinePoolMachines(ctx context.Context) er
 }
 
 func (m *MachinePoolScope) createMachine(ctx context.Context, machine azure.VMSSVM) error {
-	if machine.InstanceID == "" {
-		return errors.New("machine.InstanceID must not be empty")
-	}
+	ctx, _, done := tele.StartSpanWithLogger(ctx, "scope.MachinePoolScope.createMachine")
+	defer done()
 
-	if machine.Name == "" {
-		return errors.New("machine.Name must not be empty")
+	parsed, err := azureutil.ParseResourceID(machine.ID)
+	if err != nil {
+		return errors.Wrap(err, fmt.Sprintf("failed to parse resource id %q", machine.ID))
 	}
+	instanceID := strings.ReplaceAll(parsed.Name, "_", "-")
 
 	ampm := infrav1exp.AzureMachinePoolMachine{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      strings.Join([]string{m.AzureMachinePool.Name, machine.InstanceID}, "-"),
+			Name:      m.AzureMachinePool.Name + "-" + instanceID,
 			Namespace: m.AzureMachinePool.Namespace,
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					APIVersion:         infrav1exp.GroupVersion.String(),
-					Kind:               "AzureMachinePool",
+					Kind:               infrav1.AzureMachinePoolKind,
 					Name:               m.AzureMachinePool.Name,
-					BlockOwnerDeletion: to.BoolPtr(true),
+					BlockOwnerDeletion: ptr.To(true),
 					UID:                m.AzureMachinePool.UID,
 				},
 			},
-			Labels: map[string]string{
-				m.ClusterName():                 string(infrav1.ResourceLifecycleOwned),
-				clusterv1.ClusterLabelName:      m.ClusterName(),
-				infrav1exp.MachinePoolNameLabel: m.AzureMachinePool.Name,
-			},
+			Annotations: map[string]string{},
 		},
 		Spec: infrav1exp.AzureMachinePoolMachineSpec{
 			ProviderID: machine.ProviderID(),
@@ -361,10 +578,41 @@ func (m *MachinePoolScope) createMachine(ctx context.Context, machine azure.VMSS
 		},
 	}
 
+	labels := m.getMachinePoolMachineLabels()
+	ampm.Labels = labels
+
 	controllerutil.AddFinalizer(&ampm, infrav1exp.AzureMachinePoolMachineFinalizer)
-	conditions.MarkFalse(&ampm, infrav1.VMRunningCondition, string(infrav1.Creating), clusterv1.ConditionSeverityInfo, "")
+	v1beta1conditions.MarkFalse(&ampm, infrav1.VMRunningCondition, string(infrav1.Creating), clusterv1beta1.ConditionSeverityInfo, "")
 	if err := m.client.Create(ctx, &ampm); err != nil {
 		return errors.Wrapf(err, "failed creating AzureMachinePoolMachine %s in AzureMachinePool %s", machine.ID, m.AzureMachinePool.Name)
+	}
+
+	return nil
+}
+
+// DeleteMachine deletes an AzureMachinePoolMachine by fetching its owner Machine and deleting it. This ensures that the node cordon/drain happens before deleting the infrastructure.
+func (m *MachinePoolScope) DeleteMachine(ctx context.Context, ampm infrav1exp.AzureMachinePoolMachine) error {
+	ctx, log, done := tele.StartSpanWithLogger(ctx, "scope.MachinePoolScope.DeleteMachine")
+	defer done()
+
+	machine, err := util.GetOwnerMachine(ctx, m.client, ampm.ObjectMeta)
+	if err != nil {
+		return errors.Wrapf(err, "error getting owner Machine for AzureMachinePoolMachine %s/%s", ampm.Namespace, ampm.Name)
+	}
+	if machine == nil {
+		log.V(2).Info("No owner Machine exists for AzureMachinePoolMachine", "ampm", klog.KObj(&ampm))
+		// If the AzureMachinePoolMachine does not have an owner Machine, do not attempt to delete the AzureMachinePoolMachine as the MachinePool controller will create the
+		// Machine and we want to let it catch up. If we are too hasty to delete, that introduces a race condition where the AzureMachinePoolMachine could be deleted
+		// just as the Machine comes online.
+
+		// In the case where the MachinePool is being deleted and the Machine will never come online, the AzureMachinePoolMachine will be deleted via its ownerRef to the
+		// AzureMachinePool, so that is covered as well.
+
+		return nil
+	}
+
+	if err := m.client.Delete(ctx, machine); err != nil {
+		return errors.Wrapf(err, "failed to delete Machine %s for AzureMachinePoolMachine %s in MachinePool %s", machine.Name, ampm.Name, m.MachinePool.Name)
 	}
 
 	return nil
@@ -377,13 +625,13 @@ func (m *MachinePoolScope) SetLongRunningOperationState(future *infrav1.Future) 
 }
 
 // GetLongRunningOperationState will get the future on the AzureMachinePool status.
-func (m *MachinePoolScope) GetLongRunningOperationState(name, service string) *infrav1.Future {
-	return futures.Get(m.AzureMachinePool, name, service)
+func (m *MachinePoolScope) GetLongRunningOperationState(name, service, futureType string) *infrav1.Future {
+	return futures.Get(m.AzureMachinePool, name, service, futureType)
 }
 
 // DeleteLongRunningOperationState will delete the future from the AzureMachinePool status.
-func (m *MachinePoolScope) DeleteLongRunningOperationState(name, service string) {
-	futures.Delete(m.AzureMachinePool, name, service)
+func (m *MachinePoolScope) DeleteLongRunningOperationState(name, service, futureType string) {
+	futures.Delete(m.AzureMachinePool, name, service, futureType)
 }
 
 // setProvisioningStateAndConditions sets the AzureMachinePool provisioning state and conditions.
@@ -392,32 +640,38 @@ func (m *MachinePoolScope) setProvisioningStateAndConditions(v infrav1.Provision
 	switch {
 	case v == infrav1.Succeeded && *m.MachinePool.Spec.Replicas == m.AzureMachinePool.Status.Replicas:
 		// vmss is provisioned with enough ready replicas
-		conditions.MarkTrue(m.AzureMachinePool, infrav1.ScaleSetRunningCondition)
-		conditions.MarkTrue(m.AzureMachinePool, infrav1.ScaleSetModelUpdatedCondition)
-		conditions.MarkTrue(m.AzureMachinePool, infrav1.ScaleSetDesiredReplicasCondition)
+		v1beta1conditions.MarkTrue(m.AzureMachinePool, infrav1.ScaleSetRunningCondition)
+		v1beta1conditions.MarkTrue(m.AzureMachinePool, infrav1.ScaleSetModelUpdatedCondition)
+		v1beta1conditions.MarkTrue(m.AzureMachinePool, infrav1.ScaleSetDesiredReplicasCondition)
 		m.SetReady()
 	case v == infrav1.Succeeded && *m.MachinePool.Spec.Replicas != m.AzureMachinePool.Status.Replicas:
 		// not enough ready or too many ready replicas we must still be scaling up or down
 		updatingState := infrav1.Updating
 		m.AzureMachinePool.Status.ProvisioningState = &updatingState
 		if *m.MachinePool.Spec.Replicas > m.AzureMachinePool.Status.Replicas {
-			conditions.MarkFalse(m.AzureMachinePool, infrav1.ScaleSetDesiredReplicasCondition, infrav1.ScaleSetScaleUpReason, clusterv1.ConditionSeverityInfo, "")
+			v1beta1conditions.MarkFalse(m.AzureMachinePool, infrav1.ScaleSetDesiredReplicasCondition, infrav1.ScaleSetScaleUpReason, clusterv1beta1.ConditionSeverityInfo, "")
 		} else {
-			conditions.MarkFalse(m.AzureMachinePool, infrav1.ScaleSetDesiredReplicasCondition, infrav1.ScaleSetScaleDownReason, clusterv1.ConditionSeverityInfo, "")
+			v1beta1conditions.MarkFalse(m.AzureMachinePool, infrav1.ScaleSetDesiredReplicasCondition, infrav1.ScaleSetScaleDownReason, clusterv1beta1.ConditionSeverityInfo, "")
 		}
-		m.SetNotReady()
+		m.SetReady()
 	case v == infrav1.Updating:
-		conditions.MarkFalse(m.AzureMachinePool, infrav1.ScaleSetModelUpdatedCondition, infrav1.ScaleSetModelOutOfDateReason, clusterv1.ConditionSeverityInfo, "")
-		m.SetNotReady()
+		v1beta1conditions.MarkFalse(m.AzureMachinePool, infrav1.ScaleSetModelUpdatedCondition, infrav1.ScaleSetModelOutOfDateReason, clusterv1beta1.ConditionSeverityInfo, "")
+		m.SetReady()
 	case v == infrav1.Creating:
-		conditions.MarkFalse(m.AzureMachinePool, infrav1.ScaleSetRunningCondition, infrav1.ScaleSetCreatingReason, clusterv1.ConditionSeverityInfo, "")
+		v1beta1conditions.MarkFalse(m.AzureMachinePool, infrav1.ScaleSetRunningCondition, infrav1.ScaleSetCreatingReason, clusterv1beta1.ConditionSeverityInfo, "")
 		m.SetNotReady()
 	case v == infrav1.Deleting:
-		conditions.MarkFalse(m.AzureMachinePool, infrav1.ScaleSetRunningCondition, infrav1.ScaleSetDeletingReason, clusterv1.ConditionSeverityInfo, "")
+		v1beta1conditions.MarkFalse(m.AzureMachinePool, infrav1.ScaleSetRunningCondition, infrav1.ScaleSetDeletingReason, clusterv1beta1.ConditionSeverityInfo, "")
+		m.SetNotReady()
+	case v == infrav1.Failed:
+		v1beta1conditions.MarkFalse(m.AzureMachinePool, infrav1.ScaleSetRunningCondition, infrav1.ScaleSetProvisionFailedReason, clusterv1beta1.ConditionSeverityInfo, "")
+		m.SetNotReady()
+	case v == infrav1.Canceled || v == infrav1.Deleted:
+		v1beta1conditions.MarkFalse(m.AzureMachinePool, infrav1.ScaleSetRunningCondition, string(v), clusterv1beta1.ConditionSeverityInfo, "")
 		m.SetNotReady()
 	default:
-		conditions.MarkFalse(m.AzureMachinePool, infrav1.ScaleSetRunningCondition, string(v), clusterv1.ConditionSeverityInfo, "")
-		m.SetNotReady()
+		// Preserve readiness for unhandled provisioning states.
+		v1beta1conditions.MarkFalse(m.AzureMachinePool, infrav1.ScaleSetRunningCondition, string(v), clusterv1beta1.ConditionSeverityInfo, "")
 	}
 }
 
@@ -433,35 +687,12 @@ func (m *MachinePoolScope) SetNotReady() {
 
 // SetFailureMessage sets the AzureMachinePool status failure message.
 func (m *MachinePoolScope) SetFailureMessage(v error) {
-	m.AzureMachinePool.Status.FailureMessage = pointer.StringPtr(v.Error())
+	m.AzureMachinePool.Status.FailureMessage = ptr.To(v.Error())
 }
 
 // SetFailureReason sets the AzureMachinePool status failure reason.
-func (m *MachinePoolScope) SetFailureReason(v capierrors.MachineStatusError) {
+func (m *MachinePoolScope) SetFailureReason(v string) {
 	m.AzureMachinePool.Status.FailureReason = &v
-}
-
-// SetBootstrapConditions sets the AzureMachinePool BootstrapSucceeded condition based on the extension provisioning states.
-func (m *MachinePoolScope) SetBootstrapConditions(ctx context.Context, provisioningState string, extensionName string) error {
-	_, log, done := tele.StartSpanWithLogger(ctx, "scope.MachinePoolScope.SetBootstrapConditions")
-	defer done()
-
-	switch infrav1.ProvisioningState(provisioningState) {
-	case infrav1.Succeeded:
-		log.V(4).Info("extension provisioning state is succeeded", "vm extension", extensionName, "scale set", m.Name())
-		conditions.MarkTrue(m.AzureMachinePool, infrav1.BootstrapSucceededCondition)
-		return nil
-	case infrav1.Creating:
-		log.V(4).Info("extension provisioning state is creating", "vm extension", extensionName, "scale set", m.Name())
-		conditions.MarkFalse(m.AzureMachinePool, infrav1.BootstrapSucceededCondition, infrav1.BootstrapInProgressReason, clusterv1.ConditionSeverityInfo, "")
-		return azure.WithTransientError(errors.New("extension is still in provisioning state. This likely means that bootstrapping has not yet completed on the VM"), 30*time.Second)
-	case infrav1.Failed:
-		log.V(4).Info("extension provisioning state is failed", "vm extension", extensionName, "scale set", m.Name())
-		conditions.MarkFalse(m.AzureMachinePool, infrav1.BootstrapSucceededCondition, infrav1.BootstrapFailedReason, clusterv1.ConditionSeverityError, "")
-		return azure.WithTerminalError(errors.New("extension state failed. This likely means the Kubernetes node bootstrapping process failed or timed out. Check VM boot diagnostics logs to learn more"))
-	default:
-		return nil
-	}
 }
 
 // AdditionalTags merges AdditionalTags from the scope's AzureCluster and AzureMachinePool. If the same key is present in both,
@@ -486,20 +717,35 @@ func (m *MachinePoolScope) SetAnnotation(key, value string) {
 	m.AzureMachinePool.Annotations[key] = value
 }
 
-// PatchObject persists the machine spec and status.
+// PatchObject persists the AzureMachinePool spec and status.
 func (m *MachinePoolScope) PatchObject(ctx context.Context) error {
 	ctx, _, done := tele.StartSpanWithLogger(ctx, "scope.MachinePoolScope.PatchObject")
 	defer done()
 
-	return m.patchHelper.Patch(ctx, m.AzureMachinePool)
+	v1beta1conditions.SetSummary(m.AzureMachinePool)
+	return m.patchHelper.Patch(
+		ctx,
+		m.AzureMachinePool,
+		v1beta1patch.WithOwnedConditions{Conditions: []clusterv1beta1.ConditionType{
+			clusterv1beta1.ReadyCondition,
+			infrav1.BootstrapSucceededCondition,
+			infrav1.ScaleSetDesiredReplicasCondition,
+			infrav1.ScaleSetModelUpdatedCondition,
+			infrav1.ScaleSetRunningCondition,
+		}})
 }
 
-// Close the MachineScope by updating the machine spec, machine status.
+// Close the MachinePoolScope by updating the AzureMachinePool spec and AzureMachinePool status.
 func (m *MachinePoolScope) Close(ctx context.Context) error {
 	ctx, log, done := tele.StartSpanWithLogger(ctx, "scope.MachinePoolScope.Close")
 	defer done()
 
-	if m.vmssState != nil {
+	// Only sync MachinePool w/ MachinePoolMachines if the MachinePool
+	// represents an actual Azure VMSS (vmssState != nil), and if the
+	// MachinePool is not in an active state of deletion
+	// (DeletionTimestamp.IsZero()) to avoid recreating
+	// AzureMachinePoolMachines that reconcileDelete just removed.
+	if m.vmssState != nil && m.AzureMachinePool.DeletionTimestamp.IsZero() {
 		if err := m.applyAzureMachinePoolMachines(ctx); err != nil {
 			log.Error(err, "failed to apply changes to the AzureMachinePoolMachines")
 			return errors.Wrap(err, "failed to apply changes to AzureMachinePoolMachines")
@@ -511,17 +757,23 @@ func (m *MachinePoolScope) Close(ctx context.Context) error {
 		}
 	}
 
-	return m.patchHelper.Patch(ctx, m.AzureMachinePool)
+	if err := m.PatchObject(ctx); err != nil {
+		return errors.Wrap(err, "unable to patch AzureMachinePool")
+	}
+	if err := m.PatchCAPIMachinePoolObject(ctx); err != nil {
+		return errors.Wrap(err, "unable to patch CAPI MachinePool")
+	}
+	return nil
 }
 
-// GetBootstrapData returns the bootstrap data from the secret in the Machine's bootstrap.dataSecretName.
+// GetBootstrapData returns the bootstrap data from the secret in the MachinePool's bootstrap.dataSecretName.
 func (m *MachinePoolScope) GetBootstrapData(ctx context.Context) (string, error) {
 	ctx, _, done := tele.StartSpanWithLogger(ctx, "scope.MachinePoolScope.GetBootstrapData")
 	defer done()
 
 	dataSecretName := m.MachinePool.Spec.Template.Spec.Bootstrap.DataSecretName
 	if dataSecretName == nil {
-		return "", errors.New("error retrieving bootstrap data: linked Machine Spec's bootstrap.dataSecretName is nil")
+		return "", errors.New("error retrieving bootstrap data: linked MachinePool Spec's bootstrap.dataSecretName is nil")
 	}
 	secret := &corev1.Secret{}
 	key := types.NamespacedName{Namespace: m.AzureMachinePool.Namespace, Name: *dataSecretName}
@@ -536,9 +788,9 @@ func (m *MachinePoolScope) GetBootstrapData(ctx context.Context) (string, error)
 	return base64.StdEncoding.EncodeToString(value), nil
 }
 
-// GetVMImage picks an image from the machine configuration, or uses a default one.
+// GetVMImage picks an image from the AzureMachinePool configuration, or uses a default one.
 func (m *MachinePoolScope) GetVMImage(ctx context.Context) (*infrav1.Image, error) {
-	_, log, done := tele.StartSpanWithLogger(ctx, "scope.MachinePoolScope.GetVMImage")
+	ctx, log, done := tele.StartSpanWithLogger(ctx, "scope.MachinePoolScope.GetVMImage")
 	defer done()
 
 	// Use custom Marketplace image, Image ID or a Shared Image Gallery image if provided
@@ -550,12 +802,19 @@ func (m *MachinePoolScope) GetVMImage(ctx context.Context) (*infrav1.Image, erro
 		err          error
 		defaultImage *infrav1.Image
 	)
+
+	svc, err := virtualmachineimages.New(m)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create virtualmachineimages service")
+	}
+
 	if m.AzureMachinePool.Spec.Template.OSDisk.OSType == azure.WindowsOS {
 		runtime := m.AzureMachinePool.Annotations["runtime"]
-		log.V(4).Info("No image specified for machine, using default Windows Image", "machine", m.MachinePool.GetName(), "runtime", runtime)
-		defaultImage, err = azure.GetDefaultWindowsImage(to.String(m.MachinePool.Spec.Template.Spec.Version), runtime)
+		windowsServerVersion := m.AzureMachinePool.Annotations["windowsServerVersion"]
+		log.V(4).Info("No image specified for machine, using default Windows Image", "machine", m.MachinePool.GetName(), "runtime", runtime, "windowsServerVersion", windowsServerVersion)
+		defaultImage, err = svc.GetDefaultWindowsImage(ctx, m.Location(), m.MachinePool.Spec.Template.Spec.Version, runtime, windowsServerVersion)
 	} else {
-		defaultImage, err = azure.GetDefaultUbuntuImage(to.String(m.MachinePool.Spec.Template.Spec.Version))
+		defaultImage, err = svc.GetDefaultLinuxImage(ctx, m.Location(), m.MachinePool.Spec.Template.Spec.Version)
 	}
 
 	if err != nil {
@@ -571,26 +830,63 @@ func (m *MachinePoolScope) SaveVMImageToStatus(image *infrav1.Image) {
 }
 
 // RoleAssignmentSpecs returns the role assignment specs.
-func (m *MachinePoolScope) RoleAssignmentSpecs() []azure.RoleAssignmentSpec {
-	if m.AzureMachinePool.Spec.Identity == infrav1.VMIdentitySystemAssigned {
-		return []azure.RoleAssignmentSpec{
-			{
-				MachineName:  m.Name(),
-				Name:         m.AzureMachinePool.Spec.RoleAssignmentName,
-				ResourceType: azure.VirtualMachineScaleSet,
-			},
+func (m *MachinePoolScope) RoleAssignmentSpecs(principalID *string) []azure.ResourceSpecGetter {
+	roles := make([]azure.ResourceSpecGetter, 1)
+	if m.HasSystemAssignedIdentity() {
+		roles[0] = &roleassignments.RoleAssignmentSpec{
+			Name:             m.SystemAssignedIdentityName(),
+			MachineName:      m.Name(),
+			ResourceGroup:    m.NodeResourceGroup(),
+			ResourceType:     azure.VirtualMachineScaleSet,
+			Scope:            m.SystemAssignedIdentityScope(),
+			RoleDefinitionID: m.SystemAssignedIdentityDefinitionID(),
+			PrincipalID:      principalID,
+			PrincipalType:    armauthorization.PrincipalTypeServicePrincipal,
 		}
+		return roles
 	}
-	return []azure.RoleAssignmentSpec{}
+	return []azure.ResourceSpecGetter{}
 }
 
-// VMSSExtensionSpecs returns the vmss extension specs.
-func (m *MachinePoolScope) VMSSExtensionSpecs() []azure.ExtensionSpec {
-	var extensionSpecs = []azure.ExtensionSpec{}
-	extensionSpec := azure.GetBootstrappingVMExtension(m.AzureMachinePool.Spec.Template.OSDisk.OSType, m.CloudEnvironment(), m.Name())
+// RoleAssignmentResourceType returns the role assignment resource type.
+func (m *MachinePoolScope) RoleAssignmentResourceType() string {
+	return azure.VirtualMachineScaleSet
+}
 
-	if extensionSpec != nil {
-		extensionSpecs = append(extensionSpecs, *extensionSpec)
+// HasSystemAssignedIdentity returns true if the azure machine pool has system
+// assigned identity.
+func (m *MachinePoolScope) HasSystemAssignedIdentity() bool {
+	return m.AzureMachinePool.Spec.Identity == infrav1.VMIdentitySystemAssigned
+}
+
+// VMSSExtensionSpecs returns the VMSS extension specs.
+func (m *MachinePoolScope) VMSSExtensionSpecs() []azure.ResourceSpecGetter {
+	var extensionSpecs = []azure.ResourceSpecGetter{}
+
+	for _, extension := range m.AzureMachinePool.Spec.Template.VMExtensions {
+		extensionSpecs = append(extensionSpecs, &scalesets.VMSSExtensionSpec{
+			ExtensionSpec: azure.ExtensionSpec{
+				Name:              extension.Name,
+				VMName:            m.Name(),
+				Publisher:         extension.Publisher,
+				Version:           extension.Version,
+				Settings:          extension.Settings,
+				ProtectedSettings: extension.ProtectedSettings,
+			},
+			ResourceGroup: m.NodeResourceGroup(),
+		})
+	}
+
+	if !ptr.Deref(m.AzureMachinePool.Spec.Template.DisableVMBootstrapExtension, true) {
+		cpuArchitectureType, _ := m.cache.VMSKU.GetCapability(resourceskus.CPUArchitectureType)
+		bootstrapExtensionSpec := azure.GetBootstrappingVMExtension(m.AzureMachinePool.Spec.Template.OSDisk.OSType, m.CloudEnvironment(), m.Name(), cpuArchitectureType)
+
+		if bootstrapExtensionSpec != nil {
+			extensionSpecs = append(extensionSpecs, &scalesets.VMSSExtensionSpec{
+				ExtensionSpec: *bootstrapExtensionSpec,
+				ResourceGroup: m.NodeResourceGroup(),
+			})
+		}
 	}
 
 	return extensionSpecs
@@ -608,7 +904,7 @@ func (m *MachinePoolScope) getDeploymentStrategy() machinepool.TypedDeleteSelect
 // Note: this logic exists only for purposes of ensuring backwards compatibility for old clusters created without the `subnetName` field being
 // set, and should be removed in the future when this field is no longer optional.
 func (m *MachinePoolScope) SetSubnetName() error {
-	if m.AzureMachinePool.Spec.Template.SubnetName == "" {
+	if m.AzureMachinePool.Spec.Template.NetworkInterfaces[0].SubnetName == "" {
 		subnetName := ""
 		for _, subnet := range m.NodeSubnets() {
 			subnetName = subnet.Name
@@ -617,50 +913,118 @@ func (m *MachinePoolScope) SetSubnetName() error {
 			return errors.New("a subnet name must be specified when no subnets are specified or more than 1 subnet of role 'node' exist")
 		}
 
-		m.AzureMachinePool.Spec.Template.SubnetName = subnetName
+		m.AzureMachinePool.Spec.Template.NetworkInterfaces[0].SubnetName = subnetName
 	}
 
 	return nil
 }
 
 // UpdateDeleteStatus updates a condition on the AzureMachinePool status after a DELETE operation.
-func (m *MachinePoolScope) UpdateDeleteStatus(condition clusterv1.ConditionType, service string, err error) {
+func (m *MachinePoolScope) UpdateDeleteStatus(condition clusterv1beta1.ConditionType, service string, err error) {
 	switch {
 	case err == nil:
-		conditions.MarkFalse(m.AzureMachinePool, condition, infrav1.DeletedReason, clusterv1.ConditionSeverityInfo, "%s successfully deleted", service)
-	case errors.Is(err, azure.ErrNotOwned):
-		// do nothing
+		v1beta1conditions.MarkFalse(m.AzureMachinePool, condition, infrav1.DeletedReason, clusterv1beta1.ConditionSeverityInfo, "%s successfully deleted", service)
 	case azure.IsOperationNotDoneError(err):
-		conditions.MarkFalse(m.AzureMachinePool, condition, infrav1.DeletingReason, clusterv1.ConditionSeverityInfo, "%s deleting", service)
+		v1beta1conditions.MarkFalse(m.AzureMachinePool, condition, infrav1.DeletingReason, clusterv1beta1.ConditionSeverityInfo, "%s deleting", service)
 	default:
-		conditions.MarkFalse(m.AzureMachinePool, condition, infrav1.DeletionFailedReason, clusterv1.ConditionSeverityError, "%s failed to delete. err: %s", service, err.Error())
+		v1beta1conditions.MarkFalse(m.AzureMachinePool, condition, infrav1.DeletionFailedReason, clusterv1beta1.ConditionSeverityError, "%s failed to delete. err: %s", service, err.Error())
 	}
 }
 
 // UpdatePutStatus updates a condition on the AzureMachinePool status after a PUT operation.
-func (m *MachinePoolScope) UpdatePutStatus(condition clusterv1.ConditionType, service string, err error) {
+func (m *MachinePoolScope) UpdatePutStatus(condition clusterv1beta1.ConditionType, service string, err error) {
 	switch {
 	case err == nil:
-		conditions.MarkTrue(m.AzureMachinePool, condition)
-	case errors.Is(err, azure.ErrNotOwned):
-		// do nothing
+		v1beta1conditions.MarkTrue(m.AzureMachinePool, condition)
 	case azure.IsOperationNotDoneError(err):
-		conditions.MarkFalse(m.AzureMachinePool, condition, infrav1.CreatingReason, clusterv1.ConditionSeverityInfo, "%s creating or updating", service)
+		v1beta1conditions.MarkFalse(m.AzureMachinePool, condition, infrav1.CreatingReason, clusterv1beta1.ConditionSeverityInfo, "%s creating or updating", service)
 	default:
-		conditions.MarkFalse(m.AzureMachinePool, condition, infrav1.FailedReason, clusterv1.ConditionSeverityError, "%s failed to create or update. err: %s", service, err.Error())
+		v1beta1conditions.MarkFalse(m.AzureMachinePool, condition, infrav1.FailedReason, clusterv1beta1.ConditionSeverityError, "%s failed to create or update. err: %s", service, err.Error())
 	}
 }
 
 // UpdatePatchStatus updates a condition on the AzureMachinePool status after a PATCH operation.
-func (m *MachinePoolScope) UpdatePatchStatus(condition clusterv1.ConditionType, service string, err error) {
+func (m *MachinePoolScope) UpdatePatchStatus(condition clusterv1beta1.ConditionType, service string, err error) {
 	switch {
 	case err == nil:
-		conditions.MarkTrue(m.AzureMachinePool, condition)
-	case errors.Is(err, azure.ErrNotOwned):
-		// do nothing
+		v1beta1conditions.MarkTrue(m.AzureMachinePool, condition)
 	case azure.IsOperationNotDoneError(err):
-		conditions.MarkFalse(m.AzureMachinePool, condition, infrav1.UpdatingReason, clusterv1.ConditionSeverityInfo, "%s updating", service)
+		v1beta1conditions.MarkFalse(m.AzureMachinePool, condition, infrav1.UpdatingReason, clusterv1beta1.ConditionSeverityInfo, "%s updating", service)
 	default:
-		conditions.MarkFalse(m.AzureMachinePool, condition, infrav1.FailedReason, clusterv1.ConditionSeverityError, "%s failed to update. err: %s", service, err.Error())
+		v1beta1conditions.MarkFalse(m.AzureMachinePool, condition, infrav1.FailedReason, clusterv1beta1.ConditionSeverityError, "%s failed to update. err: %s", service, err.Error())
+	}
+}
+
+// PatchCAPIMachinePoolObject persists the capi machinepool configuration and status.
+func (m *MachinePoolScope) PatchCAPIMachinePoolObject(ctx context.Context) error {
+	return m.capiMachinePoolPatchHelper.Patch(
+		ctx,
+		m.MachinePool,
+	)
+}
+
+// UpdateCAPIMachinePoolReplicas updates the associated MachinePool replica count.
+func (m *MachinePoolScope) UpdateCAPIMachinePoolReplicas(_ context.Context, replicas *int32) {
+	m.MachinePool.Spec.Replicas = replicas
+}
+
+// HasReplicasExternallyManaged returns true if the externally managed annotation is set on the CAPI MachinePool resource.
+func (m *MachinePoolScope) HasReplicasExternallyManaged(_ context.Context) bool {
+	return annotations.ReplicasManagedByExternalAutoscaler(m.MachinePool)
+}
+
+// ReconcileReplicas ensures MachinePool replicas match VMSS capacity if replicas are externally managed by an autoscaler.
+func (m *MachinePoolScope) ReconcileReplicas(ctx context.Context, vmss *azure.VMSS) error {
+	if !m.HasReplicasExternallyManaged(ctx) {
+		return nil
+	}
+
+	var replicas int32
+	if m.MachinePool.Spec.Replicas != nil {
+		replicas = *m.MachinePool.Spec.Replicas
+	}
+
+	if capacity := int32(vmss.Capacity); capacity != replicas {
+		m.UpdateCAPIMachinePoolReplicas(ctx, &capacity)
+	}
+
+	return nil
+}
+
+// AnnotationJSON returns a map[string]interface from a JSON annotation.
+func (m *MachinePoolScope) AnnotationJSON(annotation string) (map[string]any, error) {
+	out := map[string]any{}
+	jsonAnnotation := m.AzureMachinePool.GetAnnotations()[annotation]
+	if jsonAnnotation == "" {
+		return out, nil
+	}
+	err := json.Unmarshal([]byte(jsonAnnotation), &out)
+	if err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+// UpdateAnnotationJSON updates the `annotation` with
+// `content`. `content` in this case should be a `map[string]interface{}`
+// suitable for turning into JSON. This `content` map will be marshalled into a
+// JSON string before being set as the given `annotation`.
+func (m *MachinePoolScope) UpdateAnnotationJSON(annotation string, content map[string]any) error {
+	b, err := json.Marshal(content)
+	if err != nil {
+		return err
+	}
+	m.SetAnnotation(annotation, string(b))
+	return nil
+}
+
+// TagsSpecs returns the tags for the AzureMachinePool.
+func (m *MachinePoolScope) TagsSpecs() []azure.TagsSpec {
+	return []azure.TagsSpec{
+		{
+			Scope:      azure.VMSSID(m.SubscriptionID(), m.NodeResourceGroup(), m.Name()),
+			Tags:       m.AdditionalTags(),
+			Annotation: azure.VMSSTagsLastAppliedAnnotation,
+		},
 	}
 }

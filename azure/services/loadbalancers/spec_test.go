@@ -19,60 +19,67 @@ package loadbalancers
 import (
 	"testing"
 
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-02-01/network"
-	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v4"
 	. "github.com/onsi/gomega"
+	"k8s.io/utils/ptr"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 )
 
-func getExistingLBWithMissingFrontendIPConfigs() network.LoadBalancer {
+func getExistingLBWithMissingFrontendIPConfigs() armnetwork.LoadBalancer {
 	existingLB := newSamplePublicAPIServerLB(false, true, true, true, true)
-	existingLB.FrontendIPConfigurations = &[]network.FrontendIPConfiguration{}
+	existingLB.Properties.FrontendIPConfigurations = []*armnetwork.FrontendIPConfiguration{}
 
 	return existingLB
 }
 
-func getExistingLBWithMissingBackendPool() network.LoadBalancer {
+func getExistingLBWithMissingBackendPool() armnetwork.LoadBalancer {
 	existingLB := newSamplePublicAPIServerLB(true, false, true, true, true)
-	existingLB.BackendAddressPools = &[]network.BackendAddressPool{}
+	existingLB.Properties.BackendAddressPools = []*armnetwork.BackendAddressPool{}
 
 	return existingLB
 }
 
-func getExistingLBWithMissingLBRules() network.LoadBalancer {
+func getExistingLBWithMissingLBRules() armnetwork.LoadBalancer {
 	existingLB := newSamplePublicAPIServerLB(true, true, false, true, true)
-	existingLB.LoadBalancingRules = &[]network.LoadBalancingRule{}
+	existingLB.Properties.LoadBalancingRules = []*armnetwork.LoadBalancingRule{}
 
 	return existingLB
 }
 
-func getExistingLBWithMissingProbes() network.LoadBalancer {
+func getExistingLBWithMissingProbes() armnetwork.LoadBalancer {
 	existingLB := newSamplePublicAPIServerLB(true, true, true, false, true)
-	existingLB.Probes = &[]network.Probe{}
+	existingLB.Properties.Probes = []*armnetwork.Probe{}
 
 	return existingLB
 }
 
-func getExistingLBWithMissingOutboundRules() network.LoadBalancer {
+func getExistingLBWithMissingOutboundRules() armnetwork.LoadBalancer {
 	existingLB := newSamplePublicAPIServerLB(true, true, true, true, false)
-	existingLB.OutboundRules = &[]network.OutboundRule{}
+	existingLB.Properties.OutboundRules = []*armnetwork.OutboundRule{}
 
 	return existingLB
+}
+
+func getPublicAPILBSpecWithFrontendPort(port int32) *LBSpec {
+	spec := fakePublicAPILBSpec
+	spec.APIServerFrontendPort = port
+	return &spec
 }
 
 func TestParameters(t *testing.T) {
 	testcases := []struct {
 		name          string
 		spec          *LBSpec
-		existing      interface{}
-		expect        func(g *WithT, result interface{})
+		existing      any
+		expect        func(g *WithT, result any)
 		expectedError string
 	}{
 		{
 			name:     "public API load balancer exists with all expected values",
 			spec:     &fakePublicAPILBSpec,
 			existing: newSamplePublicAPIServerLB(false, false, false, false, false),
-			expect: func(g *WithT, result interface{}) {
+			expect: func(g *WithT, result any) {
 				g.Expect(result).To(BeNil())
 			},
 			expectedError: "",
@@ -81,7 +88,7 @@ func TestParameters(t *testing.T) {
 			name:     "internal API load balancer with all expected values",
 			spec:     &fakeInternalAPILBSpec,
 			existing: newDefaultInternalAPIServerLB(),
-			expect: func(g *WithT, result interface{}) {
+			expect: func(g *WithT, result any) {
 				g.Expect(result).To(BeNil())
 			},
 			expectedError: "",
@@ -90,8 +97,60 @@ func TestParameters(t *testing.T) {
 			name:     "node outbound load balancer exists with all expected values",
 			spec:     &fakeNodeOutboundLBSpec,
 			existing: newDefaultNodeOutboundLB(),
-			expect: func(g *WithT, result interface{}) {
+			expect: func(g *WithT, result any) {
 				g.Expect(result).To(BeNil())
+			},
+			expectedError: "",
+		},
+		{
+			name:     "existing API server load balancer is updated to use the desired frontend port",
+			spec:     getPublicAPILBSpecWithFrontendPort(443),
+			existing: newSamplePublicAPIServerLB(false, false, false, false, false),
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(Equal(newSamplePublicAPIServerLB(false, false, false, false, false, func(lb *armnetwork.LoadBalancer) {
+					lb.Properties.LoadBalancingRules[0].Properties.FrontendPort = ptr.To[int32](443)
+				})))
+			},
+			expectedError: "",
+		},
+		{
+			name:     "existing API server rule and probe are updated when desired properties differ",
+			spec:     &fakePublicAPILBSpec,
+			existing: newSamplePublicAPIServerLB(false, false, true, true, false),
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(Equal(newSamplePublicAPIServerLB(false, false, false, false, false)))
+			},
+			expectedError: "",
+		},
+		{
+			name:     "load balancer exists with missing additional API server ports",
+			spec:     &fakePublicAPILBSpecWithAdditionalPorts,
+			existing: getExistingLBWithMissingFrontendIPConfigs(),
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armnetwork.LoadBalancer{}))
+				g.Expect(result.(armnetwork.LoadBalancer)).To(Equal(newSamplePublicAPIServerLB(false, true, false, false, true, func(lb *armnetwork.LoadBalancer) {
+					lb.Properties.LoadBalancingRules = append(lb.Properties.LoadBalancingRules, &armnetwork.LoadBalancingRule{
+						Name: ptr.To("rke2-agent"),
+						Properties: &armnetwork.LoadBalancingRulePropertiesFormat{
+							DisableOutboundSnat:  ptr.To(true),
+							Protocol:             ptr.To(armnetwork.TransportProtocolTCP),
+							FrontendPort:         ptr.To[int32](9345),
+							BackendPort:          ptr.To[int32](9345),
+							IdleTimeoutInMinutes: ptr.To[int32](4),
+							EnableFloatingIP:     ptr.To(false),
+							LoadDistribution:     ptr.To(armnetwork.LoadDistributionDefault),
+							FrontendIPConfiguration: &armnetwork.SubResource{
+								ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-publiclb/frontendIPConfigurations/my-publiclb-frontEnd"),
+							},
+							BackendAddressPool: &armnetwork.SubResource{
+								ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-publiclb/backendAddressPools/my-publiclb-backendPool"),
+							},
+							Probe: &armnetwork.SubResource{
+								ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-publiclb/probes/HTTPSProbe"),
+							},
+						},
+					})
+				})))
 			},
 			expectedError: "",
 		},
@@ -99,9 +158,9 @@ func TestParameters(t *testing.T) {
 			name:     "load balancer exists with missing frontend IP configs",
 			spec:     &fakePublicAPILBSpec,
 			existing: getExistingLBWithMissingFrontendIPConfigs(),
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(network.LoadBalancer{}))
-				g.Expect(result.(network.LoadBalancer)).To(Equal(newSamplePublicAPIServerLB(false, true, true, true, true)))
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armnetwork.LoadBalancer{}))
+				g.Expect(result.(armnetwork.LoadBalancer)).To(Equal(newSamplePublicAPIServerLB(false, true, false, false, true)))
 			},
 			expectedError: "",
 		},
@@ -109,9 +168,9 @@ func TestParameters(t *testing.T) {
 			name:     "load balancer exists with missing backend pool",
 			spec:     &fakePublicAPILBSpec,
 			existing: getExistingLBWithMissingBackendPool(),
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(network.LoadBalancer{}))
-				g.Expect(result.(network.LoadBalancer)).To(Equal(newSamplePublicAPIServerLB(true, false, true, true, true)))
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armnetwork.LoadBalancer{}))
+				g.Expect(result.(armnetwork.LoadBalancer)).To(Equal(newSamplePublicAPIServerLB(true, false, false, false, true)))
 			},
 			expectedError: "",
 		},
@@ -119,9 +178,9 @@ func TestParameters(t *testing.T) {
 			name:     "load balancer exists with missing load balancing rules",
 			spec:     &fakePublicAPILBSpec,
 			existing: getExistingLBWithMissingLBRules(),
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(network.LoadBalancer{}))
-				g.Expect(result.(network.LoadBalancer)).To(Equal(newSamplePublicAPIServerLB(true, true, false, true, true)))
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armnetwork.LoadBalancer{}))
+				g.Expect(result.(armnetwork.LoadBalancer)).To(Equal(newSamplePublicAPIServerLB(true, true, false, false, true)))
 			},
 			expectedError: "",
 		},
@@ -129,9 +188,9 @@ func TestParameters(t *testing.T) {
 			name:     "load balancer exists with missing probes",
 			spec:     &fakePublicAPILBSpec,
 			existing: getExistingLBWithMissingProbes(),
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(network.LoadBalancer{}))
-				g.Expect(result.(network.LoadBalancer)).To(Equal(newSamplePublicAPIServerLB(true, true, true, false, true)))
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armnetwork.LoadBalancer{}))
+				g.Expect(result.(armnetwork.LoadBalancer)).To(Equal(newSamplePublicAPIServerLB(true, true, false, false, true)))
 			},
 			expectedError: "",
 		},
@@ -139,20 +198,52 @@ func TestParameters(t *testing.T) {
 			name:     "load balancer exists with missing outbound rules",
 			spec:     &fakePublicAPILBSpec,
 			existing: getExistingLBWithMissingOutboundRules(),
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armnetwork.LoadBalancer{}))
+				g.Expect(result.(armnetwork.LoadBalancer)).To(Equal(newSamplePublicAPIServerLB(true, true, false, false, false)))
+			},
+			expectedError: "",
+		},
+		{
+			name:     "internal load balancer with availability zones",
+			spec:     &fakeInternalAPILBSpecWithZones,
+			existing: nil,
 			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(network.LoadBalancer{}))
-				g.Expect(result.(network.LoadBalancer)).To(Equal(newSamplePublicAPIServerLB(true, true, true, true, false)))
+				g.Expect(result).To(BeAssignableToTypeOf(armnetwork.LoadBalancer{}))
+				lb := result.(armnetwork.LoadBalancer)
+				// Verify zones are set on frontend IP configuration for internal LBs
+				g.Expect(lb.Properties.FrontendIPConfigurations).To(HaveLen(1))
+				g.Expect(lb.Properties.FrontendIPConfigurations[0].Zones).To(HaveLen(3))
+				g.Expect(*lb.Properties.FrontendIPConfigurations[0].Zones[0]).To(Equal("1"))
+				g.Expect(*lb.Properties.FrontendIPConfigurations[0].Zones[1]).To(Equal("2"))
+				g.Expect(*lb.Properties.FrontendIPConfigurations[0].Zones[2]).To(Equal("3"))
+			},
+			expectedError: "",
+		},
+		{
+			name:     "public load balancer with availability zones - zones NOT applied to frontend",
+			spec:     &fakePublicAPILBSpecWithZones,
+			existing: nil,
+			expect: func(g *WithT, result interface{}) {
+				g.Expect(result).To(BeAssignableToTypeOf(armnetwork.LoadBalancer{}))
+				lb := result.(armnetwork.LoadBalancer)
+				// Verify zones are NOT set on frontend IP configuration for public LBs.
+				// Azure does not allow zones on frontend IP configs that reference public IPs.
+				// Zone-redundancy for public LBs is achieved by setting zones on the public IP itself.
+				// See: https://learn.microsoft.com/en-us/azure/reliability/reliability-load-balancer#zone-redundant-load-balancer
+				g.Expect(lb.Properties.FrontendIPConfigurations).To(HaveLen(1))
+				g.Expect(lb.Properties.FrontendIPConfigurations[0].Zones).To(BeNil(),
+					"zones should not be set on public LB frontend - Azure error: LoadBalancerFrontendIPConfigCannotHaveZoneWhenReferencingPublicIPAddress")
 			},
 			expectedError: "",
 		},
 	}
 	for _, tc := range testcases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 			t.Parallel()
 
-			result, err := tc.spec.Parameters(tc.existing)
+			result, err := tc.spec.Parameters(t.Context(), tc.existing)
 			if tc.expectedError != "" {
 				g.Expect(err).To(HaveOccurred())
 				g.Expect(err).To(MatchError(tc.expectedError))
@@ -164,42 +255,77 @@ func TestParameters(t *testing.T) {
 	}
 }
 
-func newDefaultNodeOutboundLB() network.LoadBalancer {
-	return network.LoadBalancer{
-		Tags: map[string]*string{
-			"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": to.StringPtr("owned"),
-			"sigs.k8s.io_cluster-api-provider-azure_role":               to.StringPtr(infrav1.NodeOutboundRole),
+// TestAPIServerLBPortPropagation verifies that the API server LB uses the externally
+// reachable port for its frontend and the API server bind port for its backend and probe.
+func TestAPIServerLBPortPropagation(t *testing.T) {
+	g := NewWithT(t)
+
+	const (
+		frontendPort int32 = 443
+		backendPort  int32 = 6443
+	)
+	spec := LBSpec{
+		Name:                  "my-lb",
+		SubscriptionID:        "123",
+		ResourceGroup:         "my-rg",
+		BackendPoolName:       "my-lb-backendPool",
+		APIServerPort:         backendPort,
+		APIServerFrontendPort: frontendPort,
+		Role:                  infrav1.APIServerRole,
+		AdditionalPorts: []infrav1.LoadBalancerPort{
+			{Name: "https-alt", Port: 8443},
 		},
-		Sku:      &network.LoadBalancerSku{Name: network.LoadBalancerSkuNameStandard},
-		Location: to.StringPtr("my-location"),
-		LoadBalancerPropertiesFormat: &network.LoadBalancerPropertiesFormat{
-			FrontendIPConfigurations: &[]network.FrontendIPConfiguration{
+	}
+	frontendIDs := []*armnetwork.SubResource{{ID: ptr.To("/some/frontend/id")}}
+
+	rules := getLoadBalancingRules(spec, frontendIDs)
+	g.Expect(rules).To(HaveLen(2))
+	g.Expect(rules[0].Properties.FrontendPort).To(Equal(ptr.To(frontendPort)))
+	g.Expect(rules[0].Properties.BackendPort).To(Equal(ptr.To(backendPort)))
+	g.Expect(rules[1].Properties.FrontendPort).To(Equal(ptr.To[int32](8443)))
+	g.Expect(rules[1].Properties.BackendPort).To(Equal(ptr.To[int32](8443)))
+
+	probes := getProbes(spec)
+	g.Expect(probes).To(HaveLen(1))
+	g.Expect(probes[0].Properties.Port).To(Equal(ptr.To(backendPort)))
+}
+
+func newDefaultNodeOutboundLB() armnetwork.LoadBalancer {
+	return armnetwork.LoadBalancer{
+		Tags: map[string]*string{
+			"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": ptr.To("owned"),
+			"sigs.k8s.io_cluster-api-provider-azure_role":               ptr.To(infrav1.NodeOutboundRole),
+		},
+		SKU:      &armnetwork.LoadBalancerSKU{Name: ptr.To(armnetwork.LoadBalancerSKUNameStandard)},
+		Location: ptr.To("my-location"),
+		Properties: &armnetwork.LoadBalancerPropertiesFormat{
+			FrontendIPConfigurations: []*armnetwork.FrontendIPConfiguration{
 				{
-					Name: to.StringPtr("my-cluster-frontEnd"),
-					FrontendIPConfigurationPropertiesFormat: &network.FrontendIPConfigurationPropertiesFormat{
-						PublicIPAddress: &network.PublicIPAddress{ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/publicIPAddresses/outbound-publicip")},
+					Name: ptr.To("my-cluster-frontEnd"),
+					Properties: &armnetwork.FrontendIPConfigurationPropertiesFormat{
+						PublicIPAddress: &armnetwork.PublicIPAddress{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/publicIPAddresses/outbound-publicip")},
 					},
 				},
 			},
-			BackendAddressPools: &[]network.BackendAddressPool{
+			BackendAddressPools: []*armnetwork.BackendAddressPool{
 				{
-					Name: to.StringPtr("my-cluster-outboundBackendPool"),
+					Name: ptr.To("my-cluster-outboundBackendPool"),
 				},
 			},
-			LoadBalancingRules: &[]network.LoadBalancingRule{},
-			Probes:             &[]network.Probe{},
-			OutboundRules: &[]network.OutboundRule{
+			LoadBalancingRules: []*armnetwork.LoadBalancingRule{},
+			Probes:             []*armnetwork.Probe{},
+			OutboundRules: []*armnetwork.OutboundRule{
 				{
-					Name: to.StringPtr("OutboundNATAllProtocols"),
-					OutboundRulePropertiesFormat: &network.OutboundRulePropertiesFormat{
-						FrontendIPConfigurations: &[]network.SubResource{
-							{ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-cluster/frontendIPConfigurations/my-cluster-frontEnd")},
+					Name: ptr.To("OutboundNATAllProtocols"),
+					Properties: &armnetwork.OutboundRulePropertiesFormat{
+						FrontendIPConfigurations: []*armnetwork.SubResource{
+							{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-cluster/frontendIPConfigurations/my-cluster-frontEnd")},
 						},
-						BackendAddressPool: &network.SubResource{
-							ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-cluster/backendAddressPools/my-cluster-outboundBackendPool"),
+						BackendAddressPool: &armnetwork.SubResource{
+							ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-cluster/backendAddressPools/my-cluster-outboundBackendPool"),
 						},
-						Protocol:             network.LoadBalancerOutboundRuleProtocolAll,
-						IdleTimeoutInMinutes: to.Int32Ptr(30),
+						Protocol:             ptr.To(armnetwork.LoadBalancerOutboundRuleProtocolAll),
+						IdleTimeoutInMinutes: ptr.To[int32](30),
 					},
 				},
 			},
@@ -207,167 +333,175 @@ func newDefaultNodeOutboundLB() network.LoadBalancer {
 	}
 }
 
-func newSamplePublicAPIServerLB(verifyFrontendIP bool, verifyBackendAddressPools bool, verifyLBRules bool, verifyProbes bool, verifyOutboundRules bool) network.LoadBalancer {
-	var subnet *network.Subnet
-	var backendAddressPoolProps *network.BackendAddressPoolPropertiesFormat
-	enableFloatingIP := to.BoolPtr(false)
-	numProbes := to.Int32Ptr(4)
-	idleTimeout := to.Int32Ptr(4)
+func newSamplePublicAPIServerLB(verifyFrontendIP bool, verifyBackendAddressPools bool, verifyLBRules bool, verifyThreshold bool, verifyOutboundRules bool, modifications ...func(*armnetwork.LoadBalancer)) armnetwork.LoadBalancer {
+	var subnet *armnetwork.Subnet
+	var backendAddressPoolProps *armnetwork.BackendAddressPoolPropertiesFormat
+	enableFloatingIP := ptr.To(false)
+	probeThreshold := ptr.To[int32](1)
+	idleTimeout := ptr.To[int32](4)
 
 	if verifyFrontendIP {
-		subnet = &network.Subnet{
-			Name: to.StringPtr("fake-test-subnet"),
+		subnet = &armnetwork.Subnet{
+			Name: ptr.To("fake-test-subnet"),
 		}
 	}
 	if verifyBackendAddressPools {
-		backendAddressPoolProps = &network.BackendAddressPoolPropertiesFormat{
-			Location: to.StringPtr("fake-test-location"),
+		backendAddressPoolProps = &armnetwork.BackendAddressPoolPropertiesFormat{
+			Location: ptr.To("fake-test-location"),
 		}
 	}
 	if verifyLBRules {
-		enableFloatingIP = to.BoolPtr(true)
+		enableFloatingIP = ptr.To(true)
 	}
-	if verifyProbes {
-		numProbes = to.Int32Ptr(999)
+	if verifyThreshold {
+		probeThreshold = ptr.To[int32](999)
 	}
 	if verifyOutboundRules {
-		idleTimeout = to.Int32Ptr(1000)
+		idleTimeout = ptr.To[int32](1000)
 	}
 
-	return network.LoadBalancer{
+	lb := armnetwork.LoadBalancer{
 		Tags: map[string]*string{
-			"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": to.StringPtr("owned"),
-			"sigs.k8s.io_cluster-api-provider-azure_role":               to.StringPtr(infrav1.APIServerRole),
+			"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": ptr.To("owned"),
+			"sigs.k8s.io_cluster-api-provider-azure_role":               ptr.To(infrav1.APIServerRole),
 		},
-		Sku:      &network.LoadBalancerSku{Name: network.LoadBalancerSkuNameStandard},
-		Location: to.StringPtr("my-location"),
-		LoadBalancerPropertiesFormat: &network.LoadBalancerPropertiesFormat{
-			FrontendIPConfigurations: &[]network.FrontendIPConfiguration{
+		SKU:      &armnetwork.LoadBalancerSKU{Name: ptr.To(armnetwork.LoadBalancerSKUNameStandard)},
+		Location: ptr.To("my-location"),
+		Properties: &armnetwork.LoadBalancerPropertiesFormat{
+			FrontendIPConfigurations: []*armnetwork.FrontendIPConfiguration{
 				{
-					Name: to.StringPtr("my-publiclb-frontEnd"),
-					FrontendIPConfigurationPropertiesFormat: &network.FrontendIPConfigurationPropertiesFormat{
-						PublicIPAddress: &network.PublicIPAddress{ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/publicIPAddresses/my-publicip")},
+					Name: ptr.To("my-publiclb-frontEnd"),
+					Properties: &armnetwork.FrontendIPConfigurationPropertiesFormat{
+						PublicIPAddress: &armnetwork.PublicIPAddress{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/publicIPAddresses/my-publicip")},
 						Subnet:          subnet, // Add to verify that FrontendIPConfigurations aren't overwritten on update
 					},
 				},
 			},
-			BackendAddressPools: &[]network.BackendAddressPool{
+			BackendAddressPools: []*armnetwork.BackendAddressPool{
 				{
-					Name:                               to.StringPtr("my-publiclb-backendPool"),
-					BackendAddressPoolPropertiesFormat: backendAddressPoolProps, // Add to verify that BackendAddressPools aren't overwritten on update
+					Name:       ptr.To("my-publiclb-backendPool"),
+					Properties: backendAddressPoolProps, // Add to verify that BackendAddressPools aren't overwritten on update
 				},
 			},
-			LoadBalancingRules: &[]network.LoadBalancingRule{
+			LoadBalancingRules: []*armnetwork.LoadBalancingRule{
 				{
-					Name: to.StringPtr(lbRuleHTTPS),
-					LoadBalancingRulePropertiesFormat: &network.LoadBalancingRulePropertiesFormat{
-						DisableOutboundSnat:  to.BoolPtr(true),
-						Protocol:             network.TransportProtocolTCP,
-						FrontendPort:         to.Int32Ptr(6443),
-						BackendPort:          to.Int32Ptr(6443),
-						IdleTimeoutInMinutes: to.Int32Ptr(4),
+					Name: ptr.To(lbRuleHTTPS),
+					Properties: &armnetwork.LoadBalancingRulePropertiesFormat{
+						DisableOutboundSnat:  ptr.To(true),
+						Protocol:             ptr.To(armnetwork.TransportProtocolTCP),
+						FrontendPort:         ptr.To[int32](6443),
+						BackendPort:          ptr.To[int32](6443),
+						IdleTimeoutInMinutes: ptr.To[int32](4),
 						EnableFloatingIP:     enableFloatingIP, // Add to verify that LoadBalancingRules aren't overwritten on update
-						LoadDistribution:     network.LoadDistributionDefault,
-						FrontendIPConfiguration: &network.SubResource{
-							ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-publiclb/frontendIPConfigurations/my-publiclb-frontEnd"),
+						LoadDistribution:     ptr.To(armnetwork.LoadDistributionDefault),
+						FrontendIPConfiguration: &armnetwork.SubResource{
+							ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-publiclb/frontendIPConfigurations/my-publiclb-frontEnd"),
 						},
-						BackendAddressPool: &network.SubResource{
-							ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-publiclb/backendAddressPools/my-publiclb-backendPool"),
+						BackendAddressPool: &armnetwork.SubResource{
+							ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-publiclb/backendAddressPools/my-publiclb-backendPool"),
 						},
-						Probe: &network.SubResource{
-							ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-publiclb/probes/TCPProbe"),
+						Probe: &armnetwork.SubResource{
+							ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-publiclb/probes/HTTPSProbe"),
 						},
 					},
 				},
 			},
-			Probes: &[]network.Probe{
+			Probes: []*armnetwork.Probe{
 				{
-					Name: to.StringPtr(tcpProbe),
-					ProbePropertiesFormat: &network.ProbePropertiesFormat{
-						Protocol:          network.ProbeProtocolTCP,
-						Port:              to.Int32Ptr(6443),
-						IntervalInSeconds: to.Int32Ptr(15),
-						NumberOfProbes:    numProbes, // Add to verify that Probes aren't overwritten on update
+					Name: ptr.To(httpsProbe),
+					Properties: &armnetwork.ProbePropertiesFormat{
+						Protocol:          ptr.To(armnetwork.ProbeProtocolHTTPS),
+						Port:              ptr.To[int32](6443),
+						RequestPath:       ptr.To(httpsProbeRequestPath),
+						IntervalInSeconds: ptr.To[int32](15),
+						ProbeThreshold:    probeThreshold, // Add to verify that Probes aren't overwritten on update
 					},
 				},
 			},
-			OutboundRules: &[]network.OutboundRule{
+			OutboundRules: []*armnetwork.OutboundRule{
 				{
-					Name: to.StringPtr("OutboundNATAllProtocols"),
-					OutboundRulePropertiesFormat: &network.OutboundRulePropertiesFormat{
-						FrontendIPConfigurations: &[]network.SubResource{
-							{ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-publiclb/frontendIPConfigurations/my-publiclb-frontEnd")},
+					Name: ptr.To("OutboundNATAllProtocols"),
+					Properties: &armnetwork.OutboundRulePropertiesFormat{
+						FrontendIPConfigurations: []*armnetwork.SubResource{
+							{ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-publiclb/frontendIPConfigurations/my-publiclb-frontEnd")},
 						},
-						BackendAddressPool: &network.SubResource{
-							ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-publiclb/backendAddressPools/my-publiclb-backendPool"),
+						BackendAddressPool: &armnetwork.SubResource{
+							ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-publiclb/backendAddressPools/my-publiclb-backendPool"),
 						},
-						Protocol:             network.LoadBalancerOutboundRuleProtocolAll,
+						Protocol:             ptr.To(armnetwork.LoadBalancerOutboundRuleProtocolAll),
 						IdleTimeoutInMinutes: idleTimeout, // Add to verify that OutboundRules aren't overwritten on update
 					},
 				},
 			},
 		},
 	}
+
+	for _, modify := range modifications {
+		modify(&lb)
+	}
+
+	return lb
 }
 
-func newDefaultInternalAPIServerLB() network.LoadBalancer {
-	return network.LoadBalancer{
+func newDefaultInternalAPIServerLB() armnetwork.LoadBalancer {
+	return armnetwork.LoadBalancer{
 		Tags: map[string]*string{
-			"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": to.StringPtr("owned"),
-			"sigs.k8s.io_cluster-api-provider-azure_role":               to.StringPtr(infrav1.APIServerRole),
+			"sigs.k8s.io_cluster-api-provider-azure_cluster_my-cluster": ptr.To("owned"),
+			"sigs.k8s.io_cluster-api-provider-azure_role":               ptr.To(infrav1.APIServerRole),
 		},
-		Sku:      &network.LoadBalancerSku{Name: network.LoadBalancerSkuNameStandard},
-		Location: to.StringPtr("my-location"),
-		LoadBalancerPropertiesFormat: &network.LoadBalancerPropertiesFormat{
-			FrontendIPConfigurations: &[]network.FrontendIPConfiguration{
+		SKU:      &armnetwork.LoadBalancerSKU{Name: ptr.To(armnetwork.LoadBalancerSKUNameStandard)},
+		Location: ptr.To("my-location"),
+		Properties: &armnetwork.LoadBalancerPropertiesFormat{
+			FrontendIPConfigurations: []*armnetwork.FrontendIPConfiguration{
 				{
-					Name: to.StringPtr("my-private-lb-frontEnd"),
-					FrontendIPConfigurationPropertiesFormat: &network.FrontendIPConfigurationPropertiesFormat{
-						PrivateIPAllocationMethod: network.IPAllocationMethodStatic,
-						Subnet: &network.Subnet{
-							ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-cp-subnet"),
+					Name: ptr.To("my-private-lb-frontEnd"),
+					Properties: &armnetwork.FrontendIPConfigurationPropertiesFormat{
+						PrivateIPAllocationMethod: ptr.To(armnetwork.IPAllocationMethodStatic),
+						Subnet: &armnetwork.Subnet{
+							ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/virtualNetworks/my-vnet/subnets/my-cp-subnet"),
 						},
-						PrivateIPAddress: to.StringPtr("10.0.0.10"),
+						PrivateIPAddress: ptr.To("10.0.0.10"),
 					},
 				},
 			},
-			BackendAddressPools: &[]network.BackendAddressPool{
+			BackendAddressPools: []*armnetwork.BackendAddressPool{
 				{
-					Name: to.StringPtr("my-private-lb-backendPool"),
+					Name: ptr.To("my-private-lb-backendPool"),
 				},
 			},
-			LoadBalancingRules: &[]network.LoadBalancingRule{
+			LoadBalancingRules: []*armnetwork.LoadBalancingRule{
 				{
-					Name: to.StringPtr(lbRuleHTTPS),
-					LoadBalancingRulePropertiesFormat: &network.LoadBalancingRulePropertiesFormat{
-						DisableOutboundSnat:  to.BoolPtr(true),
-						Protocol:             network.TransportProtocolTCP,
-						FrontendPort:         to.Int32Ptr(6443),
-						BackendPort:          to.Int32Ptr(6443),
-						IdleTimeoutInMinutes: to.Int32Ptr(4),
-						EnableFloatingIP:     to.BoolPtr(false),
-						LoadDistribution:     network.LoadDistributionDefault,
-						FrontendIPConfiguration: &network.SubResource{
-							ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-private-lb/frontendIPConfigurations/my-private-lb-frontEnd"),
+					Name: ptr.To(lbRuleHTTPS),
+					Properties: &armnetwork.LoadBalancingRulePropertiesFormat{
+						DisableOutboundSnat:  ptr.To(true),
+						Protocol:             ptr.To(armnetwork.TransportProtocolTCP),
+						FrontendPort:         ptr.To[int32](6443),
+						BackendPort:          ptr.To[int32](6443),
+						IdleTimeoutInMinutes: ptr.To[int32](4),
+						EnableFloatingIP:     ptr.To(false),
+						LoadDistribution:     ptr.To(armnetwork.LoadDistributionDefault),
+						FrontendIPConfiguration: &armnetwork.SubResource{
+							ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-private-lb/frontendIPConfigurations/my-private-lb-frontEnd"),
 						},
-						BackendAddressPool: &network.SubResource{
-							ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-private-lb/backendAddressPools/my-private-lb-backendPool"),
+						BackendAddressPool: &armnetwork.SubResource{
+							ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-private-lb/backendAddressPools/my-private-lb-backendPool"),
 						},
-						Probe: &network.SubResource{
-							ID: to.StringPtr("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-private-lb/probes/TCPProbe"),
+						Probe: &armnetwork.SubResource{
+							ID: ptr.To("/subscriptions/123/resourceGroups/my-rg/providers/Microsoft.Network/loadBalancers/my-private-lb/probes/HTTPSProbe"),
 						},
 					},
 				},
 			},
-			OutboundRules: &[]network.OutboundRule{},
-			Probes: &[]network.Probe{
+			OutboundRules: []*armnetwork.OutboundRule{},
+			Probes: []*armnetwork.Probe{
 				{
-					Name: to.StringPtr(tcpProbe),
-					ProbePropertiesFormat: &network.ProbePropertiesFormat{
-						Protocol:          network.ProbeProtocolTCP,
-						Port:              to.Int32Ptr(6443),
-						IntervalInSeconds: to.Int32Ptr(15),
-						NumberOfProbes:    to.Int32Ptr(4),
+					Name: ptr.To(httpsProbe),
+					Properties: &armnetwork.ProbePropertiesFormat{
+						Protocol:          ptr.To(armnetwork.ProbeProtocolHTTPS),
+						Port:              ptr.To[int32](6443),
+						RequestPath:       ptr.To(httpsProbeRequestPath),
+						IntervalInSeconds: ptr.To[int32](15),
+						ProbeThreshold:    ptr.To[int32](1),
 					},
 				},
 			},

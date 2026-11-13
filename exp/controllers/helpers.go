@@ -27,8 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
-	clusterv1exp "sigs.k8s.io/cluster-api/exp/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -47,23 +46,23 @@ import (
 // AzureClusterToAzureMachinePoolsMapper creates a mapping handler to transform AzureClusters into AzureMachinePools. The transform
 // requires AzureCluster to map to the owning Cluster, then from the Cluster, collect the MachinePools belonging to the cluster,
 // then finally projecting the infrastructure reference to the AzureMachinePool.
-func AzureClusterToAzureMachinePoolsMapper(ctx context.Context, c client.Client, scheme *runtime.Scheme, log logr.Logger) (handler.MapFunc, error) {
+func AzureClusterToAzureMachinePoolsMapper(_ context.Context, c client.Client, scheme *runtime.Scheme, log logr.Logger) (handler.MapFunc, error) {
 	gvk, err := apiutil.GVKForObject(new(infrav1exp.AzureMachinePool), scheme)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to find GVK for AzureMachinePool")
 	}
 
-	return func(o client.Object) []ctrl.Request {
+	return func(ctx context.Context, o client.Object) []ctrl.Request {
 		ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultMappingTimeout)
 		defer cancel()
 
 		azCluster, ok := o.(*infrav1.AzureCluster)
 		if !ok {
-			log.Error(errors.Errorf("expected an AzureCluster, got %T instead", o.GetObjectKind()), "failed to map AzureCluster")
+			log.Error(errors.Errorf("expected an AzureCluster, got %T instead", o), "failed to map AzureCluster")
 			return nil
 		}
 
-		log = log.WithValues("AzureCluster", azCluster.Name, "Namespace", azCluster.Namespace)
+		log := log.WithValues("AzureCluster", azCluster.Name, "Namespace", azCluster.Namespace)
 
 		// Don't handle deleted AzureClusters
 		if !azCluster.ObjectMeta.DeletionTimestamp.IsZero() {
@@ -77,10 +76,10 @@ func AzureClusterToAzureMachinePoolsMapper(ctx context.Context, c client.Client,
 			return nil
 		}
 
-		machineList := &clusterv1exp.MachinePoolList{}
+		machineList := &clusterv1.MachinePoolList{}
 		machineList.SetGroupVersionKind(gvk)
 		// list all of the requested objects within the cluster namespace with the cluster name label
-		if err := c.List(ctx, machineList, client.InNamespace(azCluster.Namespace), client.MatchingLabels{clusterv1.ClusterLabelName: clusterName}); err != nil {
+		if err := c.List(ctx, machineList, client.InNamespace(azCluster.Namespace), client.MatchingLabels{clusterv1.ClusterNameLabel: clusterName}); err != nil {
 			log.V(4).Info(fmt.Sprintf("unable to list machine pools in cluster %s", clusterName))
 			return nil
 		}
@@ -89,7 +88,60 @@ func AzureClusterToAzureMachinePoolsMapper(ctx context.Context, c client.Client,
 		var results []ctrl.Request
 		for _, machine := range machineList.Items {
 			m := machine
-			azureMachines := mapFunc(&m)
+			azureMachines := mapFunc(ctx, &m)
+			results = append(results, azureMachines...)
+		}
+
+		return results
+	}, nil
+}
+
+// AzureManagedControlPlaneToAzureMachinePoolsMapper creates a mapping handler to transform AzureManagedControlPlanes into AzureMachinePools. The transform
+// requires AzureManagedControlPlane to map to the owning Cluster, then from the Cluster, collect the MachinePools belonging to the cluster,
+// then finally projecting the infrastructure reference to the AzureMachinePool.
+func AzureManagedControlPlaneToAzureMachinePoolsMapper(_ context.Context, c client.Client, scheme *runtime.Scheme, log logr.Logger) (handler.MapFunc, error) {
+	gvk, err := apiutil.GVKForObject(new(infrav1exp.AzureMachinePool), scheme)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to find GVK for AzureMachinePool")
+	}
+
+	return func(ctx context.Context, o client.Object) []ctrl.Request {
+		ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultMappingTimeout)
+		defer cancel()
+
+		azControlPlane, ok := o.(*infrav1.AzureManagedControlPlane)
+		if !ok {
+			log.Error(errors.Errorf("expected an AzureManagedControlPlane, got %T instead", o), "failed to map AzureManagedControlPlane")
+			return nil
+		}
+
+		log := log.WithValues("AzureManagedControlPlane", azControlPlane.Name, "Namespace", azControlPlane.Namespace)
+
+		// Don't handle deleted AzureManagedControlPlane
+		if !azControlPlane.ObjectMeta.DeletionTimestamp.IsZero() {
+			log.V(4).Info("AzureManagedControlPlane has a deletion timestamp, skipping mapping.")
+			return nil
+		}
+
+		clusterName, ok := controllers.GetOwnerClusterName(azControlPlane.ObjectMeta)
+		if !ok {
+			log.V(4).Info("unable to get the owner cluster")
+			return nil
+		}
+
+		machineList := &clusterv1.MachinePoolList{}
+		machineList.SetGroupVersionKind(gvk)
+		// list all of the requested objects within the cluster namespace with the cluster name label
+		if err := c.List(ctx, machineList, client.InNamespace(azControlPlane.Namespace), client.MatchingLabels{clusterv1.ClusterNameLabel: clusterName}); err != nil {
+			log.V(4).Info(fmt.Sprintf("unable to list machine pools in cluster %s", clusterName))
+			return nil
+		}
+
+		mapFunc := MachinePoolToInfrastructureMapFunc(gvk, log)
+		var results []ctrl.Request
+		for _, machine := range machineList.Items {
+			m := machine
+			azureMachines := mapFunc(ctx, &m)
 			results = append(results, azureMachines...)
 		}
 
@@ -99,7 +151,7 @@ func AzureClusterToAzureMachinePoolsMapper(ctx context.Context, c client.Client,
 
 // AzureMachinePoolMachineMapper creates a mapping handler to transform AzureMachinePoolMachine to AzureMachinePools.
 func AzureMachinePoolMachineMapper(scheme *runtime.Scheme, log logr.Logger) handler.MapFunc {
-	return func(o client.Object) []ctrl.Request {
+	return func(_ context.Context, o client.Object) []ctrl.Request {
 		gvk, err := apiutil.GVKForObject(new(infrav1exp.AzureMachinePool), scheme)
 		if err != nil {
 			log.Error(errors.WithStack(err), "failed to find GVK for AzureMachinePool")
@@ -112,7 +164,7 @@ func AzureMachinePoolMachineMapper(scheme *runtime.Scheme, log logr.Logger) hand
 			return nil
 		}
 
-		log = log.WithValues("AzureMachinePoolMachine", azureMachinePoolMachine.Name, "Namespace", azureMachinePoolMachine.Namespace)
+		log := log.WithValues("AzureMachinePoolMachine", azureMachinePoolMachine.Name, "Namespace", azureMachinePoolMachine.Namespace)
 		for _, ref := range azureMachinePoolMachine.OwnerReferences {
 			if ref.Kind != gvk.Kind {
 				continue
@@ -140,316 +192,11 @@ func AzureMachinePoolMachineMapper(scheme *runtime.Scheme, log logr.Logger) hand
 	}
 }
 
-// AzureManagedClusterToAzureManagedMachinePoolsMapper creates a mapping handler to transform AzureManagedClusters into
-// AzureManagedMachinePools. The transform requires AzureManagedCluster to map to the owning Cluster, then from the
-// Cluster, collect the MachinePools belonging to the cluster, then finally projecting the infrastructure reference
-// to the AzureManagedMachinePools.
-func AzureManagedClusterToAzureManagedMachinePoolsMapper(ctx context.Context, c client.Client, scheme *runtime.Scheme, log logr.Logger) (handler.MapFunc, error) {
-	gvk, err := apiutil.GVKForObject(new(infrav1exp.AzureManagedMachinePool), scheme)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to find GVK for AzureManagedMachinePool")
-	}
-
-	return func(o client.Object) []ctrl.Request {
-		ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultMappingTimeout)
-		defer cancel()
-
-		azCluster, ok := o.(*infrav1exp.AzureManagedCluster)
-		if !ok {
-			log.Error(errors.Errorf("expected an AzureManagedCluster, got %T instead", o.GetObjectKind()), "failed to map AzureManagedCluster")
-			return nil
-		}
-
-		log = log.WithValues("AzureManagedCluster", azCluster.Name, "Namespace", azCluster.Namespace)
-
-		// Don't handle deleted AzureManagedClusters
-		if !azCluster.ObjectMeta.DeletionTimestamp.IsZero() {
-			log.V(4).Info("AzureManagedCluster has a deletion timestamp, skipping mapping.")
-			return nil
-		}
-
-		clusterName, ok := controllers.GetOwnerClusterName(azCluster.ObjectMeta)
-		if !ok {
-			log.V(4).Info("unable to get the owner cluster")
-			return nil
-		}
-
-		machineList := &clusterv1exp.MachinePoolList{}
-		machineList.SetGroupVersionKind(gvk)
-		// list all of the requested objects within the cluster namespace with the cluster name label
-		if err := c.List(ctx, machineList, client.InNamespace(azCluster.Namespace), client.MatchingLabels{clusterv1.ClusterLabelName: clusterName}); err != nil {
-			return nil
-		}
-
-		mapFunc := MachinePoolToInfrastructureMapFunc(gvk, log)
-		var results []ctrl.Request
-		for _, machine := range machineList.Items {
-			m := machine
-			azureMachines := mapFunc(&m)
-			results = append(results, azureMachines...)
-		}
-
-		return results
-	}, nil
-}
-
-// AzureManagedControlPlaneToAzureManagedMachinePoolsMapper creates a mapping handler to transform AzureManagedControlPlanes into
-// AzureManagedMachinePools. The transform requires AzureManagedControlPlane to map to the owning Cluster, then from the
-// Cluster, collect the MachinePools belonging to the cluster, then finally projecting the infrastructure reference
-// to the AzureManagedMachinePools.
-func AzureManagedControlPlaneToAzureManagedMachinePoolsMapper(ctx context.Context, c client.Client, scheme *runtime.Scheme, log logr.Logger) (handler.MapFunc, error) {
-	gvk, err := apiutil.GVKForObject(new(infrav1exp.AzureManagedMachinePool), scheme)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to find GVK for AzureManagedMachinePool")
-	}
-
-	return func(o client.Object) []ctrl.Request {
-		ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultMappingTimeout)
-		defer cancel()
-
-		azControlPlane, ok := o.(*infrav1exp.AzureManagedControlPlane)
-		if !ok {
-			log.Error(errors.Errorf("expected an AzureManagedControlPlane, got %T instead", o.GetObjectKind()), "failed to map AzureManagedControlPlane")
-			return nil
-		}
-
-		log = log.WithValues("AzureManagedControlPlane", azControlPlane.Name, "Namespace", azControlPlane.Namespace)
-
-		// Don't handle deleted AzureManagedControlPlanes
-		if !azControlPlane.ObjectMeta.DeletionTimestamp.IsZero() {
-			log.V(4).Info("AzureManagedControlPlane has a deletion timestamp, skipping mapping.")
-			return nil
-		}
-
-		clusterName, ok := controllers.GetOwnerClusterName(azControlPlane.ObjectMeta)
-		if !ok {
-			log.Info("unable to get the owner cluster")
-			return nil
-		}
-
-		machineList := &clusterv1exp.MachinePoolList{}
-		machineList.SetGroupVersionKind(gvk)
-		// list all of the requested objects within the cluster namespace with the cluster name label
-		if err := c.List(ctx, machineList, client.InNamespace(azControlPlane.Namespace), client.MatchingLabels{clusterv1.ClusterLabelName: clusterName}); err != nil {
-			return nil
-		}
-
-		mapFunc := MachinePoolToInfrastructureMapFunc(gvk, log)
-		var results []ctrl.Request
-		for _, machine := range machineList.Items {
-			m := machine
-			azureMachines := mapFunc(&m)
-			results = append(results, azureMachines...)
-		}
-
-		return results
-	}, nil
-}
-
-// AzureManagedClusterToAzureManagedControlPlaneMapper creates a mapping handler to transform AzureManagedClusters into
-// AzureManagedControlPlane. The transform requires AzureManagedCluster to map to the owning Cluster, then from the
-// Cluster, collect the control plane infrastructure reference.
-func AzureManagedClusterToAzureManagedControlPlaneMapper(ctx context.Context, c client.Client, log logr.Logger) (handler.MapFunc, error) {
-	return func(o client.Object) []ctrl.Request {
-		ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultMappingTimeout)
-		defer cancel()
-
-		azCluster, ok := o.(*infrav1exp.AzureManagedCluster)
-		if !ok {
-			log.Error(errors.Errorf("expected an AzureManagedCluster, got %T instead", o), "failed to map AzureManagedCluster")
-			return nil
-		}
-
-		log = log.WithValues("AzureManagedCluster", azCluster.Name, "Namespace", azCluster.Namespace)
-
-		// Don't handle deleted AzureManagedClusters
-		if !azCluster.ObjectMeta.DeletionTimestamp.IsZero() {
-			log.V(4).Info("AzureManagedCluster has a deletion timestamp, skipping mapping.")
-			return nil
-		}
-
-		cluster, err := util.GetOwnerCluster(ctx, c, azCluster.ObjectMeta)
-		if err != nil {
-			log.Error(err, "failed to get the owning cluster")
-			return nil
-		}
-
-		if cluster == nil {
-			log.Error(err, "cluster has not set owner ref yet")
-			return nil
-		}
-
-		ref := cluster.Spec.ControlPlaneRef
-		if ref == nil || ref.Name == "" {
-			return nil
-		}
-
-		return []ctrl.Request{
-			{
-				NamespacedName: types.NamespacedName{
-					Namespace: ref.Namespace,
-					Name:      ref.Name,
-				},
-			},
-		}
-	}, nil
-}
-
-// AzureManagedControlPlaneToAzureManagedClusterMapper creates a mapping handler to transform AzureManagedClusters into
-// AzureManagedControlPlane. The transform requires AzureManagedCluster to map to the owning Cluster, then from the
-// Cluster, collect the control plane infrastructure reference.
-func AzureManagedControlPlaneToAzureManagedClusterMapper(ctx context.Context, c client.Client, log logr.Logger) (handler.MapFunc, error) {
-	return func(o client.Object) []ctrl.Request {
-		ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultMappingTimeout)
-		defer cancel()
-
-		azManagedControlPlane, ok := o.(*infrav1exp.AzureManagedControlPlane)
-		if !ok {
-			log.Error(errors.Errorf("expected an AzureManagedControlPlane, got %T instead", o), "failed to map AzureManagedControlPlane")
-			return nil
-		}
-
-		log = log.WithValues("AzureManagedControlPlane", azManagedControlPlane.Name, "Namespace", azManagedControlPlane.Namespace)
-
-		// Don't handle deleted AzureManagedControlPlanes
-		if !azManagedControlPlane.ObjectMeta.DeletionTimestamp.IsZero() {
-			log.V(4).Info("AzureManagedControlPlane has a deletion timestamp, skipping mapping.")
-			return nil
-		}
-
-		cluster, err := util.GetOwnerCluster(ctx, c, azManagedControlPlane.ObjectMeta)
-		if err != nil {
-			log.Error(err, "failed to get the owning cluster")
-			return nil
-		}
-
-		if cluster == nil {
-			log.Error(err, "cluster has not set owner ref yet")
-			return nil
-		}
-
-		ref := cluster.Spec.InfrastructureRef
-		if ref == nil || ref.Name == "" {
-			return nil
-		}
-
-		return []ctrl.Request{
-			{
-				NamespacedName: types.NamespacedName{
-					Namespace: ref.Namespace,
-					Name:      ref.Name,
-				},
-			},
-		}
-	}, nil
-}
-
-// MachinePoolToAzureManagedControlPlaneMapFunc returns a handler.MapFunc that watches for
-// MachinePool events and returns reconciliation requests for a control plane object.
-func MachinePoolToAzureManagedControlPlaneMapFunc(ctx context.Context, c client.Client, gvk schema.GroupVersionKind, log logr.Logger) handler.MapFunc {
-	return func(o client.Object) []reconcile.Request {
-		ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultMappingTimeout)
-		defer cancel()
-
-		machinePool, ok := o.(*clusterv1exp.MachinePool)
-		if !ok {
-			log.Info("expected a MachinePool, got wrong type", "type", fmt.Sprintf("%T", o))
-			return nil
-		}
-
-		cluster, err := util.GetClusterByName(ctx, c, machinePool.ObjectMeta.Namespace, machinePool.Spec.ClusterName)
-		if err != nil {
-			log.Error(err, "failed to get the owning cluster")
-			return nil
-		}
-
-		gk := gvk.GroupKind()
-		ref := cluster.Spec.ControlPlaneRef
-		// Return early if the GroupKind doesn't match what we expect.
-		controlPlaneGK := ref.GroupVersionKind().GroupKind()
-		if gk != controlPlaneGK {
-			log.Info("gk does not match", "gk", gk, "controlPlaneGK", controlPlaneGK)
-			return nil
-		}
-
-		controlPlaneKey := client.ObjectKey{
-			Name:      ref.Name,
-			Namespace: ref.Namespace,
-		}
-		controlPlane := &infrav1exp.AzureManagedControlPlane{}
-		if err := c.Get(ctx, controlPlaneKey, controlPlane); err != nil {
-			log.Error(err, "failed to fetch default pool reference")
-			// If we get here, we might want to reconcile but aren't sure.
-			// Do it anyway to be safe. Worst case we reconcile a few extra times with no-ops.
-			return []reconcile.Request{
-				{
-					NamespacedName: client.ObjectKey{
-						Namespace: ref.Namespace,
-						Name:      ref.Name,
-					},
-				},
-			}
-		}
-
-		infraMachinePoolRef := machinePool.Spec.Template.Spec.InfrastructureRef
-
-		gv, err := schema.ParseGroupVersion(infraMachinePoolRef.APIVersion)
-		if err != nil {
-			log.Error(err, "failed to parse group version")
-			// If we get here, we might want to reconcile but aren't sure.
-			// Do it anyway to be safe. Worst case we reconcile a few extra times with no-ops.
-			return []reconcile.Request{
-				{
-					NamespacedName: client.ObjectKey{
-						Namespace: ref.Namespace,
-						Name:      ref.Name,
-					},
-				},
-			}
-		}
-
-		kindMatches := infraMachinePoolRef.Kind == "AzureManagedMachinePool"
-		groupMatches := controlPlaneGK.Group == gv.Group
-
-		ammp := &infrav1exp.AzureManagedMachinePool{}
-		key := types.NamespacedName{Namespace: infraMachinePoolRef.Namespace, Name: infraMachinePoolRef.Name}
-		if err := c.Get(ctx, key, ammp); err != nil {
-			log.Error(err, fmt.Sprintf("failed to fetch azure managed machine pool for Machinepool: %s", infraMachinePoolRef.Name))
-			// If we get here, we might want to reconcile but aren't sure.
-			// Do it anyway to be safe. Worst case we reconcile a few extra times with no-ops.
-			return []reconcile.Request{
-				{
-					NamespacedName: client.ObjectKey{
-						Namespace: ref.Namespace,
-						Name:      ref.Name,
-					},
-				},
-			}
-		}
-
-		isSystemNodePool := ammp.Spec.Mode == string(infrav1exp.NodePoolModeSystem)
-
-		if groupMatches && kindMatches && isSystemNodePool {
-			return []reconcile.Request{
-				{
-					NamespacedName: client.ObjectKey{
-						Namespace: ref.Namespace,
-						Name:      ref.Name,
-					},
-				},
-			}
-		}
-
-		// By default, return nothing for a machine pool which is not the default pool for a control plane.
-		return nil
-	}
-}
-
 // MachinePoolToInfrastructureMapFunc returns a handler.MapFunc that watches for
 // MachinePool events and returns reconciliation requests for an infrastructure provider object.
 func MachinePoolToInfrastructureMapFunc(gvk schema.GroupVersionKind, log logr.Logger) handler.MapFunc {
-	return func(o client.Object) []reconcile.Request {
-		m, ok := o.(*clusterv1exp.MachinePool)
+	return func(_ context.Context, o client.Object) []reconcile.Request {
+		m, ok := o.(*clusterv1.MachinePool)
 		if !ok {
 			log.V(4).Info("attempt to map incorrect type", "type", fmt.Sprintf("%T", o))
 			return nil
@@ -458,7 +205,7 @@ func MachinePoolToInfrastructureMapFunc(gvk schema.GroupVersionKind, log logr.Lo
 		gk := gvk.GroupKind()
 		ref := m.Spec.Template.Spec.InfrastructureRef
 		// Return early if the GroupKind doesn't match what we expect.
-		infraGK := ref.GroupVersionKind().GroupKind()
+		infraGK := ref.GroupKind()
 		if gk != infraGK {
 			log.V(4).Info("gk does not match", "gk", gk, "infraGK", infraGK)
 			return nil
@@ -477,8 +224,8 @@ func MachinePoolToInfrastructureMapFunc(gvk schema.GroupVersionKind, log logr.Lo
 
 // AzureClusterToAzureMachinePoolsFunc is a handler.MapFunc to be used to enqueue
 // requests for reconciliation of AzureMachinePools.
-func AzureClusterToAzureMachinePoolsFunc(ctx context.Context, c client.Client, log logr.Logger) handler.MapFunc {
-	return func(o client.Object) []reconcile.Request {
+func AzureClusterToAzureMachinePoolsFunc(_ context.Context, c client.Client, log logr.Logger) handler.MapFunc {
+	return func(ctx context.Context, o client.Object) []reconcile.Request {
 		ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultMappingTimeout)
 		defer cancel()
 
@@ -499,7 +246,7 @@ func AzureClusterToAzureMachinePoolsFunc(ctx context.Context, c client.Client, l
 			return nil
 		}
 
-		labels := map[string]string{clusterv1.ClusterLabelName: cluster.Name}
+		labels := map[string]string{clusterv1.ClusterNameLabel: cluster.Name}
 		ampl := &infrav1exp.AzureMachinePoolList{}
 		if err := c.List(ctx, ampl, client.InNamespace(ac.Namespace), client.MatchingLabels(labels)); err != nil {
 			logWithValues.Error(err, "failed to list AzureMachinePools")
@@ -522,8 +269,8 @@ func AzureClusterToAzureMachinePoolsFunc(ctx context.Context, c client.Client, l
 
 // AzureMachinePoolToAzureMachinePoolMachines maps an AzureMachinePool to its child AzureMachinePoolMachines through
 // Cluster and MachinePool labels.
-func AzureMachinePoolToAzureMachinePoolMachines(ctx context.Context, c client.Client, log logr.Logger) handler.MapFunc {
-	return func(o client.Object) []reconcile.Request {
+func AzureMachinePoolToAzureMachinePoolMachines(_ context.Context, c client.Client, log logr.Logger) handler.MapFunc {
+	return func(ctx context.Context, o client.Object) []reconcile.Request {
 		ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultMappingTimeout)
 		defer cancel()
 
@@ -535,7 +282,7 @@ func AzureMachinePoolToAzureMachinePoolMachines(ctx context.Context, c client.Cl
 		logWithValues := log.WithValues("AzureMachinePool", amp.Name, "Namespace", amp.Namespace)
 
 		labels := map[string]string{
-			clusterv1.ClusterLabelName:      amp.Labels[clusterv1.ClusterLabelName],
+			clusterv1.ClusterNameLabel:      amp.Labels[clusterv1.ClusterNameLabel],
 			infrav1exp.MachinePoolNameLabel: amp.Name,
 		}
 		ampml := &infrav1exp.AzureMachinePoolMachineList{}
@@ -580,14 +327,14 @@ func MachinePoolModelHasChanged(logger logr.Logger) predicate.Funcs {
 				!cmp.Equal(oldAmp.Spec.UserAssignedIdentities, newAmp.Spec.UserAssignedIdentities) ||
 				!cmp.Equal(oldAmp.Status.ProvisioningState, newAmp.Status.ProvisioningState)
 
-			//if shouldUpdate {
+			// if shouldUpdate {
 			log.Info("machine pool predicate", "shouldUpdate", shouldUpdate)
 			//}
 			return shouldUpdate
 		},
-		CreateFunc:  func(e event.CreateEvent) bool { return false },
-		DeleteFunc:  func(e event.DeleteEvent) bool { return false },
-		GenericFunc: func(e event.GenericEvent) bool { return false },
+		CreateFunc:  func(_ event.CreateEvent) bool { return false },
+		DeleteFunc:  func(_ event.DeleteEvent) bool { return false },
+		GenericFunc: func(_ event.GenericEvent) bool { return false },
 	}
 }
 
@@ -618,8 +365,68 @@ func MachinePoolMachineHasStateOrVersionChange(logger logr.Logger) predicate.Fun
 			}
 			return shouldUpdate
 		},
-		CreateFunc:  func(e event.CreateEvent) bool { return false },
-		DeleteFunc:  func(e event.DeleteEvent) bool { return false },
-		GenericFunc: func(e event.GenericEvent) bool { return false },
+		CreateFunc:  func(_ event.CreateEvent) bool { return false },
+		DeleteFunc:  func(_ event.DeleteEvent) bool { return false },
+		GenericFunc: func(_ event.GenericEvent) bool { return false },
+	}
+}
+
+// BootstrapConfigToInfrastructureMapFunc returns a handler.ToRequestsFunc that watches for <Bootstrap>Config events and returns.
+func BootstrapConfigToInfrastructureMapFunc(c client.Client, log logr.Logger) handler.MapFunc {
+	return func(ctx context.Context, o client.Object) []reconcile.Request {
+		ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultMappingTimeout)
+		defer cancel()
+
+		// Lookup the first MachinePool owner of this BootstrapConfig, if any
+		mpName := ""
+		for _, owner := range o.GetOwnerReferences() {
+			if owner.Kind == "MachinePool" {
+				mpName = owner.Name
+				break
+			}
+		}
+		if mpName == "" {
+			log.V(4).Info("BootstrapConfig has no MachinePool owner")
+			return []reconcile.Request{}
+		}
+
+		// Fetch the MachinePool to validate the Bootstrap.ConfigRef
+		mpKey := client.ObjectKey{
+			Namespace: o.GetNamespace(),
+			Name:      mpName,
+		}
+		mp := &clusterv1.MachinePool{}
+		if err := c.Get(ctx, mpKey, mp); err != nil {
+			if !apierrors.IsNotFound(err) {
+				log.Error(err, "failed to fetch MachinePool to validate Bootstrap.ConfigRef")
+			}
+			return []reconcile.Request{}
+		}
+
+		ref := mp.Spec.Template.Spec.Bootstrap.ConfigRef
+		if !ref.IsDefined() {
+			log.V(4).Info("fetched MachinePool has no Bootstrap.ConfigRef")
+			return []reconcile.Request{}
+		}
+		sameKind := ref.Kind == o.GetObjectKind().GroupVersionKind().Kind
+		sameName := ref.Name == o.GetName()
+		if !sameKind || !sameName {
+			log.V(4).Info("Bootstrap.ConfigRef does not match",
+				"sameKind", sameKind,
+				"ref kind", ref.Kind,
+				"other kind", o.GetObjectKind().GroupVersionKind().Kind,
+				"sameName", sameName,
+			)
+			return []reconcile.Request{}
+		}
+
+		// Enqueue a request for an AzureMachinePool with same name of MachinePool
+		log.V(4).Info("Enqueueing AzureMachinePool from Bootstrap Config", "key", client.ObjectKeyFromObject(o), "kind", ref.Kind)
+
+		return []reconcile.Request{
+			{
+				NamespacedName: mpKey,
+			},
+		}
 	}
 }

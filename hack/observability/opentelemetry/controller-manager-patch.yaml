@@ -9,7 +9,8 @@ spec:
       containers:
         - name: manager
           args:
-            - "--metrics-bind-addr=:8080"
+            - "--diagnostics-address=:8080"
+            - "--insecure-diagnostics"
             - "--leader-elect"
-            - "--feature-gates=MachinePool=${EXP_MACHINE_POOL:=false},AKS=${EXP_AKS:=false}"
+            - "--feature-gates=MachinePool=${EXP_MACHINE_POOL:=true},AKSResourceHealth=${EXP_AKS_RESOURCE_HEALTH:=false},EdgeZone=${EXP_EDGEZONE:=false},ASOAPI=${EXP_ASO_API:=true},APIServerILB=${EXP_APISERVER_ILB:=false},SkipMachinePoolModelReconciliation=${EXP_SKIP_MACHINE_POOL_MODEL_RECONCILIATION:=false}"
             - "--enable-tracing"

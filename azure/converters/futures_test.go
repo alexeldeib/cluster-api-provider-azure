@@ -17,24 +17,20 @@ limitations under the License.
 package converters
 
 import (
+	"encoding/base64"
+	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"testing"
 
-	azureautorest "github.com/Azure/go-autorest/autorest/azure"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	. "github.com/onsi/gomega"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 )
 
 var (
-	sdkFuture, _ = azureautorest.NewFutureFromResponse(&http.Response{
-		Status:     "200 OK",
-		StatusCode: 200,
-		Request: &http.Request{
-			Method: http.MethodDelete,
-		},
-	})
-
 	validFuture = infrav1.Future{
 		Type:          infrav1.DeleteFuture,
 		ServiceName:   "test-service",
@@ -68,91 +64,129 @@ var (
 	}
 )
 
-func Test_SDKToFuture(t *testing.T) {
+func TestPollerToFuture(t *testing.T) {
 	cases := []struct {
-		name         string
-		future       azureautorest.FutureAPI
-		futureType   string
-		service      string
-		resourceName string
-		rgName       string
-		expect       func(*GomegaWithT, *infrav1.Future, error)
+		name        string
+		futureType  string
+		statusCode  int
+		expectedErr string
 	}{
 		{
-			name:         "valid future",
-			future:       &sdkFuture,
-			futureType:   infrav1.DeleteFuture,
-			service:      "test-service",
-			resourceName: "test-resource",
-			rgName:       "test-group",
-			expect: func(g *GomegaWithT, f *infrav1.Future, err error) {
-				g.Expect(err).Should(BeNil())
-				g.Expect(f).Should(BeEquivalentTo(&infrav1.Future{
-					Type:          infrav1.DeleteFuture,
-					ServiceName:   "test-service",
-					Name:          "test-resource",
-					ResourceGroup: "test-group",
-					Data:          "eyJtZXRob2QiOiJERUxFVEUiLCJwb2xsaW5nTWV0aG9kIjoiIiwicG9sbGluZ1VSSSI6IiIsImxyb1N0YXRlIjoiU3VjY2VlZGVkIiwicmVzdWx0VVJJIjoiIn0=",
-				}))
-			},
+			name:       "valid DELETE poller",
+			futureType: infrav1.DeleteFuture,
+			statusCode: http.StatusAccepted,
+		},
+		{
+			name:        "invalid DELETE poller",
+			futureType:  infrav1.DeleteFuture,
+			statusCode:  http.StatusNoContent,
+			expectedErr: "failed to get resume token",
+		},
+		{
+			name:       "valid PUT poller",
+			futureType: infrav1.PutFuture,
+			statusCode: http.StatusAccepted,
+		},
+		{
+			name:        "invalid PUT poller",
+			futureType:  infrav1.PutFuture,
+			statusCode:  http.StatusNoContent,
+			expectedErr: "failed to get resume token",
 		},
 	}
 
 	for _, c := range cases {
-		c := c
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			g := NewGomegaWithT(t)
-			result, err := SDKToFuture(c.future, c.futureType, c.service, c.resourceName, c.rgName)
-			c.expect(g, result, err)
+			poller := fakePoller[MockPolled](g, c.statusCode)
+			future, err := PollerToFuture(poller, c.futureType, "test-service", "test-resource", "test-group")
+			if c.expectedErr != "" {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(err.Error()).To(ContainSubstring(c.expectedErr))
+			} else {
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(future).NotTo(BeNil())
+				g.Expect(future.Data).NotTo(BeNil())
+				token, err := base64.URLEncoding.DecodeString(future.Data)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(string(token)).NotTo(BeEmpty())
+				// The following assertion should pass, but the token's format could change.
+				// g.Expect(string(token)).To(MatchJSON(`{"type":"MockPolled","token":{"type":"body","pollURL":"/","state":"InProgress"}}`))
+			}
 		})
 	}
 }
 
-func Test_FutureToSDK(t *testing.T) {
+func TestFutureToResumeToken(t *testing.T) {
 	cases := []struct {
 		name   string
 		future infrav1.Future
-		expect func(*GomegaWithT, azureautorest.FutureAPI, error)
+		expect func(*GomegaWithT, string, error)
 	}{
 		{
 			name:   "data is empty",
 			future: emptyDataFuture,
-			expect: func(g *GomegaWithT, f azureautorest.FutureAPI, err error) {
+			expect: func(g *GomegaWithT, token string, err error) {
+				g.Expect(err).To(HaveOccurred())
 				g.Expect(err.Error()).Should(ContainSubstring("failed to unmarshal future data"))
 			},
 		},
 		{
-			name:   "data is not base64 encoded",
+			name:   "data is not base64-encoded",
 			future: decodedDataFuture,
-			expect: func(g *GomegaWithT, f azureautorest.FutureAPI, err error) {
-				g.Expect(err.Error()).Should(ContainSubstring("failed to base64 decode future data"))
+			expect: func(g *GomegaWithT, token string, err error) {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(err.Error()).Should(ContainSubstring("failed to decode future data"))
 			},
 		},
 		{
-			name:   "base64 data is not a valid future",
+			name:   "data does not contain a valid resume token",
 			future: invalidFuture,
-			expect: func(g *GomegaWithT, f azureautorest.FutureAPI, err error) {
-				g.Expect(err.Error()).Should(ContainSubstring("failed to unmarshal future data"))
+			expect: func(g *GomegaWithT, token string, err error) {
+				// "The token's format should be considered opaque and is subject to change."
+				// This validates decoding the unit test data, but actual SDKv2 tokens won't look like this.
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(token).To(ContainSubstring("fake b64 future data"))
 			},
 		},
 		{
-			name:   "valid future data",
+			name:   "data contains a valid resume token",
 			future: validFuture,
-			expect: func(g *GomegaWithT, f azureautorest.FutureAPI, err error) {
-				g.Expect(err).Should(BeNil())
-				g.Expect(f).Should(BeAssignableToTypeOf(&azureautorest.Future{}))
+			expect: func(g *GomegaWithT, token string, err error) {
+				// "The token's format should be considered opaque and is subject to change."
+				// This validates decoding the unit test data, but actual SDKv2 tokens won't look like this.
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(token).To(MatchJSON(`{"method":"DELETE","pollingMethod":"Location","lroState":"InProgress"}`))
 			},
 		},
 	}
 
 	for _, c := range cases {
-		c := c
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			g := NewGomegaWithT(t)
-			result, err := FutureToSDK(c.future)
-			c.expect(g, result, err)
+			token, err := FutureToResumeToken(c.future)
+			c.expect(g, token, err)
 		})
 	}
+}
+
+type MockPolled struct{}
+
+func (m *MockPolled) Done() bool { return true }
+
+func fakePoller[T any](g *GomegaWithT, statusCode int) *runtime.Poller[T] {
+	response := &http.Response{
+		Body: io.NopCloser(strings.NewReader("")),
+		Request: &http.Request{
+			Method: http.MethodPut,
+			URL:    &url.URL{Path: "/"},
+		},
+		StatusCode: statusCode,
+	}
+	pipeline := runtime.NewPipeline("testmodule", "v0.1.0", runtime.PipelineOptions{}, nil)
+	poller, err := runtime.NewPoller[T](response, pipeline, nil)
+	g.Expect(err).NotTo(HaveOccurred())
+	return poller
 }

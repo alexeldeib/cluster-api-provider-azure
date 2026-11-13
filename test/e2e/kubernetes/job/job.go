@@ -1,3 +1,4 @@
+//go:build e2e
 // +build e2e
 
 /*
@@ -25,8 +26,8 @@ import (
 	"sigs.k8s.io/cluster-api/util"
 )
 
-func CreateCurlJob(name, endpoint string) *batchv1.Job {
-	name = name + util.RandomString(5)
+func CreateCurlJobResourceSpec(name, endpoint string) *batchv1.Job {
+	name += util.RandomString(5)
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,

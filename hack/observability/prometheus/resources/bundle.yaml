@@ -4052,7 +4052,7 @@ spec:
                 description: Define which Nodes the Pods are scheduled on.
                 type: object
               paused:
-                description: If set to true all actions on the underlaying managed
+                description: If set to true all actions on the underlying managed
                   objects are not goint to be performed, except for delete actions.
                 type: boolean
               podMetadata:
@@ -4486,7 +4486,7 @@ spec:
                               If underlying persistent volume is being resized then
                               the Condition will be set to 'ResizeStarted'.
                             items:
-                              description: PersistentVolumeClaimCondition contails
+                              description: PersistentVolumeClaimCondition contains
                                 details about state of pvc
                               properties:
                                 lastProbeTime:
@@ -5921,7 +5921,7 @@ spec:
                 format: int32
                 type: integer
               paused:
-                description: Represents whether any actions on the underlaying managed
+                description: Represents whether any actions on the underlying managed
                   objects are being performed. Only delete actions will be performed.
                 type: boolean
               replicas:
@@ -11335,7 +11335,7 @@ spec:
                               If underlying persistent volume is being resized then
                               the Condition will be set to 'ResizeStarted'.
                             items:
-                              description: PersistentVolumeClaimCondition contails
+                              description: PersistentVolumeClaimCondition contains
                                 details about state of pvc
                               properties:
                                 lastProbeTime:
@@ -13021,7 +13021,7 @@ spec:
                 format: int32
                 type: integer
               paused:
-                description: Represents whether any actions on the underlaying managed
+                description: Represents whether any actions on the underlying managed
                   objects are being performed. Only delete actions will be performed.
                 type: boolean
               replicas:
@@ -17146,7 +17146,7 @@ spec:
                               If underlying persistent volume is being resized then
                               the Condition will be set to 'ResizeStarted'.
                             items:
-                              description: PersistentVolumeClaimCondition contails
+                              description: PersistentVolumeClaimCondition contains
                                 details about state of pvc
                               properties:
                                 lastProbeTime:
@@ -18725,7 +18725,7 @@ spec:
         securityContext:
           allowPrivilegeEscalation: false
       nodeSelector:
-        beta.kubernetes.io/os: linux
+        kubernetes.io/os: linux
       securityContext:
         runAsNonRoot: true
         runAsUser: 65534

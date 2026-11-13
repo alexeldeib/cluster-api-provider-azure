@@ -17,19 +17,19 @@ limitations under the License.
 package coalescing
 
 import (
-	"context"
 	"testing"
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/golang/mock/gomock"
 	. "github.com/onsi/gomega"
 	gtypes "github.com/onsi/gomega/types"
 	"github.com/pkg/errors"
+	"go.uber.org/mock/gomock"
 	"k8s.io/apimachinery/pkg/types"
-	mock_coalescing "sigs.k8s.io/cluster-api-provider-azure/pkg/coalescing/mocks"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	mock_coalescing "sigs.k8s.io/cluster-api-provider-azure/pkg/coalescing/mocks"
 )
 
 func TestCoalescingReconciler_Reconcile(t *testing.T) {
@@ -46,14 +46,14 @@ func TestCoalescingReconciler_Reconcile(t *testing.T) {
 
 	cases := []struct {
 		Name       string
-		Reconciler func(g *WithT, cacherMock *mock_coalescing.MockReconcileCacher, mockReconciler *mock_coalescing.MockReconciler) reconcile.Reconciler
+		Reconciler func(g *WithT, cacherMock *mock_coalescing.MockReconcileCacher, mockReconciler *mock_coalescing.MockReconciler[reconcile.Request]) reconcile.Reconciler
 		Request    reconcile.Request
 		MatchThis  gtypes.GomegaMatcher
 		Error      string
 	}{
 		{
 			Name: "should call upstream reconciler if key does not exist in cache",
-			Reconciler: func(g *WithT, cacherMock *mock_coalescing.MockReconcileCacher, mockReconciler *mock_coalescing.MockReconciler) reconcile.Reconciler {
+			Reconciler: func(g *WithT, cacherMock *mock_coalescing.MockReconcileCacher, mockReconciler *mock_coalescing.MockReconciler[reconcile.Request]) reconcile.Reconciler {
 				cacherMock.EXPECT().ShouldProcess(defaultRequestKey).Return(time.Now(), true)
 				cacherMock.EXPECT().Reconciled(defaultRequestKey)
 				mockReconciler.EXPECT().Reconcile(gomock.Any(), defaultRequest)
@@ -64,7 +64,7 @@ func TestCoalescingReconciler_Reconcile(t *testing.T) {
 		},
 		{
 			Name: "should not call upstream reconciler if key does exists in cache and is not expired",
-			Reconciler: func(g *WithT, cacherMock *mock_coalescing.MockReconcileCacher, mockReconciler *mock_coalescing.MockReconciler) reconcile.Reconciler {
+			Reconciler: func(g *WithT, cacherMock *mock_coalescing.MockReconcileCacher, mockReconciler *mock_coalescing.MockReconciler[reconcile.Request]) reconcile.Reconciler {
 				cacherMock.EXPECT().ShouldProcess(defaultRequestKey).Return(time.Now().Add(30*time.Second), false)
 				return NewReconciler(mockReconciler, cacherMock, logr.New(log.NullLogSink{}))
 			},
@@ -73,7 +73,7 @@ func TestCoalescingReconciler_Reconcile(t *testing.T) {
 		},
 		{
 			Name: "should call upstream reconciler if key does not exist in cache and return error",
-			Reconciler: func(g *WithT, cacherMock *mock_coalescing.MockReconcileCacher, mockReconciler *mock_coalescing.MockReconciler) reconcile.Reconciler {
+			Reconciler: func(g *WithT, cacherMock *mock_coalescing.MockReconcileCacher, mockReconciler *mock_coalescing.MockReconciler[reconcile.Request]) reconcile.Reconciler {
 				cacherMock.EXPECT().ShouldProcess(defaultRequestKey).Return(time.Now(), true)
 				mockReconciler.EXPECT().Reconcile(gomock.Any(), defaultRequest).Return(reconcile.Result{}, errors.New("boom"))
 				return NewReconciler(mockReconciler, cacherMock, logr.New(log.NullLogSink{}))
@@ -85,15 +85,14 @@ func TestCoalescingReconciler_Reconcile(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		c := c
 		t.Run(c.Name, func(t *testing.T) {
 			g := NewWithT(t)
 			mockCtrl := gomock.NewController(t)
 			defer mockCtrl.Finish()
 			cacherMock := mock_coalescing.NewMockReconcileCacher(mockCtrl)
-			reconcilerMock := mock_coalescing.NewMockReconciler(mockCtrl)
+			reconcilerMock := mock_coalescing.NewMockReconciler[reconcile.Request](mockCtrl)
 			subject := c.Reconciler(g, cacherMock, reconcilerMock)
-			result, err := subject.Reconcile(context.Background(), c.Request)
+			result, err := subject.Reconcile(t.Context(), c.Request)
 			if c.Error != "" || err != nil {
 				g.Expect(err).To(And(HaveOccurred(), MatchError(c.Error)))
 				return

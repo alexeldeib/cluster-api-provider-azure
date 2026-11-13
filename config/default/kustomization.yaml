@@ -1,57 +1,38 @@
-namespace: capz-system
-
-namePrefix: capz-
-
-# Labels to add to all resources and selectors.
-commonLabels:
-  cluster.x-k8s.io/provider: "infrastructure-azure"
-
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
 resources:
-  - namespace.yaml
-  - credentials.yaml
-  - aad-pod-identity-deployment.yaml  
+- ../capz
 
-bases:
-  - ../crd
-  - ../rbac
-  - ../manager
-  - ../webhook
-  - ../certmanager
+components:
+- ../aso
 
-patchesStrategicMerge:
-  - manager_image_patch.yaml
-  - manager_pull_policy.yaml
-  - manager_credentials_patch.yaml
-  - manager_webhook_patch.yaml
-  - webhookcainjection_patch.yaml
-
-vars:
-  - name: CERTIFICATE_NAMESPACE # namespace of the certificate CR
-    objref:
-      kind: Certificate
-      group: cert-manager.io
-      version: v1
-      name: serving-cert # this name should match the one in certificate.yaml
-    fieldref:
-      fieldpath: metadata.namespace
-  - name: CERTIFICATE_NAME
-    objref:
-      kind: Certificate
-      group: cert-manager.io
-      version: v1
-      name: serving-cert # this name should match the one in certificate.yaml
-  - name: SERVICE_NAMESPACE # namespace of the service
-    objref:
-      kind: Service
-      version: v1
-      name: webhook-service
-    fieldref:
-      fieldpath: metadata.namespace
-  - name: SERVICE_NAME
-    objref:
-      kind: Service
-      version: v1
-      name: webhook-service
-
-configurations:
-  - kustomizeconfig.yaml
+replacements:
+- source:
+    fieldPath: spec.template.spec.containers.[name=manager].image
+    kind: Deployment
+    name: capz-controller-manager
+  targets:
+  # Keep the ASO stored-version migration init container on the same image as
+  # the CAPZ manager, since it runs the manager binary's migrate-aso-crds
+  # subcommand.
+  - fieldPaths:
+    - spec.template.spec.initContainers.[name=migrate-aso-crd-stored-versions].image
+    select:
+      kind: Deployment
+      name: azureserviceoperator-controller-manager
+- source:
+    fieldPath: spec.template.spec.containers.[name=manager].image
+    kind: Deployment
+    name: capz-controller-manager
+    options:
+      delimiter: ':'
+      index: 1
+  targets:
+  - fieldPaths:
+    - stringData.AZURE_USER_AGENT_SUFFIX
+    options:
+      delimiter: /
+      index: 1
+    select:
+      kind: Secret
+      name: aso-controller-settings

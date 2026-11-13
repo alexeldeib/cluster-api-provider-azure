@@ -1,19 +1,57 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
 namespace: default
 resources:
-  - ../../../test/ci/prow
-patchesStrategicMerge:
-  - patches/machine-deployment-pr-version.yaml
+- ../../../test/ci/prow
+- ../../../addons/metrics-server/metrics-server-resource-set.yaml
 patches:
-- target:
+- patch: |-
+    - op: add
+      path: /spec/kubeadmConfigSpec/clusterConfiguration/scheduler
+      value:
+        extraArgs: {}
+  target:
+    kind: KubeadmControlPlane
+- path: ../../../test/ci/patches/alpha-beta-feature-gates-kubeadmcontrolplane.yaml
+  target:
+    kind: KubeadmControlPlane
+- path: ../../../test/ci/prow-ci-version/patches/oot-credential-provider.yaml
+  target:
     group: bootstrap.cluster.x-k8s.io
-    version: v1beta1
     kind: KubeadmConfigTemplate
     name: .*-md-0
     namespace: default
-  path: patches/kubeadm-bootstrap.yaml
-- target:
-    group: controlplane.cluster.x-k8s.io
     version: v1beta1
+- path: ../../../test/ci/prow-ci-version/patches/oot-credential-provider-kcp.yaml
+  target:
+    group: controlplane.cluster.x-k8s.io
     kind: KubeadmControlPlane
     name: .*-control-plane
-  path: patches/kubeadm-controlplane-bootstrap.yaml
+    version: v1beta1
+- path: patches/kubeadm-bootstrap.yaml
+  target:
+    group: bootstrap.cluster.x-k8s.io
+    kind: KubeadmConfigTemplate
+    name: .*-md-0
+    namespace: default
+    version: v1beta1
+- path: patches/kubeadm-controlplane-bootstrap.yaml
+  target:
+    group: controlplane.cluster.x-k8s.io
+    kind: KubeadmControlPlane
+    name: .*-control-plane
+    version: v1beta1
+- path: patches/machine-deployment-pr-version.yaml
+- path: ../../../test/ci/patches/metrics-server-enabled-cluster.yaml
+configMapGenerator:
+- files:
+  - metrics-server=../../../addons/metrics-server/metrics-server.yaml
+  name: metrics-server-${CLUSTER_NAME}
+generatorOptions:
+  annotations:
+    note: generated
+  disableNameSuffixHash: true
+  labels:
+    type: generated
+sortOptions:
+  order: fifo

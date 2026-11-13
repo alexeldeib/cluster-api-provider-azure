@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Kubernetes Authors.
+Copyright 2023 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,371 +18,529 @@ package async
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"io"
 	"net/http"
+	"net/url"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/Azure/azure-sdk-for-go/services/resources/mgmt/2019-05-01/resources"
-	"github.com/Azure/go-autorest/autorest"
-	azureautorest "github.com/Azure/go-autorest/autorest/azure"
-	"github.com/golang/mock/gomock"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	. "github.com/onsi/gomega"
+	"go.uber.org/mock/gomock"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
+	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/mock_azure"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/async/mock_async"
 	gomockinternal "sigs.k8s.io/cluster-api-provider-azure/internal/test/matchers/gomock"
+	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
+)
+
+func TestServiceCreateOrUpdateResource(t *testing.T) {
+	testcases := []struct {
+		name            string
+		serviceName     string
+		expectedError   string
+		expectedResult  any
+		expectTransient bool
+		expect          func(g *WithT, s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockCreatorMockRecorder[MockCreator], r *mock_azure.MockResourceSpecGetterMockRecorder)
+	}{
+		{
+			name:          "invalid future",
+			serviceName:   serviceName,
+			expectedError: "could not decode future data, resetting long-running operation state",
+			expect: func(g *WithT, s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockCreatorMockRecorder[MockCreator], r *mock_azure.MockResourceSpecGetterMockRecorder) {
+				gomock.InOrder(
+					r.ResourceName().Return(resourceName),
+					r.ResourceGroupName().Return(resourceGroupName),
+					s.GetLongRunningOperationState(resourceName, serviceName, infrav1.PutFuture).Return(invalidPutFuture),
+					s.DeleteLongRunningOperationState(resourceName, serviceName, infrav1.PutFuture),
+				)
+			},
+		},
+		{
+			name:           "operation completed",
+			serviceName:    serviceName,
+			expectedError:  "",
+			expectedResult: fakeResource,
+			expect: func(g *WithT, s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockCreatorMockRecorder[MockCreator], r *mock_azure.MockResourceSpecGetterMockRecorder) {
+				gomock.InOrder(
+					r.ResourceName().Return(resourceName),
+					r.ResourceGroupName().Return(resourceGroupName),
+					s.GetLongRunningOperationState(resourceName, serviceName, infrav1.PutFuture).Return(validPutFuture),
+					c.CreateOrUpdateAsync(gomockinternal.AContext(), gomock.AssignableToTypeOf(azureResourceGetterType), resumeToken, gomock.Any()).Return(fakeResource, nil, nil),
+					s.DeleteLongRunningOperationState(resourceName, serviceName, infrav1.PutFuture),
+				)
+			},
+		},
+		{
+			name:            "operation in progress",
+			serviceName:     serviceName,
+			expectedError:   "operation type PUT on Azure resource mock-resourcegroup/mock-resource is not done. Object will be requeued after 15s",
+			expectTransient: true,
+			expect: func(g *WithT, s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockCreatorMockRecorder[MockCreator], r *mock_azure.MockResourceSpecGetterMockRecorder) {
+				gomock.InOrder(
+					r.ResourceName().Return(resourceName),
+					r.ResourceGroupName().Return(resourceGroupName),
+					s.GetLongRunningOperationState(resourceName, serviceName, infrav1.PutFuture).Return(validPutFuture),
+					c.CreateOrUpdateAsync(gomockinternal.AContext(), gomock.AssignableToTypeOf(azureResourceGetterType), resumeToken, gomock.Any()).Return(nil, fakePoller[MockCreator](g, http.StatusAccepted), context.DeadlineExceeded),
+					s.SetLongRunningOperationState(gomock.AssignableToTypeOf(&infrav1.Future{})),
+					s.DefaultedReconcilerRequeue().Return(reconciler.DefaultReconcilerRequeue),
+				)
+			},
+		},
+		{
+			name:          "operation failed with a non-retryable error",
+			serviceName:   serviceName,
+			expectedError: "failed to create or update resource mock-resourcegroup/mock-resource (service: mock-service): foo",
+			// A plain, non-retryable error is returned unwrapped (not classified
+			// transient); UpdatePutStatus reports it as a VM provisioning failure,
+			// though controller-runtime may still retry the returned error with backoff.
+			expectTransient: false,
+			expect: func(g *WithT, s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockCreatorMockRecorder[MockCreator], r *mock_azure.MockResourceSpecGetterMockRecorder) {
+				gomock.InOrder(
+					r.ResourceName().Return(resourceName),
+					r.ResourceGroupName().Return(resourceGroupName),
+					s.GetLongRunningOperationState(resourceName, serviceName, infrav1.PutFuture).Return(validPutFuture),
+					c.CreateOrUpdateAsync(gomockinternal.AContext(), gomock.AssignableToTypeOf(azureResourceGetterType), resumeToken, gomock.Any()).Return(nil, fakePoller[MockCreator](g, http.StatusAccepted), errors.New("foo")),
+					s.DeleteLongRunningOperationState(resourceName, serviceName, infrav1.PutFuture),
+				)
+			},
+		},
+		{
+			name:          "operation failed with a non-retryable status code",
+			serviceName:   serviceName,
+			expectedError: "failed to create or update resource mock-resourcegroup/mock-resource (service: mock-service)",
+			// A 400 is not in the retryable set, so it is returned unwrapped (not
+			// classified transient).
+			expectTransient: false,
+			expect: func(g *WithT, s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockCreatorMockRecorder[MockCreator], r *mock_azure.MockResourceSpecGetterMockRecorder) {
+				gomock.InOrder(
+					r.ResourceName().Return(resourceName),
+					r.ResourceGroupName().Return(resourceGroupName),
+					s.GetLongRunningOperationState(resourceName, serviceName, infrav1.PutFuture).Return(validPutFuture),
+					c.CreateOrUpdateAsync(gomockinternal.AContext(), gomock.AssignableToTypeOf(azureResourceGetterType), resumeToken, gomock.Any()).Return(nil, fakePoller[MockCreator](g, http.StatusAccepted), &azcore.ResponseError{StatusCode: http.StatusBadRequest}),
+					s.DeleteLongRunningOperationState(resourceName, serviceName, infrav1.PutFuture),
+				)
+			},
+		},
+		{
+			name:          "operation failed with a throttling error is transient",
+			serviceName:   serviceName,
+			expectedError: "failed to create or update resource mock-resourcegroup/mock-resource (service: mock-service)",
+			// A 429 that outlived the SDK's own retries is wrapped as transient so
+			// it is requeued rather than reported as a terminal provisioning failure.
+			expectTransient: true,
+			expect: func(g *WithT, s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockCreatorMockRecorder[MockCreator], r *mock_azure.MockResourceSpecGetterMockRecorder) {
+				gomock.InOrder(
+					r.ResourceName().Return(resourceName),
+					r.ResourceGroupName().Return(resourceGroupName),
+					s.GetLongRunningOperationState(resourceName, serviceName, infrav1.PutFuture).Return(validPutFuture),
+					c.CreateOrUpdateAsync(gomockinternal.AContext(), gomock.AssignableToTypeOf(azureResourceGetterType), resumeToken, gomock.Any()).Return(nil, fakePoller[MockCreator](g, http.StatusAccepted), &azcore.ResponseError{StatusCode: http.StatusTooManyRequests}),
+					s.DeleteLongRunningOperationState(resourceName, serviceName, infrav1.PutFuture),
+				)
+			},
+		},
+		{
+			name:          "operation timed out before a poller is available is transient",
+			serviceName:   serviceName,
+			expectedError: "failed to create or update resource mock-resourcegroup/mock-resource (service: mock-service): context deadline exceeded. Object will be requeued after 15s",
+			// A timeout with no poller cannot be resumed, so it is retried as transient.
+			expectTransient: true,
+			expect: func(g *WithT, s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockCreatorMockRecorder[MockCreator], r *mock_azure.MockResourceSpecGetterMockRecorder) {
+				gomock.InOrder(
+					r.ResourceName().Return(resourceName),
+					r.ResourceGroupName().Return(resourceGroupName),
+					s.GetLongRunningOperationState(resourceName, serviceName, infrav1.PutFuture).Return(validPutFuture),
+					c.CreateOrUpdateAsync(gomockinternal.AContext(), gomock.AssignableToTypeOf(azureResourceGetterType), resumeToken, gomock.Any()).Return(nil, nil, context.DeadlineExceeded),
+					s.DeleteLongRunningOperationState(resourceName, serviceName, infrav1.PutFuture),
+				)
+			},
+		},
+		{
+			name:            "get returns resource not found error",
+			serviceName:     serviceName,
+			expectedError:   "operation type PUT on Azure resource mock-resourcegroup/mock-resource is not done. Object will be requeued after 15s",
+			expectTransient: true,
+			expect: func(g *WithT, s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockCreatorMockRecorder[MockCreator], r *mock_azure.MockResourceSpecGetterMockRecorder) {
+				gomock.InOrder(
+					r.ResourceName().Return(resourceName),
+					r.ResourceGroupName().Return(resourceGroupName),
+					s.GetLongRunningOperationState(resourceName, serviceName, infrav1.PutFuture).Return(nil),
+					c.Get(gomockinternal.AContext(), gomock.AssignableToTypeOf(azureResourceGetterType)).Return(nil, &azcore.ResponseError{StatusCode: http.StatusNotFound}),
+					r.Parameters(gomockinternal.AContext(), nil).Return(fakeParameters, nil),
+					c.CreateOrUpdateAsync(gomockinternal.AContext(), gomock.AssignableToTypeOf(azureResourceGetterType), "", gomock.Any()).Return(nil, fakePoller[MockCreator](g, http.StatusAccepted), context.DeadlineExceeded),
+					s.SetLongRunningOperationState(gomock.AssignableToTypeOf(&infrav1.Future{})),
+					s.DefaultedReconcilerRequeue().Return(reconciler.DefaultReconcilerRequeue),
+				)
+			},
+		},
+		{
+			name:            "get returns unexpected error",
+			serviceName:     serviceName,
+			expectedError:   "failed to get existing resource mock-resourcegroup/mock-resource (service: mock-service): foo. Object will be requeued after 15s",
+			expectTransient: true,
+			expect: func(g *WithT, s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockCreatorMockRecorder[MockCreator], r *mock_azure.MockResourceSpecGetterMockRecorder) {
+				gomock.InOrder(
+					r.ResourceName().Return(resourceName),
+					r.ResourceGroupName().Return(resourceGroupName),
+					s.GetLongRunningOperationState(resourceName, serviceName, infrav1.PutFuture).Return(nil),
+					c.Get(gomockinternal.AContext(), gomock.AssignableToTypeOf(azureResourceGetterType)).Return(nil, errors.New("foo")),
+				)
+			},
+		},
+		{
+			name:           "parameters are nil: up to date",
+			serviceName:    serviceName,
+			expectedError:  "",
+			expectedResult: fakeResource,
+			expect: func(g *WithT, s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockCreatorMockRecorder[MockCreator], r *mock_azure.MockResourceSpecGetterMockRecorder) {
+				gomock.InOrder(
+					r.ResourceName().Return(resourceName),
+					r.ResourceGroupName().Return(resourceGroupName),
+					s.GetLongRunningOperationState(resourceName, serviceName, infrav1.PutFuture).Return(nil),
+					c.Get(gomockinternal.AContext(), gomock.AssignableToTypeOf(azureResourceGetterType)).Return(fakeResource, nil),
+					r.Parameters(gomockinternal.AContext(), fakeResource).Return(nil, nil),
+				)
+			},
+		},
+		{
+			name:           "parameters returns error",
+			serviceName:    serviceName,
+			expectedError:  "failed to get desired parameters for resource mock-resourcegroup/mock-resource (service: mock-service): foo",
+			expectedResult: nil,
+			expect: func(g *WithT, s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockCreatorMockRecorder[MockCreator], r *mock_azure.MockResourceSpecGetterMockRecorder) {
+				gomock.InOrder(
+					r.ResourceName().Return(resourceName),
+					r.ResourceGroupName().Return(resourceGroupName),
+					s.GetLongRunningOperationState(resourceName, serviceName, infrav1.PutFuture).Return(nil),
+					c.Get(gomockinternal.AContext(), gomock.AssignableToTypeOf(azureResourceGetterType)).Return(fakeResource, nil),
+					r.Parameters(gomockinternal.AContext(), fakeResource).Return(nil, errors.New("foo")),
+				)
+			},
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			t.Parallel()
+			mockCtrl := gomock.NewController(t)
+			defer mockCtrl.Finish()
+			scopeMock := mock_async.NewMockFutureScope(mockCtrl)
+			creatorMock := mock_async.NewMockCreator[MockCreator](mockCtrl)
+			svc := New[MockCreator, MockDeleter](scopeMock, creatorMock, nil)
+			specMock := mock_azure.NewMockResourceSpecGetter(mockCtrl)
+
+			tc.expect(g, scopeMock.EXPECT(), creatorMock.EXPECT(), specMock.EXPECT())
+
+			result, err := svc.CreateOrUpdateResource(t.Context(), specMock, serviceName)
+			if tc.expectedError != "" {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(err.Error()).To(ContainSubstring(tc.expectedError))
+			} else {
+				g.Expect(err).NotTo(HaveOccurred())
+				if tc.expectedResult != nil {
+					g.Expect(result).To(Equal(tc.expectedResult))
+				} else {
+					g.Expect(result).To(BeNil())
+				}
+			}
+			g.Expect(isTransientReconcileError(err)).To(Equal(tc.expectTransient))
+		})
+	}
+}
+
+// isTransientReconcileError reports whether err is (or wraps) a transient
+// azure.ReconcileError. The controller requeues such errors with an Azure-aware
+// RequeueAfter. An error that is not classified this way (e.g. a plain wrapped
+// ResponseError) is still returned to controller-runtime and may be retried with
+// backoff; this helper only detects the explicit transient marker.
+func isTransientReconcileError(err error) bool {
+	var reconcileErr azure.ReconcileError
+	return errors.As(err, &reconcileErr) && reconcileErr.IsTransient()
+}
+
+// newRetryAfterError returns a ResponseError with the given status code and
+// Retry-After header value. An empty retryAfter omits the header.
+func newRetryAfterError(statusCode int, retryAfter string) *azcore.ResponseError {
+	header := http.Header{}
+	if retryAfter != "" {
+		header.Set("Retry-After", retryAfter)
+	}
+	return &azcore.ResponseError{
+		StatusCode: statusCode,
+		RawResponse: &http.Response{
+			StatusCode: statusCode,
+			Body:       io.NopCloser(strings.NewReader("")),
+			Header:     header,
+		},
+	}
+}
+
+// elapsedHTTPDate is a Retry-After HTTP-date that is always in the past.
+const elapsedHTTPDate = "Mon, 02 Jan 2006 15:04:05 GMT"
+
+func TestGetRetryAfterFromError(t *testing.T) {
+	testcases := []struct {
+		name     string
+		err      error
+		expected time.Duration
+	}{
+		{
+			name:     "not a ResponseError",
+			err:      errors.New("foo"),
+			expected: reconciler.DefaultReconcilerRequeue,
+		},
+		{
+			name:     "Retry-After in seconds",
+			err:      newRetryAfterError(http.StatusTooManyRequests, "30"),
+			expected: 30 * time.Second,
+		},
+		{
+			name:     "Retry-After of zero falls back to the default",
+			err:      newRetryAfterError(http.StatusTooManyRequests, "0"),
+			expected: reconciler.DefaultReconcilerRequeue,
+		},
+		{
+			name:     "negative Retry-After falls back to the default",
+			err:      newRetryAfterError(http.StatusTooManyRequests, "-5"),
+			expected: reconciler.DefaultReconcilerRequeue,
+		},
+		{
+			name:     "elapsed Retry-After HTTP-date falls back to the default",
+			err:      newRetryAfterError(http.StatusServiceUnavailable, elapsedHTTPDate),
+			expected: reconciler.DefaultReconcilerRequeue,
+		},
+		{
+			name:     "429 without Retry-After",
+			err:      newRetryAfterError(http.StatusTooManyRequests, ""),
+			expected: reconciler.DefaultHTTP429RetryAfter,
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(GetRetryAfterFromError(tc.err)).To(Equal(tc.expected))
+		})
+	}
+}
+
+func TestServiceCreateOrUpdateResourceRetryAfter(t *testing.T) {
+	testcases := []struct {
+		name                 string
+		retryAfter           string
+		expectedRequeueAfter time.Duration
+	}{
+		{
+			name:                 "positive Retry-After is preserved",
+			retryAfter:           "30",
+			expectedRequeueAfter: 30 * time.Second,
+		},
+		{
+			name:                 "Retry-After of zero requeues after the default",
+			retryAfter:           "0",
+			expectedRequeueAfter: reconciler.DefaultReconcilerRequeue,
+		},
+		{
+			name:                 "negative Retry-After requeues after the default",
+			retryAfter:           "-5",
+			expectedRequeueAfter: reconciler.DefaultReconcilerRequeue,
+		},
+		{
+			name:                 "elapsed Retry-After HTTP-date requeues after the default",
+			retryAfter:           elapsedHTTPDate,
+			expectedRequeueAfter: reconciler.DefaultReconcilerRequeue,
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			mockCtrl := gomock.NewController(t)
+			defer mockCtrl.Finish()
+
+			scopeMock := mock_async.NewMockFutureScope(mockCtrl)
+			creatorMock := mock_async.NewMockCreator[MockCreator](mockCtrl)
+			svc := New[MockCreator, MockDeleter](scopeMock, creatorMock, nil)
+			specMock := mock_azure.NewMockResourceSpecGetter(mockCtrl)
+
+			s, c, r := scopeMock.EXPECT(), creatorMock.EXPECT(), specMock.EXPECT()
+			gomock.InOrder(
+				r.ResourceName().Return(resourceName),
+				r.ResourceGroupName().Return(resourceGroupName),
+				s.GetLongRunningOperationState(resourceName, serviceName, infrav1.PutFuture).Return(validPutFuture),
+				c.CreateOrUpdateAsync(gomockinternal.AContext(), gomock.AssignableToTypeOf(azureResourceGetterType), resumeToken, gomock.Any()).Return(nil, fakePoller[MockCreator](g, http.StatusAccepted), newRetryAfterError(http.StatusTooManyRequests, tc.retryAfter)),
+				s.DeleteLongRunningOperationState(resourceName, serviceName, infrav1.PutFuture),
+			)
+
+			_, err := svc.CreateOrUpdateResource(t.Context(), specMock, serviceName)
+			g.Expect(err).To(HaveOccurred())
+			var reconcileErr azure.ReconcileError
+			g.Expect(errors.As(err, &reconcileErr)).To(BeTrue())
+			g.Expect(reconcileErr.IsTransient()).To(BeTrue())
+			g.Expect(reconcileErr.RequeueAfter()).To(BeNumerically(">", 0))
+			g.Expect(reconcileErr.RequeueAfter()).To(Equal(tc.expectedRequeueAfter))
+		})
+	}
+}
+
+func TestServiceDeleteResource(t *testing.T) {
+	testcases := []struct {
+		name           string
+		serviceName    string
+		expectedError  string
+		expectedResult any
+		expect         func(g *GomegaWithT, s *mock_async.MockFutureScopeMockRecorder, d *mock_async.MockDeleterMockRecorder[MockDeleter], r *mock_azure.MockResourceSpecGetterMockRecorder)
+	}{
+		{
+			name:          "invalid future",
+			serviceName:   serviceName,
+			expectedError: "could not decode future data",
+			expect: func(_ *GomegaWithT, s *mock_async.MockFutureScopeMockRecorder, _ *mock_async.MockDeleterMockRecorder[MockDeleter], r *mock_azure.MockResourceSpecGetterMockRecorder) {
+				gomock.InOrder(
+					r.ResourceName().Return(resourceName),
+					r.ResourceGroupName().Return(resourceGroupName),
+					s.GetLongRunningOperationState(resourceName, serviceName, infrav1.DeleteFuture).Return(invalidDeleteFuture),
+					s.DeleteLongRunningOperationState(resourceName, serviceName, infrav1.DeleteFuture),
+				)
+			},
+		},
+		{
+			name:          "operation in progress",
+			serviceName:   serviceName,
+			expectedError: "operation type DELETE on Azure resource mock-resourcegroup/mock-resource is not done. Object will be requeued after 15s",
+			expect: func(g *GomegaWithT, s *mock_async.MockFutureScopeMockRecorder, d *mock_async.MockDeleterMockRecorder[MockDeleter], r *mock_azure.MockResourceSpecGetterMockRecorder) {
+				gomock.InOrder(
+					r.ResourceName().Return(resourceName),
+					r.ResourceGroupName().Return(resourceGroupName),
+					s.GetLongRunningOperationState(resourceName, serviceName, infrav1.DeleteFuture).Return(validDeleteFuture),
+					d.DeleteAsync(gomockinternal.AContext(), gomock.AssignableToTypeOf(azureResourceGetterType), gomock.Any()).Return(fakePoller[MockDeleter](g, http.StatusAccepted), context.DeadlineExceeded),
+					s.SetLongRunningOperationState(gomock.AssignableToTypeOf(&infrav1.Future{})),
+					s.DefaultedReconcilerRequeue().Return(reconciler.DefaultReconcilerRequeue),
+				)
+			},
+		},
+		{
+			name:          "operation succeeds",
+			serviceName:   serviceName,
+			expectedError: "",
+			expect: func(_ *GomegaWithT, s *mock_async.MockFutureScopeMockRecorder, d *mock_async.MockDeleterMockRecorder[MockDeleter], r *mock_azure.MockResourceSpecGetterMockRecorder) {
+				gomock.InOrder(
+					r.ResourceName().Return(resourceName),
+					r.ResourceGroupName().Return(resourceGroupName),
+					s.GetLongRunningOperationState(resourceName, serviceName, infrav1.DeleteFuture).Return(validDeleteFuture),
+					d.DeleteAsync(gomockinternal.AContext(), gomock.AssignableToTypeOf(azureResourceGetterType), gomock.Any()).Return(nil, nil),
+					s.DeleteLongRunningOperationState(resourceName, serviceName, infrav1.DeleteFuture),
+				)
+			},
+		},
+		{
+			name:          "operation fails",
+			serviceName:   serviceName,
+			expectedError: "failed to delete resource mock-resourcegroup/mock-resource (service: mock-service): foo",
+			expect: func(g *GomegaWithT, s *mock_async.MockFutureScopeMockRecorder, d *mock_async.MockDeleterMockRecorder[MockDeleter], r *mock_azure.MockResourceSpecGetterMockRecorder) {
+				gomock.InOrder(
+					r.ResourceName().Return(resourceName),
+					r.ResourceGroupName().Return(resourceGroupName),
+					s.GetLongRunningOperationState(resourceName, serviceName, infrav1.DeleteFuture).Return(validDeleteFuture),
+					d.DeleteAsync(gomockinternal.AContext(), gomock.AssignableToTypeOf(azureResourceGetterType), gomock.Any()).Return(fakePoller[MockDeleter](g, http.StatusAccepted), errors.New("foo")),
+					s.DeleteLongRunningOperationState(resourceName, serviceName, infrav1.DeleteFuture),
+				)
+			},
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			t.Parallel()
+			mockCtrl := gomock.NewController(t)
+			defer mockCtrl.Finish()
+			scopeMock := mock_async.NewMockFutureScope(mockCtrl)
+			deleterMock := mock_async.NewMockDeleter[MockDeleter](mockCtrl)
+			svc := New[MockCreator, MockDeleter](scopeMock, nil, deleterMock)
+			specMock := mock_azure.NewMockResourceSpecGetter(mockCtrl)
+
+			tc.expect(g, scopeMock.EXPECT(), deleterMock.EXPECT(), specMock.EXPECT())
+
+			err := svc.DeleteResource(t.Context(), specMock, tc.serviceName)
+			if tc.expectedError != "" {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(err.Error()).To(ContainSubstring(tc.expectedError))
+			} else {
+				g.Expect(err).NotTo(HaveOccurred())
+			}
+		})
+	}
+}
+
+const (
+	resourceGroupName  = "mock-resourcegroup"
+	resourceName       = "mock-resource"
+	serviceName        = "mock-service"
+	resumeToken        = "mock-resume-token"
+	invalidResumeToken = "!invalid-resume-token"
 )
 
 var (
-	validCreateFuture = infrav1.Future{
+	validPutFuture = &infrav1.Future{
 		Type:          infrav1.PutFuture,
-		ServiceName:   "test-service",
-		Name:          "test-resource",
-		ResourceGroup: "test-group",
-		Data:          "eyJtZXRob2QiOiJQVVQiLCJwb2xsaW5nTWV0aG9kIjoiTG9jYXRpb24iLCJscm9TdGF0ZSI6IkluUHJvZ3Jlc3MifQ==",
+		ServiceName:   serviceName,
+		Name:          resourceName,
+		ResourceGroup: resourceGroupName,
+		Data:          base64.URLEncoding.EncodeToString([]byte(resumeToken)),
 	}
-	validDeleteFuture = infrav1.Future{
+	invalidPutFuture = &infrav1.Future{
+		Type:          infrav1.PutFuture,
+		ServiceName:   serviceName,
+		Name:          resourceName,
+		ResourceGroup: resourceGroupName,
+		Data:          invalidResumeToken,
+	}
+	validDeleteFuture = &infrav1.Future{
 		Type:          infrav1.DeleteFuture,
-		ServiceName:   "test-service",
-		Name:          "test-resource",
-		ResourceGroup: "test-group",
-		Data:          "eyJtZXRob2QiOiJERUxFVEUiLCJwb2xsaW5nTWV0aG9kIjoiTG9jYXRpb24iLCJscm9TdGF0ZSI6IkluUHJvZ3Jlc3MifQ==",
+		ServiceName:   serviceName,
+		Name:          resourceName,
+		ResourceGroup: resourceGroupName,
+		Data:          base64.URLEncoding.EncodeToString([]byte(resumeToken)),
 	}
-	invalidFuture = infrav1.Future{
+	invalidDeleteFuture = &infrav1.Future{
 		Type:          infrav1.DeleteFuture,
-		ServiceName:   "test-service",
-		Name:          "test-resource",
-		ResourceGroup: "test-group",
-		Data:          "ZmFrZSBiNjQgZnV0dXJlIGRhdGEK",
+		ServiceName:   serviceName,
+		Name:          resourceName,
+		ResourceGroup: resourceGroupName,
+		Data:          invalidResumeToken,
 	}
-	fakeExistingResource   = resources.GenericResource{}
-	fakeResourceParameters = resources.GenericResource{}
-	fakeInternalError      = autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 500}, "Internal Server Error")
-	fakeNotFoundError      = autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not Found")
-	errCtxExceeded         = errors.New("ctx exceeded")
+	fakeResource            = armresources.GenericResource{}
+	fakeParameters          = armresources.GenericResource{}
+	azureResourceGetterType = reflect.TypeFor[azure.ResourceSpecGetter]()
 )
 
-// TestProcessOngoingOperation tests the processOngoingOperation function.
-func TestProcessOngoingOperation(t *testing.T) {
-	testcases := []struct {
-		name           string
-		resourceName   string
-		serviceName    string
-		expectedError  string
-		expectedResult interface{}
-		expect         func(s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockFutureHandlerMockRecorder)
-	}{
-		{
-			name:          "no future data stored in status",
-			expectedError: "",
-			resourceName:  "test-resource",
-			serviceName:   "test-service",
-			expect: func(s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockFutureHandlerMockRecorder) {
-				s.GetLongRunningOperationState("test-resource", "test-service").Return(nil)
-			},
+func fakePoller[T any](g *GomegaWithT, statusCode int) *runtime.Poller[T] {
+	response := &http.Response{
+		Body: io.NopCloser(strings.NewReader("")),
+		Request: &http.Request{
+			Method: http.MethodPut,
+			URL:    &url.URL{Path: "/"},
 		},
-		{
-			name:          "future data is not valid",
-			expectedError: "could not decode future data, resetting long-running operation state",
-			resourceName:  "test-resource",
-			serviceName:   "test-service",
-			expect: func(s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockFutureHandlerMockRecorder) {
-				s.GetLongRunningOperationState("test-resource", "test-service").Return(&invalidFuture)
-				s.DeleteLongRunningOperationState("test-resource", "test-service")
-			},
-		},
-		{
-			name:          "fail to check if ongoing operation is done",
-			expectedError: "failed checking if the operation was complete",
-			resourceName:  "test-resource",
-			serviceName:   "test-service",
-			expect: func(s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockFutureHandlerMockRecorder) {
-				s.GetLongRunningOperationState("test-resource", "test-service").Return(&validDeleteFuture)
-				c.IsDone(gomockinternal.AContext(), gomock.AssignableToTypeOf(&azureautorest.Future{})).Return(false, fakeInternalError)
-			},
-		},
-		{
-			name:          "ongoing operation is not done",
-			expectedError: "operation type DELETE on Azure resource test-group/test-resource is not done",
-			resourceName:  "test-resource",
-			serviceName:   "test-service",
-			expect: func(s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockFutureHandlerMockRecorder) {
-				s.GetLongRunningOperationState("test-resource", "test-service").Return(&validDeleteFuture)
-				c.IsDone(gomockinternal.AContext(), gomock.AssignableToTypeOf(&azureautorest.Future{})).Return(false, nil)
-			},
-		},
-		{
-			name:           "operation is done",
-			expectedError:  "",
-			expectedResult: &fakeExistingResource,
-			resourceName:   "test-resource",
-			serviceName:    "test-service",
-			expect: func(s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockFutureHandlerMockRecorder) {
-				s.GetLongRunningOperationState("test-resource", "test-service").Return(&validDeleteFuture)
-				c.IsDone(gomockinternal.AContext(), gomock.AssignableToTypeOf(&azureautorest.Future{})).Return(true, nil)
-				s.DeleteLongRunningOperationState("test-resource", "test-service")
-				c.Result(gomockinternal.AContext(), gomock.AssignableToTypeOf(&azureautorest.Future{}), infrav1.DeleteFuture).Return(&fakeExistingResource, nil)
-			},
-		},
+		StatusCode: statusCode,
 	}
-
-	for _, tc := range testcases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			g := NewWithT(t)
-
-			t.Parallel()
-			mockCtrl := gomock.NewController(t)
-			defer mockCtrl.Finish()
-			scopeMock := mock_async.NewMockFutureScope(mockCtrl)
-			clientMock := mock_async.NewMockFutureHandler(mockCtrl)
-
-			tc.expect(scopeMock.EXPECT(), clientMock.EXPECT())
-
-			result, err := processOngoingOperation(context.TODO(), scopeMock, clientMock, tc.resourceName, tc.serviceName)
-			if tc.expectedError != "" {
-				g.Expect(err).To(HaveOccurred())
-				g.Expect(err.Error()).To(ContainSubstring(tc.expectedError))
-			} else {
-				g.Expect(err).NotTo(HaveOccurred())
-			}
-			if tc.expectedResult != nil {
-				g.Expect(result).To(Equal(tc.expectedResult))
-			} else {
-				g.Expect(result).To(BeNil())
-			}
-		})
-	}
+	pipeline := runtime.NewPipeline("testmodule", "v0.1.0", runtime.PipelineOptions{}, nil)
+	poller, err := runtime.NewPoller[T](response, pipeline, nil)
+	g.Expect(err).NotTo(HaveOccurred())
+	return poller
 }
 
-// TestCreateResource tests the CreateResource function.
-func TestCreateResource(t *testing.T) {
-	testcases := []struct {
-		name           string
-		serviceName    string
-		expectedError  string
-		expectedResult interface{}
-		expect         func(s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockCreatorMockRecorder, r *mock_azure.MockResourceSpecGetterMockRecorder)
-	}{
-		{
-			name:          "create operation is already in progress",
-			expectedError: "operation type PUT on Azure resource test-group/test-resource is not done. Object will be requeued after 15s",
-			serviceName:   "test-service",
-			expect: func(s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockCreatorMockRecorder, r *mock_azure.MockResourceSpecGetterMockRecorder) {
-				r.ResourceName().Return("test-resource")
-				r.ResourceGroupName().Return("test-group")
-				s.GetLongRunningOperationState("test-resource", "test-service").Times(2).Return(&validCreateFuture)
-				c.IsDone(gomockinternal.AContext(), gomock.AssignableToTypeOf(&azureautorest.Future{})).Return(false, nil)
-			},
-		},
-		{
-			name:           "create async returns success",
-			expectedError:  "",
-			expectedResult: "test-resource",
-			serviceName:    "test-service",
-			expect: func(s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockCreatorMockRecorder, r *mock_azure.MockResourceSpecGetterMockRecorder) {
-				r.ResourceName().Return("test-resource")
-				r.ResourceGroupName().Return("test-group")
-				s.GetLongRunningOperationState("test-resource", "test-service").Return(nil)
-				c.Get(gomockinternal.AContext(), gomock.AssignableToTypeOf(&mock_azure.MockResourceSpecGetter{})).Return(&fakeExistingResource, nil)
-				r.Parameters(&fakeExistingResource).Return(&fakeResourceParameters, nil)
-				c.CreateOrUpdateAsync(gomockinternal.AContext(), gomock.AssignableToTypeOf(&mock_azure.MockResourceSpecGetter{}), &fakeResourceParameters).Return("test-resource", nil, nil)
-			},
-		},
-		{
-			name:          "error occurs while running async get",
-			expectedError: "failed to get existing resource test-group/test-resource (service: test-service)",
-			serviceName:   "test-service",
-			expect: func(s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockCreatorMockRecorder, r *mock_azure.MockResourceSpecGetterMockRecorder) {
-				r.ResourceName().Return("test-resource")
-				r.ResourceGroupName().Return("test-group")
-				s.GetLongRunningOperationState("test-resource", "test-service").Return(nil)
-				c.Get(gomockinternal.AContext(), gomock.AssignableToTypeOf(&mock_azure.MockResourceSpecGetter{})).Return(nil, fakeInternalError)
-			},
-		},
-		{
-			name:           "async get returns not found",
-			expectedError:  "",
-			serviceName:    "test-service",
-			expectedResult: &fakeExistingResource,
-			expect: func(s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockCreatorMockRecorder, r *mock_azure.MockResourceSpecGetterMockRecorder) {
-				r.ResourceName().Return("test-resource")
-				r.ResourceGroupName().Return("test-group")
-				s.GetLongRunningOperationState("test-resource", "test-service").Return(nil)
-				c.Get(gomockinternal.AContext(), gomock.AssignableToTypeOf(&mock_azure.MockResourceSpecGetter{})).Return(nil, fakeNotFoundError)
-				r.Parameters(nil).Return(&fakeResourceParameters, nil)
-				c.CreateOrUpdateAsync(gomockinternal.AContext(), gomock.AssignableToTypeOf(&mock_azure.MockResourceSpecGetter{}), &fakeResourceParameters).Return(&fakeExistingResource, nil, nil)
-			},
-		},
-		{
-			name:          "error occurs while running async spec parameters",
-			expectedError: "failed to get desired parameters for resource test-group/test-resource (service: test-service)",
-			serviceName:   "test-service",
-			expect: func(s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockCreatorMockRecorder, r *mock_azure.MockResourceSpecGetterMockRecorder) {
-				r.ResourceName().Return("test-resource")
-				r.ResourceGroupName().Return("test-group")
-				s.GetLongRunningOperationState("test-resource", "test-service").Return(nil)
-				c.Get(gomockinternal.AContext(), gomock.AssignableToTypeOf(&mock_azure.MockResourceSpecGetter{})).Return(&fakeExistingResource, nil)
-				r.Parameters(&fakeExistingResource).Return(nil, fakeInternalError)
-			},
-		},
-		{
-			name:           "async spec parameters returns nil",
-			expectedError:  "",
-			serviceName:    "test-service",
-			expectedResult: &fakeExistingResource,
-			expect: func(s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockCreatorMockRecorder, r *mock_azure.MockResourceSpecGetterMockRecorder) {
-				r.ResourceName().Return("test-resource")
-				r.ResourceGroupName().Return("test-group")
-				s.GetLongRunningOperationState("test-resource", "test-service").Return(nil)
-				c.Get(gomockinternal.AContext(), gomock.AssignableToTypeOf(&mock_azure.MockResourceSpecGetter{})).Return(&fakeExistingResource, nil)
-				r.Parameters(&fakeExistingResource).Return(nil, nil)
-			},
-		},
-		{
-			name:          "error occurs while running async create",
-			expectedError: "failed to create resource test-group/test-resource (service: test-service)",
-			serviceName:   "test-service",
-			expect: func(s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockCreatorMockRecorder, r *mock_azure.MockResourceSpecGetterMockRecorder) {
-				r.ResourceName().Return("test-resource")
-				r.ResourceGroupName().Return("test-group")
-				s.GetLongRunningOperationState("test-resource", "test-service").Return(nil)
-				c.Get(gomockinternal.AContext(), gomock.AssignableToTypeOf(&mock_azure.MockResourceSpecGetter{})).Return(&fakeExistingResource, nil)
-				r.Parameters(&fakeExistingResource).Return(&fakeResourceParameters, nil)
-				c.CreateOrUpdateAsync(gomockinternal.AContext(), gomock.AssignableToTypeOf(&mock_azure.MockResourceSpecGetter{}), &fakeResourceParameters).Return(nil, nil, fakeInternalError)
-			},
-		},
-		{
-			name:          "create async exits before completing",
-			expectedError: "operation type PUT on Azure resource test-group/test-resource is not done. Object will be requeued after 15s",
-			serviceName:   "test-service",
-			expect: func(s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockCreatorMockRecorder, r *mock_azure.MockResourceSpecGetterMockRecorder) {
-				r.ResourceName().Return("test-resource")
-				r.ResourceGroupName().Return("test-group")
-				s.GetLongRunningOperationState("test-resource", "test-service").Return(nil)
-				c.Get(gomockinternal.AContext(), gomock.AssignableToTypeOf(&mock_azure.MockResourceSpecGetter{})).Return(&fakeExistingResource, nil)
-				r.Parameters(&fakeExistingResource).Return(&fakeResourceParameters, nil)
-				c.CreateOrUpdateAsync(gomockinternal.AContext(), gomock.AssignableToTypeOf(&mock_azure.MockResourceSpecGetter{}), &fakeResourceParameters).Return(nil, &azureautorest.Future{}, errCtxExceeded)
-				s.SetLongRunningOperationState(gomock.AssignableToTypeOf(&infrav1.Future{}))
-			},
-		},
-	}
-
-	for _, tc := range testcases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			g := NewWithT(t)
-
-			t.Parallel()
-			mockCtrl := gomock.NewController(t)
-			defer mockCtrl.Finish()
-			scopeMock := mock_async.NewMockFutureScope(mockCtrl)
-			creatorMock := mock_async.NewMockCreator(mockCtrl)
-			specMock := mock_azure.NewMockResourceSpecGetter(mockCtrl)
-
-			tc.expect(scopeMock.EXPECT(), creatorMock.EXPECT(), specMock.EXPECT())
-
-			s := New(scopeMock, creatorMock, nil)
-			result, err := s.CreateResource(context.TODO(), specMock, tc.serviceName)
-			if tc.expectedError != "" {
-				g.Expect(err).To(HaveOccurred())
-				g.Expect(err.Error()).To(ContainSubstring(tc.expectedError))
-			} else {
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(result).To(Equal(tc.expectedResult))
-			}
-		})
-	}
-}
-
-// TestDeleteResource tests the DeleteResource function.
-func TestDeleteResource(t *testing.T) {
-	testcases := []struct {
-		name          string
-		serviceName   string
-		expectedError string
-		expect        func(s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockDeleterMockRecorder, r *mock_azure.MockResourceSpecGetterMockRecorder)
-	}{
-		{
-			name:          "delete operation is already in progress",
-			expectedError: "operation type DELETE on Azure resource test-group/test-resource is not done. Object will be requeued after 15s",
-			serviceName:   "test-service",
-			expect: func(s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockDeleterMockRecorder, r *mock_azure.MockResourceSpecGetterMockRecorder) {
-				r.ResourceName().Return("test-resource")
-				r.ResourceGroupName().Return("test-group")
-				s.GetLongRunningOperationState("test-resource", "test-service").Times(2).Return(&validDeleteFuture)
-				c.IsDone(gomockinternal.AContext(), gomock.AssignableToTypeOf(&azureautorest.Future{})).Return(false, nil)
-			},
-		},
-		{
-			name:          "delete async returns success",
-			expectedError: "",
-			serviceName:   "test-service",
-			expect: func(s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockDeleterMockRecorder, r *mock_azure.MockResourceSpecGetterMockRecorder) {
-				r.ResourceName().Return("test-resource")
-				r.ResourceGroupName().Return("test-group")
-				s.GetLongRunningOperationState("test-resource", "test-service").Return(nil)
-				c.DeleteAsync(gomockinternal.AContext(), gomock.AssignableToTypeOf(&mock_azure.MockResourceSpecGetter{})).Return(nil, nil)
-			},
-		},
-		{
-			name:          "delete async returns not found",
-			expectedError: "",
-			serviceName:   "test-service",
-			expect: func(s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockDeleterMockRecorder, r *mock_azure.MockResourceSpecGetterMockRecorder) {
-				r.ResourceName().Return("test-resource")
-				r.ResourceGroupName().Return("test-group")
-				s.GetLongRunningOperationState("test-resource", "test-service").Return(nil)
-				c.DeleteAsync(gomockinternal.AContext(), gomock.AssignableToTypeOf(&mock_azure.MockResourceSpecGetter{})).Return(nil, fakeNotFoundError)
-			},
-		},
-		{
-			name:          "error occurs while running async delete",
-			expectedError: "failed to delete resource test-group/test-resource (service: test-service)",
-			serviceName:   "test-service",
-			expect: func(s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockDeleterMockRecorder, r *mock_azure.MockResourceSpecGetterMockRecorder) {
-				r.ResourceName().Return("test-resource")
-				r.ResourceGroupName().Return("test-group")
-				s.GetLongRunningOperationState("test-resource", "test-service").Return(nil)
-				c.DeleteAsync(gomockinternal.AContext(), gomock.AssignableToTypeOf(&mock_azure.MockResourceSpecGetter{})).Return(nil, fakeInternalError)
-			},
-		},
-		{
-			name:          "delete async exits before completing",
-			expectedError: "operation type DELETE on Azure resource test-group/test-resource is not done. Object will be requeued after 15s",
-			serviceName:   "test-service",
-			expect: func(s *mock_async.MockFutureScopeMockRecorder, c *mock_async.MockDeleterMockRecorder, r *mock_azure.MockResourceSpecGetterMockRecorder) {
-				r.ResourceName().Return("test-resource")
-				r.ResourceGroupName().Return("test-group")
-				s.GetLongRunningOperationState("test-resource", "test-service").Return(nil)
-				c.DeleteAsync(gomockinternal.AContext(), gomock.AssignableToTypeOf(&mock_azure.MockResourceSpecGetter{})).Return(&azureautorest.Future{}, errCtxExceeded)
-				s.SetLongRunningOperationState(gomock.AssignableToTypeOf(&infrav1.Future{}))
-			},
-		},
-	}
-
-	for _, tc := range testcases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			g := NewWithT(t)
-
-			t.Parallel()
-			mockCtrl := gomock.NewController(t)
-			defer mockCtrl.Finish()
-			scopeMock := mock_async.NewMockFutureScope(mockCtrl)
-			deleterMock := mock_async.NewMockDeleter(mockCtrl)
-			specMock := mock_azure.NewMockResourceSpecGetter(mockCtrl)
-
-			tc.expect(scopeMock.EXPECT(), deleterMock.EXPECT(), specMock.EXPECT())
-
-			s := New(scopeMock, nil, deleterMock)
-			err := s.DeleteResource(context.TODO(), specMock, tc.serviceName)
-			if tc.expectedError != "" {
-				g.Expect(err).To(HaveOccurred())
-				g.Expect(err.Error()).To(ContainSubstring(tc.expectedError))
-			} else {
-				g.Expect(err).NotTo(HaveOccurred())
-			}
-		})
-	}
-}
+type MockCreator struct{}
+type MockDeleter struct{}

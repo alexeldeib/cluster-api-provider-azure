@@ -33,25 +33,21 @@ import (
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/tags"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/virtualmachines"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/vmextensions"
+	apiinternal "sigs.k8s.io/cluster-api-provider-azure/internal/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
 )
 
 // azureMachineService is the group of services called by the AzureMachine controller.
 type azureMachineService struct {
-	scope                *scope.MachineScope
-	networkInterfacesSvc azure.Reconciler
-	inboundNatRulesSvc   azure.Reconciler
-	virtualMachinesSvc   azure.Reconciler
-	roleAssignmentsSvc   azure.Reconciler
-	disksSvc             azure.Reconciler
-	publicIPsSvc         azure.Reconciler
-	tagsSvc              azure.Reconciler
-	vmExtensionsSvc      azure.Reconciler
-	availabilitySetsSvc  azure.Reconciler
-	skuCache             *resourceskus.Cache
+	scope *scope.MachineScope
+	// services is the list of services to be reconciled.
+	// The order of the services is important as it determines the order in which the services are reconciled.
+	services  []azure.ServiceReconciler
+	skuCache  *resourceskus.Cache
+	Reconcile func(context.Context) error
+	Pause     func(context.Context) error
+	Delete    func(context.Context) error
 }
-
-var _ azure.Reconciler = (*azureMachineService)(nil)
 
 // newAzureMachineService populates all the services based on input scope.
 func newAzureMachineService(machineScope *scope.MachineScope) (*azureMachineService, error) {
@@ -59,93 +55,113 @@ func newAzureMachineService(machineScope *scope.MachineScope) (*azureMachineServ
 	if err != nil {
 		return nil, errors.Wrap(err, "failed creating a NewCache")
 	}
+	availabilitySetsSvc, err := availabilitysets.New(machineScope, cache)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed creating availabilitysets service")
+	}
+	disksSvc, err := disks.New(machineScope)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed creating disks service")
+	}
+	inboundnatrulesSvc, err := inboundnatrules.New(machineScope)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed creating inboundnatrules service")
+	}
+	publicIPsSvc, err := publicips.New(machineScope)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed creating publicips service")
+	}
+	roleAssignmentsSvc, err := roleassignments.New(machineScope)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed creating roleassignments service")
+	}
+	tagsSvc, err := tags.New(machineScope)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed creating tags service")
+	}
+	virtualmachinesSvc, err := virtualmachines.New(machineScope)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed creating virtualmachines service")
+	}
+	vmextensionsSvc, err := vmextensions.New(machineScope)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed creating vmextensions service")
+	}
+	networkInterfacesSvc, err := networkinterfaces.New(machineScope, cache)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed creating networkinterfaces service")
+	}
+	ams := &azureMachineService{
+		scope: machineScope,
+		services: []azure.ServiceReconciler{
+			publicIPsSvc,
+			inboundnatrulesSvc,
+			networkInterfacesSvc,
+			availabilitySetsSvc,
+			disksSvc,
+			virtualmachinesSvc,
+			roleAssignmentsSvc,
+			vmextensionsSvc,
+			tagsSvc,
+		},
+		skuCache: cache,
+	}
+	ams.Reconcile = ams.reconcile
+	ams.Pause = ams.pause
+	ams.Delete = ams.delete
 
-	return &azureMachineService{
-		scope:                machineScope,
-		inboundNatRulesSvc:   inboundnatrules.New(machineScope),
-		networkInterfacesSvc: networkinterfaces.New(machineScope, cache),
-		virtualMachinesSvc:   virtualmachines.New(machineScope),
-		roleAssignmentsSvc:   roleassignments.New(machineScope),
-		disksSvc:             disks.New(machineScope),
-		publicIPsSvc:         publicips.New(machineScope),
-		tagsSvc:              tags.New(machineScope),
-		vmExtensionsSvc:      vmextensions.New(machineScope),
-		availabilitySetsSvc:  availabilitysets.New(machineScope, cache),
-		skuCache:             cache,
-	}, nil
+	return ams, nil
 }
 
-// Reconcile reconciles all the services in a predetermined order.
-func (s *azureMachineService) Reconcile(ctx context.Context) error {
-	ctx, _, done := tele.StartSpanWithLogger(ctx, "controllers.azureMachineService.Reconcile")
+// reconcile reconciles all the services in a predetermined order.
+func (s *azureMachineService) reconcile(ctx context.Context) error {
+	ctx, _, done := tele.StartSpanWithLogger(ctx, "controllers.azureMachineService.reconcile")
 	defer done()
+
+	// Ensure that the deprecated networking field values have been migrated to the new NetworkInterfaces field.
+	apiinternal.SetDefaultAzureMachineSpecNetworkInterfaces(&s.scope.AzureMachine.Spec)
 
 	if err := s.scope.SetSubnetName(); err != nil {
 		return errors.Wrap(err, "failed defaulting subnet name")
 	}
 
-	if err := s.publicIPsSvc.Reconcile(ctx); err != nil {
-		return errors.Wrap(err, "failed to create public IP")
-	}
-
-	if err := s.inboundNatRulesSvc.Reconcile(ctx); err != nil {
-		return errors.Wrap(err, "failed to create inbound NAT rule")
-	}
-
-	if err := s.networkInterfacesSvc.Reconcile(ctx); err != nil {
-		return errors.Wrap(err, "failed to create network interface")
-	}
-
-	if err := s.availabilitySetsSvc.Reconcile(ctx); err != nil {
-		return errors.Wrap(err, "failed to create availability set")
-	}
-
-	if err := s.virtualMachinesSvc.Reconcile(ctx); err != nil {
-		return errors.Wrap(err, "failed to create virtual machine")
-	}
-
-	if err := s.roleAssignmentsSvc.Reconcile(ctx); err != nil {
-		return errors.Wrap(err, "unable to create role assignment")
-	}
-
-	if err := s.vmExtensionsSvc.Reconcile(ctx); err != nil {
-		return errors.Wrap(err, "unable to create vm extension")
-	}
-
-	if err := s.tagsSvc.Reconcile(ctx); err != nil {
-		return errors.Wrap(err, "unable to update tags")
+	for _, service := range s.services {
+		if err := service.Reconcile(ctx); err != nil {
+			return errors.Wrapf(err, "failed to reconcile AzureMachine service %s", service.Name())
+		}
 	}
 
 	return nil
 }
 
-// Delete deletes all the services in a predetermined order.
-func (s *azureMachineService) Delete(ctx context.Context) error {
-	ctx, _, done := tele.StartSpanWithLogger(ctx, "controllers.azureMachineService.Delete")
+// pause pauses all components making up the machine.
+func (s *azureMachineService) pause(ctx context.Context) error {
+	ctx, _, done := tele.StartSpanWithLogger(ctx, "controllers.azureMachineService.pause")
 	defer done()
 
-	if err := s.virtualMachinesSvc.Delete(ctx); err != nil {
-		return errors.Wrap(err, "failed to delete machine")
+	for _, service := range s.services {
+		pauser, ok := service.(azure.Pauser)
+		if !ok {
+			continue
+		}
+		if err := pauser.Pause(ctx); err != nil {
+			return errors.Wrapf(err, "failed to pause AzureMachine service %s", service.Name())
+		}
 	}
 
-	if err := s.networkInterfacesSvc.Delete(ctx); err != nil {
-		return errors.Wrap(err, "failed to delete network interface")
-	}
+	return nil
+}
 
-	if err := s.inboundNatRulesSvc.Delete(ctx); err != nil {
-		return errors.Wrap(err, "failed to delete inbound NAT rule")
-	}
+// delete deletes all the services in a predetermined order.
+func (s *azureMachineService) delete(ctx context.Context) error {
+	ctx, _, done := tele.StartSpanWithLogger(ctx, "controllers.azureMachineService.delete")
+	defer done()
 
-	if err := s.publicIPsSvc.Delete(ctx); err != nil {
-		return errors.Wrap(err, "failed to delete public IPs")
-	}
-
-	if err := s.disksSvc.Delete(ctx); err != nil {
-		return errors.Wrap(err, "failed to delete OS disk")
-	}
-
-	if err := s.availabilitySetsSvc.Delete(ctx); err != nil {
-		return errors.Wrap(err, "failed to delete availability set")
+	// Delete services in reverse order of creation.
+	for i := len(s.services) - 1; i >= 0; i-- {
+		if err := s.services[i].Delete(ctx); err != nil {
+			return errors.Wrapf(err, "failed to delete AzureMachine service %s", s.services[i].Name())
+		}
 	}
 
 	return nil

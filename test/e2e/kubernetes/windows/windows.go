@@ -1,3 +1,4 @@
+//go:build e2e
 // +build e2e
 
 /*
@@ -49,11 +50,11 @@ func (i *WindowsImage) GetImage(version OSVersion) string {
 	return fmt.Sprintf("%s:%s", i.BaseImage, tag)
 }
 
-func GetWindowsImage(testImage WindowsTestImages, version OSVersion) string {
+func GetWindowsImage(_ WindowsTestImages, version OSVersion) string {
 	httpd := WindowsImage{
-		BaseImage: "k8sprow.azurecr.io/kubernetes-e2e-test-images/httpd",
+		BaseImage: "registry.k8s.io/e2e-test-images/httpd",
 		Tags: map[OSVersion]string{
-			LTSC2019: "2.4.39-alpine",
+			LTSC2019: "2.4.39-4",
 		},
 	}
 

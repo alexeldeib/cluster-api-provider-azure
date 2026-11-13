@@ -2,8 +2,7 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  creationTimestamp: null
-  name: manager-role
+  name: base-manager-role
 rules:
 - apiGroups:
   - ""
@@ -19,6 +18,20 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - namespaces
+  verbs:
+  - list
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - secrets
   verbs:
   - create
@@ -29,19 +42,29 @@ rules:
   - update
   - watch
 - apiGroups:
-  - aadpodidentity.k8s.io
+  - apiextensions.k8s.io
   resources:
-  - azureidentities
-  - azureidentities/status
+  - customresourcedefinitions
   verbs:
   - get
   - list
   - watch
 - apiGroups:
-  - aadpodidentity.k8s.io
+  - authentication.k8s.io
   resources:
-  - azureidentitybindings
-  - azureidentitybindings/status
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
+  verbs:
+  - create
+- apiGroups:
+  - bootstrap.cluster.x-k8s.io
+  resources:
+  - '*'
   verbs:
   - get
   - list
@@ -50,6 +73,15 @@ rules:
   - cluster.x-k8s.io
   resources:
   - clusters
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
   - clusters/status
   verbs:
   - get
@@ -60,10 +92,22 @@ rules:
   - cluster.x-k8s.io
   resources:
   - machinepools
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
   - machinepools/status
   verbs:
   - get
   - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - cluster.x-k8s.io
@@ -71,13 +115,32 @@ rules:
   - machines
   - machines/status
   verbs:
+  - delete
   - get
   - list
   - watch
 - apiGroups:
-  - ""
+  - containerservice.azure.com
   resources:
-  - nodes
+  - fleetsmembers
+  - maintenanceconfigurations
+  - managedclusters
+  - managedclustersagentpools
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - containerservice.azure.com
+  resources:
+  - fleetsmembers/status
+  - maintenanceconfigurations/status
+  - managedclusters/status
+  - managedclustersagentpools/status
   verbs:
   - get
   - list
@@ -85,148 +148,17 @@ rules:
 - apiGroups:
   - infrastructure.cluster.x-k8s.io
   resources:
+  - azureasomanagedclusters
+  - azureasomanagedcontrolplanes
+  - azureasomanagedmachinepools
   - azureclusteridentities
   - azureclusteridentities/status
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
   - azureclusters
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - azureclusters/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
   - azuremachinepoolmachines
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - azuremachinepoolmachines/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
   - azuremachinepools
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - azuremachinepools/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
   - azuremachines
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - azuremachines/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - azuremachinetemplates
-  - azuremachinetemplates/status
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
   - azuremanagedclusters
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - azuremanagedclusters/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
   - azuremanagedcontrolplanes
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - azuremanagedcontrolplanes/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
   - azuremanagedmachinepools
   verbs:
   - create
@@ -239,8 +171,113 @@ rules:
 - apiGroups:
   - infrastructure.cluster.x-k8s.io
   resources:
+  - azureasomanagedclusters/finalizers
+  - azureasomanagedcontrolplanes/finalizers
+  - azureasomanagedmachinepools/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - infrastructure.cluster.x-k8s.io
+  resources:
+  - azureasomanagedclusters/status
+  - azureasomanagedcontrolplanes/status
+  - azureasomanagedmachinepools/status
+  - azureclusters/status
+  - azuremachinepoolmachines/status
+  - azuremachinepools/status
+  - azuremachines/status
+  - azuremanagedclusters/status
+  - azuremanagedcontrolplanes/status
   - azuremanagedmachinepools/status
   verbs:
   - get
   - patch
   - update
+- apiGroups:
+  - infrastructure.cluster.x-k8s.io
+  resources:
+  - azuremachinetemplates
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - infrastructure.cluster.x-k8s.io
+  resources:
+  - azuremachinetemplates/status
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - kubernetesconfiguration.azure.com
+  resources:
+  - extensions
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - kubernetesconfiguration.azure.com
+  resources:
+  - extensions/status
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - network.azure.com
+  resources:
+  - bastionhosts
+  - natgateways
+  - privateendpoints
+  - privatelinkservices
+  - virtualnetworks
+  - virtualnetworkssubnets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - network.azure.com
+  resources:
+  - bastionhosts/status
+  - natgateways/status
+  - privateendpoints/status
+  - privatelinkservices/status
+  - virtualnetworks/status
+  - virtualnetworkssubnets/status
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - resources.azure.com
+  resources:
+  - resourcegroups
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - resources.azure.com
+  resources:
+  - resourcegroups/status
+  verbs:
+  - get
+  - list
+  - watch

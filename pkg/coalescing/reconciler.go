@@ -22,9 +22,10 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
 	"sigs.k8s.io/cluster-api-provider-azure/util/cache/ttllru"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 type (
@@ -77,7 +78,7 @@ func (cache *ReconcileCache) Reconciled(key string) {
 
 // NewReconciler returns a reconcile wrapper that will delay new reconcile.Requests
 // after the cache expiry of the request string key.
-// A successful reconciliation is defined as as one where no error is returned.
+// A successful reconciliation is defined as one where no error is returned.
 func NewReconciler(upstream reconcile.Reconciler, cache ReconcileCacher, log logr.Logger) reconcile.Reconciler {
 	return &reconciler{
 		upstream: upstream,

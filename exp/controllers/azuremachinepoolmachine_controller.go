@@ -26,6 +26,19 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/util"
+	"sigs.k8s.io/cluster-api/util/annotations"
+	v1beta1conditions "sigs.k8s.io/cluster-api/util/deprecated/v1beta1/conditions"
+	"sigs.k8s.io/cluster-api/util/predicates"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/scope"
@@ -35,29 +48,20 @@ import (
 	"sigs.k8s.io/cluster-api-provider-azure/pkg/coalescing"
 	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
-	capierrors "sigs.k8s.io/cluster-api/errors"
-	"sigs.k8s.io/cluster-api/util"
-	"sigs.k8s.io/cluster-api/util/annotations"
-	"sigs.k8s.io/cluster-api/util/predicates"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 type (
-	azureMachinePoolMachineReconcilerFactory func(*scope.MachinePoolMachineScope) azure.Reconciler
+	azureMachinePoolMachineReconcilerFactory func(*scope.MachinePoolMachineScope) (azure.Reconciler, error)
 
 	// AzureMachinePoolMachineController handles Kubernetes change events for AzureMachinePoolMachine resources.
 	AzureMachinePoolMachineController struct {
 		client.Client
 		Scheme            *runtime.Scheme
 		Recorder          record.EventRecorder
-		ReconcileTimeout  time.Duration
+		Timeouts          reconciler.Timeouts
 		WatchFilterValue  string
 		reconcilerFactory azureMachinePoolMachineReconcilerFactory
+		CredentialCache   azure.CredentialCache
 	}
 
 	azureMachinePoolMachineReconciler struct {
@@ -67,13 +71,14 @@ type (
 )
 
 // NewAzureMachinePoolMachineController creates a new AzureMachinePoolMachineController to handle updates to Azure Machine Pool Machines.
-func NewAzureMachinePoolMachineController(c client.Client, recorder record.EventRecorder, reconcileTimeout time.Duration, watchFilterValue string) *AzureMachinePoolMachineController {
+func NewAzureMachinePoolMachineController(c client.Client, recorder record.EventRecorder, timeouts reconciler.Timeouts, watchFilterValue string, credCache azure.CredentialCache) *AzureMachinePoolMachineController {
 	return &AzureMachinePoolMachineController{
 		Client:            c,
 		Recorder:          recorder,
-		ReconcileTimeout:  reconcileTimeout,
+		Timeouts:          timeouts,
 		WatchFilterValue:  watchFilterValue,
 		reconcilerFactory: newAzureMachinePoolMachineReconciler,
+		CredentialCache:   credCache,
 	}
 }
 
@@ -90,26 +95,28 @@ func (ampmr *AzureMachinePoolMachineController) SetupWithManager(ctx context.Con
 		r = coalescing.NewReconciler(ampmr, options.Cache, log)
 	}
 
-	c, err := ctrl.NewControllerManagedBy(mgr).
+	return ctrl.NewControllerManagedBy(mgr).
 		WithOptions(options.Options).
 		For(&infrav1exp.AzureMachinePoolMachine{}).
-		WithEventFilter(predicates.ResourceNotPausedAndHasFilterLabel(log, ampmr.WatchFilterValue)).
-		Build(r)
-	if err != nil {
-		return errors.Wrapf(err, "error creating controller")
-	}
-
-	// Add a watch on AzureMachinePool for model changes
-	if err := c.Watch(
-		&source.Kind{Type: &infrav1exp.AzureMachinePool{}},
-		handler.EnqueueRequestsFromMapFunc(AzureMachinePoolToAzureMachinePoolMachines(ctx, mgr.GetClient(), log)),
-		MachinePoolModelHasChanged(log),
-		predicates.ResourceNotPausedAndHasFilterLabel(log, ampmr.WatchFilterValue),
-	); err != nil {
-		return errors.Wrapf(err, "failed adding a watch for AzureMachinePool model changes")
-	}
-
-	return nil
+		WithEventFilter(predicates.ResourceNotPausedAndHasFilterLabel(mgr.GetScheme(), log, ampmr.WatchFilterValue)).
+		// Add a watch on AzureMachinePool for model changes
+		Watches(
+			&infrav1exp.AzureMachinePool{},
+			handler.EnqueueRequestsFromMapFunc(AzureMachinePoolToAzureMachinePoolMachines(ctx, mgr.GetClient(), log)),
+			builder.WithPredicates(
+				MachinePoolModelHasChanged(log),
+				predicates.ResourceNotPausedAndHasFilterLabel(mgr.GetScheme(), log, ampmr.WatchFilterValue),
+			),
+		).
+		// Add a watch on CAPI Machines for MachinePool Machines
+		Watches(
+			&clusterv1.Machine{},
+			handler.EnqueueRequestsFromMapFunc(util.MachineToInfrastructureMapFunc(infrav1exp.GroupVersion.WithKind("AzureMachinePoolMachine"))),
+			builder.WithPredicates(
+				predicates.ResourceNotPausedAndHasFilterLabel(mgr.GetScheme(), log, ampmr.WatchFilterValue),
+			),
+		).
+		Complete(r)
 }
 
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=azuremachinepools,verbs=get;list;watch
@@ -117,6 +124,7 @@ func (ampmr *AzureMachinePoolMachineController) SetupWithManager(ctx context.Con
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=azuremachinepoolmachines,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=azuremachinepoolmachines/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machinepools;machinepools/status,verbs=get
+// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines;machines/status,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups="",resources=secrets;,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
@@ -134,31 +142,57 @@ func (ampmr *AzureMachinePoolMachineController) Reconcile(ctx context.Context, r
 
 	logger = logger.WithValues("namespace", req.Namespace, "azureMachinePoolMachine", req.Name)
 
-	ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultedLoopTimeout(ampmr.ReconcileTimeout))
+	ctx, cancel := context.WithTimeout(ctx, ampmr.Timeouts.DefaultedLoopTimeout())
 	defer cancel()
 
-	machine := &infrav1exp.AzureMachinePoolMachine{}
-	err := ampmr.Get(ctx, req.NamespacedName, machine)
+	azureMachine := &infrav1exp.AzureMachinePoolMachine{}
+	err := ampmr.Get(ctx, req.NamespacedName, azureMachine)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return reconcile.Result{}, nil
 		}
 		return reconcile.Result{}, err
 	}
+	logger.V(2).Info("Fetching cluster for AzureMachinePoolMachine", "ampm", azureMachine.Name)
 
+	// Fetch the Cluster.
+	cluster, err := util.GetClusterFromMetadata(ctx, ampmr.Client, azureMachine.ObjectMeta)
+	if err != nil {
+		logger.Info("AzureMachinePoolMachine is missing cluster label or cluster does not exist")
+		return reconcile.Result{}, nil
+	}
+
+	logger = logger.WithValues("cluster", cluster.Name)
+
+	// Return early if the object or Cluster is paused.
+	if annotations.IsPaused(cluster, azureMachine) {
+		logger.Info("AzureMachinePoolMachine or linked Cluster is marked as paused. Won't reconcile")
+		return ctrl.Result{}, nil
+	}
+
+	clusterScope, err := infracontroller.GetClusterScoper(ctx, logger, ampmr.Client, cluster, ampmr.Timeouts, ampmr.CredentialCache)
+	if err != nil {
+		return reconcile.Result{}, errors.Wrapf(err, "failed to create cluster scope for cluster %s/%s", cluster.Namespace, cluster.Name)
+	}
+
+	logger.V(2).Info("Fetching AzureMachinePool with object meta", "meta", azureMachine.ObjectMeta)
 	// Fetch the owning AzureMachinePool (VMSS)
-	azureMachinePool, err := infracontroller.GetOwnerAzureMachinePool(ctx, ampmr.Client, machine.ObjectMeta)
+	azureMachinePool, err := infracontroller.GetOwnerAzureMachinePool(ctx, ampmr.Client, azureMachine.ObjectMeta)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			controllerutil.RemoveFinalizer(machine, infrav1exp.AzureMachinePoolMachineFinalizer)
-			return reconcile.Result{}, ampmr.Client.Update(ctx, machine)
+			logger.Info("AzureMachinePool not found error missing, removing finalizer", "azureMachinePoolMachine", azureMachine.Name)
+			controllerutil.RemoveFinalizer(azureMachine, infrav1exp.AzureMachinePoolMachineFinalizer)
+			return reconcile.Result{}, ampmr.Client.Update(ctx, azureMachine)
 		}
 		return reconcile.Result{}, err
 	}
-
-	if azureMachinePool != nil {
-		logger = logger.WithValues("azureMachinePool", azureMachinePool.Name)
+	if azureMachinePool == nil {
+		logger.Info("AzureMachinePool not found error missing, removing finalizer", "azureMachinePoolMachine", azureMachine.Name)
+		controllerutil.RemoveFinalizer(azureMachine, infrav1exp.AzureMachinePoolMachineFinalizer)
+		return reconcile.Result{}, ampmr.Client.Update(ctx, azureMachine)
 	}
+
+	logger = logger.WithValues("azureMachinePool", azureMachinePool.Name)
 
 	// Fetch the CAPI MachinePool.
 	machinePool, err := infracontroller.GetOwnerMachinePool(ctx, ampmr.Client, azureMachinePool.ObjectMeta)
@@ -170,42 +204,22 @@ func (ampmr *AzureMachinePoolMachineController) Reconcile(ctx context.Context, r
 		logger = logger.WithValues("machinePool", machinePool.Name)
 	}
 
-	// Fetch the Cluster.
-	cluster, err := util.GetClusterFromMetadata(ctx, ampmr.Client, machinePool.ObjectMeta)
-	if err != nil {
-		logger.Info("MachinePool is missing cluster label or cluster does not exist")
-		return reconcile.Result{}, nil
-	}
-
-	logger = logger.WithValues("cluster", cluster.Name)
-
-	// Return early if the object or Cluster is paused.
-	if annotations.IsPaused(cluster, machine) {
-		logger.Info("AzureMachinePoolMachine or linked Cluster is marked as paused. Won't reconcile")
-		return ctrl.Result{}, nil
-	}
-
-	azureClusterName := client.ObjectKey{
-		Namespace: machine.Namespace,
-		Name:      cluster.Spec.InfrastructureRef.Name,
-	}
-
-	azureCluster := &infrav1.AzureCluster{}
-	if err := ampmr.Client.Get(ctx, azureClusterName, azureCluster); err != nil {
-		logger.Info("AzureCluster is not available yet")
-		return reconcile.Result{}, nil
-	}
-
-	logger = logger.WithValues("AzureCluster", azureCluster.Name)
-
-	// Create the cluster scope
-	clusterScope, err := scope.NewClusterScope(ctx, scope.ClusterScopeParams{
-		Client:       ampmr.Client,
-		Cluster:      cluster,
-		AzureCluster: azureCluster,
-	})
-	if err != nil {
+	// Fetch the CAPI Machine.
+	machine, err := util.GetOwnerMachine(ctx, ampmr.Client, azureMachine.ObjectMeta)
+	if err != nil && !apierrors.IsNotFound(err) {
 		return reconcile.Result{}, err
+	}
+
+	switch {
+	case machine != nil:
+		logger = logger.WithValues("machine", machine.Name)
+	case !azureMachinePool.ObjectMeta.DeletionTimestamp.IsZero():
+		logger.Info("AzureMachinePool is being deleted, removing finalizer")
+		controllerutil.RemoveFinalizer(azureMachine, infrav1exp.AzureMachinePoolMachineFinalizer)
+		return reconcile.Result{}, ampmr.Client.Update(ctx, azureMachine)
+	default:
+		logger.Info("Waiting for Machine Controller to set OwnerRef on AzureMachinePoolMachine")
+		return reconcile.Result{}, nil
 	}
 
 	// Create the machine pool scope
@@ -213,11 +227,12 @@ func (ampmr *AzureMachinePoolMachineController) Reconcile(ctx context.Context, r
 		Client:                  ampmr.Client,
 		MachinePool:             machinePool,
 		AzureMachinePool:        azureMachinePool,
-		AzureMachinePoolMachine: machine,
+		AzureMachinePoolMachine: azureMachine,
+		Machine:                 machine,
 		ClusterScope:            clusterScope,
 	})
 	if err != nil {
-		return reconcile.Result{}, errors.Errorf("failed to create scope: %+v", err)
+		return reconcile.Result{}, errors.Wrap(err, "failed to create scope")
 	}
 
 	// Always close the scope when exiting this function so we can persist any AzureMachine changes.
@@ -228,12 +243,12 @@ func (ampmr *AzureMachinePoolMachineController) Reconcile(ctx context.Context, r
 	}()
 
 	// Handle deleted machine pools machine
-	if !machine.ObjectMeta.DeletionTimestamp.IsZero() {
-		return ampmr.reconcileDelete(ctx, machineScope)
+	if !azureMachine.ObjectMeta.DeletionTimestamp.IsZero() {
+		return ampmr.reconcileDelete(ctx, machineScope, clusterScope)
 	}
 
-	if !clusterScope.Cluster.Status.InfrastructureReady {
-		logger.Info("Cluster infrastructure is not ready yet")
+	if !ptr.Deref(cluster.Status.Initialization.InfrastructureProvisioned, false) {
+		logger.Info("Cluster infrastructure is not provisioned yet")
 		return reconcile.Result{}, nil
 	}
 
@@ -252,7 +267,10 @@ func (ampmr *AzureMachinePoolMachineController) reconcileNormal(ctx context.Cont
 		return reconcile.Result{}, nil
 	}
 
-	ampms := ampmr.reconcilerFactory(machineScope)
+	ampms, err := ampmr.reconcilerFactory(machineScope)
+	if err != nil {
+		return reconcile.Result{}, errors.Wrap(err, "failed to create AzureMachinePoolMachine reconciler")
+	}
 	if err := ampms.Reconcile(ctx); err != nil {
 		// Handle transient and terminal errors
 		var reconcileError azure.ReconcileError
@@ -267,7 +285,7 @@ func (ampmr *AzureMachinePoolMachineController) reconcileNormal(ctx context.Cont
 				return reconcile.Result{RequeueAfter: reconcileError.RequeueAfter()}, nil
 			}
 
-			return reconcile.Result{}, errors.Wrapf(err, "failed to reconcile AzureMachinePool")
+			return reconcile.Result{}, errors.Wrap(err, "failed to reconcile AzureMachinePool")
 		}
 
 		return reconcile.Result{}, err
@@ -277,15 +295,19 @@ func (ampmr *AzureMachinePoolMachineController) reconcileNormal(ctx context.Cont
 	switch state {
 	case infrav1.Failed:
 		ampmr.Recorder.Eventf(machineScope.AzureMachinePoolMachine, corev1.EventTypeWarning, "FailedVMState", "Azure scale set VM is in failed state")
-		machineScope.SetFailureReason(capierrors.UpdateMachineError)
-		machineScope.SetFailureMessage(errors.Errorf("Azure VM state is %s", state))
 	case infrav1.Deleting:
-		if err := ampmr.Client.Delete(ctx, machineScope.AzureMachinePoolMachine); err != nil {
-			return reconcile.Result{}, errors.Wrap(err, "machine pool machine failed to be deleted when deleting")
+		log.V(4).Info("deleting machine because state is Deleting", "machine", machineScope.Name())
+		if err := ampmr.Client.Delete(ctx, machineScope.Machine); err != nil && !apierrors.IsNotFound(err) {
+			return reconcile.Result{}, errors.Wrap(err, "machine failed to be deleted when deleting")
 		}
 	}
 
 	log.V(2).Info(fmt.Sprintf("Scale Set VM is %s", state), "id", machineScope.ProviderID())
+
+	bootstrappingCondition := v1beta1conditions.Get(machineScope.AzureMachinePoolMachine, infrav1.BootstrapSucceededCondition)
+	if bootstrappingCondition != nil && bootstrappingCondition.Reason == infrav1.BootstrapFailedReason {
+		return reconcile.Result{}, nil
+	}
 
 	if !infrav1.IsTerminalProvisioningState(state) || !machineScope.IsReady() {
 		log.V(2).Info("Requeuing", "state", state, "ready", machineScope.IsReady())
@@ -298,24 +320,34 @@ func (ampmr *AzureMachinePoolMachineController) reconcileNormal(ctx context.Cont
 	return reconcile.Result{}, nil
 }
 
-func (ampmr *AzureMachinePoolMachineController) reconcileDelete(ctx context.Context, machineScope *scope.MachinePoolMachineScope) (_ reconcile.Result, reterr error) {
+func (ampmr *AzureMachinePoolMachineController) reconcileDelete(ctx context.Context, machineScope *scope.MachinePoolMachineScope, clusterScope infracontroller.ClusterScoper) (_ reconcile.Result, reterr error) {
 	ctx, log, done := tele.StartSpanWithLogger(ctx, "controllers.AzureMachinePoolMachineController.reconcileDelete")
 	defer done()
 
-	log.Info("Handling deleted AzureMachinePoolMachine")
+	if !infracontroller.ShouldDeleteIndividualResources(ctx, clusterScope) {
+		log.Info("Skipping VMSS VM deletion as the whole resource group is being deleted")
 
-	if machineScope.AzureMachinePool == nil || !machineScope.AzureMachinePool.ObjectMeta.DeletionTimestamp.IsZero() {
-		// deleting the entire VMSS, so just remove finalizer and VMSS delete remove the underlying infrastructure.
 		controllerutil.RemoveFinalizer(machineScope.AzureMachinePoolMachine, infrav1exp.AzureMachinePoolMachineFinalizer)
 		return reconcile.Result{}, nil
 	}
 
-	// deleting a single machine
-	// 1) drain the node (TODO: @devigned)
-	// 2) after drained, delete the infrastructure
-	// 3) remove finalizer
+	if !machineScope.AzureMachinePool.ObjectMeta.DeletionTimestamp.IsZero() {
+		log.Info("Skipping VMSS VM deletion as VMSS delete will delete individual instances")
 
-	ampms := ampmr.reconcilerFactory(machineScope)
+		controllerutil.RemoveFinalizer(machineScope.AzureMachinePoolMachine, infrav1exp.AzureMachinePoolMachineFinalizer)
+		return reconcile.Result{}, nil
+	}
+
+	log.Info("Deleting AzureMachinePoolMachine")
+
+	// deleting a single machine
+	// 1) delete the infrastructure, node drain already done by owner Machine
+	// 2) remove finalizer
+
+	ampms, err := ampmr.reconcilerFactory(machineScope)
+	if err != nil {
+		return reconcile.Result{}, errors.Wrap(err, "failed to create AzureMachinePoolMachine reconciler")
+	}
 	if err := ampms.Delete(ctx); err != nil {
 		// Handle transient and terminal errors
 		var reconcileError azure.ReconcileError
@@ -339,11 +371,15 @@ func (ampmr *AzureMachinePoolMachineController) reconcileDelete(ctx context.Cont
 	return reconcile.Result{}, nil
 }
 
-func newAzureMachinePoolMachineReconciler(scope *scope.MachinePoolMachineScope) azure.Reconciler {
+func newAzureMachinePoolMachineReconciler(scope *scope.MachinePoolMachineScope) (azure.Reconciler, error) {
+	scaleSetVMsSvc, err := scalesetvms.NewService(scope)
+	if err != nil {
+		return nil, err
+	}
 	return &azureMachinePoolMachineReconciler{
 		Scope:              scope,
-		scalesetVMsService: scalesetvms.NewService(scope),
-	}
+		scalesetVMsService: scaleSetVMsSvc,
+	}, nil
 }
 
 // Reconcile will reconcile the state of the Machine Pool Machine with the state of the Azure VMSS VM.
@@ -355,8 +391,12 @@ func (r *azureMachinePoolMachineReconciler) Reconcile(ctx context.Context) error
 		return errors.Wrap(err, "failed to reconcile scalesetVMs")
 	}
 
-	if err := r.Scope.UpdateStatus(ctx); err != nil {
-		return errors.Wrap(err, "failed to update vmss vm status")
+	if err := r.Scope.UpdateNodeStatus(ctx); err != nil {
+		return errors.Wrap(err, "failed to update VMSS VM node status")
+	}
+
+	if err := r.Scope.UpdateInstanceStatus(ctx); err != nil {
+		return errors.Wrap(err, "failed to update VMSS VM instance status")
 	}
 
 	return nil
@@ -368,15 +408,14 @@ func (r *azureMachinePoolMachineReconciler) Delete(ctx context.Context) error {
 	defer done()
 
 	defer func() {
-		if err := r.Scope.UpdateStatus(ctx); err != nil {
-			log.V(4).Info("failed tup update vmss vm status during delete")
+		if err := r.Scope.UpdateNodeStatus(ctx); err != nil {
+			log.V(4).Info("failed to update VMSS VM node status during delete")
+		}
+
+		if err := r.Scope.UpdateInstanceStatus(ctx); err != nil {
+			log.V(4).Info("failed to update VMSS VM instance status during delete")
 		}
 	}()
-
-	// cordon and drain stuff
-	if err := r.Scope.CordonAndDrain(ctx); err != nil {
-		return errors.Wrap(err, "failed to cordon and drain the scalesetVMs")
-	}
 
 	if err := r.scalesetVMsService.Delete(ctx); err != nil {
 		return errors.Wrap(err, "failed to reconcile scalesetVMs")

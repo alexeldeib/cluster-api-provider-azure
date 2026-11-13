@@ -1,3 +1,4 @@
+//go:build e2e
 // +build e2e
 
 /*
@@ -22,22 +23,25 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 
-	typedappsv1 "k8s.io/client-go/kubernetes/typed/apps/v1"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
-
+	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/utils/pointer"
+	typedappsv1 "k8s.io/client-go/kubernetes/typed/apps/v1"
+	"k8s.io/utils/ptr"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 )
 
 const (
-	ExternalLoadbalancer = LoadbalancerType("external")
-	InternalLoadbalancer = LoadbalancerType("internal")
+	ExternalLoadbalancer                   = LoadbalancerType("external")
+	InternalLoadbalancer                   = LoadbalancerType("internal")
+	deploymentOperationTimeout             = 30 * time.Second
+	deploymentOperationSleepBetweenRetries = 3 * time.Second
 )
 
 type (
@@ -59,7 +63,7 @@ func Create(image, name, namespace string) *Builder {
 				Labels:    map[string]string{},
 			},
 			Spec: appsv1.DeploymentSpec{
-				Replicas: pointer.Int32Ptr(1),
+				Replicas: ptr.To[int32](1),
 				Selector: &metav1.LabelSelector{
 					MatchLabels: map[string]string{
 						"app": name,
@@ -127,12 +131,31 @@ func (d *Builder) AddContainerPort(name, portName string, portNumber int32, prot
 	}
 }
 
-func (d *Builder) Deploy(ctx context.Context, clientset *kubernetes.Clientset) (*appsv1.Deployment, error) {
-	deployment, err := d.Client(clientset).Create(ctx, d.deployment, metav1.CreateOptions{})
-	if err != nil {
-		log.Printf("Error trying to deploy %s in namespace %s:%s\n", d.deployment.Name, d.deployment.ObjectMeta.Namespace, err.Error())
-		return nil, err
+func (d *Builder) AddPVC(pvcName string) *Builder {
+	volumes := []corev1.Volume{
+		{
+			Name: "managed",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: pvcName,
+				},
+			},
+		},
 	}
+	d.deployment.Spec.Template.Spec.Volumes = volumes
+	return d
+}
+
+func (d *Builder) Deploy(ctx context.Context, clientset *kubernetes.Clientset) (*appsv1.Deployment, error) {
+	var deployment *appsv1.Deployment
+	Eventually(func(g Gomega) {
+		var err error
+		deployment, err = d.Client(clientset).Create(ctx, d.deployment, metav1.CreateOptions{})
+		if err != nil {
+			log.Printf("Error trying to deploy %s in namespace %s:%s\n", d.deployment.Name, d.deployment.ObjectMeta.Namespace, err.Error())
+		}
+		g.Expect(err).NotTo(HaveOccurred())
+	}, deploymentOperationTimeout, deploymentOperationSleepBetweenRetries).Should(Succeed())
 
 	return deployment, nil
 }
@@ -146,15 +169,19 @@ func (d *Builder) GetPodsFromDeployment(ctx context.Context, clientset *kubernet
 		LabelSelector: labels.Set(d.deployment.Labels).String(),
 		Limit:         100,
 	}
-	pods, err := clientset.CoreV1().Pods(d.deployment.GetNamespace()).List(ctx, opts)
-	if err != nil {
-		log.Printf("Error trying to get the pods from deployment %s:%s\n", d.deployment.GetName(), err.Error())
-		return nil, err
-	}
+	var pods *corev1.PodList
+	Eventually(func(g Gomega) {
+		var err error
+		pods, err = clientset.CoreV1().Pods(d.deployment.GetNamespace()).List(ctx, opts)
+		if err != nil {
+			log.Printf("Error trying to get the pods from deployment %s:%s\n", d.deployment.GetName(), err.Error())
+		}
+		g.Expect(err).NotTo(HaveOccurred())
+	}, deploymentOperationTimeout, deploymentOperationSleepBetweenRetries).Should(Succeed())
 	return pods.Items, nil
 }
 
-func (d *Builder) GetService(ports []corev1.ServicePort, lbtype LoadbalancerType) *corev1.Service {
+func (d *Builder) CreateServiceResourceSpec(ports []corev1.ServicePort, lbtype LoadbalancerType, ipFamilies []corev1.IPFamily) *corev1.Service {
 	suffix := "elb"
 	annotations := map[string]string{}
 	if lbtype == InternalLoadbalancer {
@@ -174,6 +201,7 @@ func (d *Builder) GetService(ports []corev1.ServicePort, lbtype LoadbalancerType
 			Selector: map[string]string{
 				"app": d.deployment.Name,
 			},
+			IPFamilies: ipFamilies,
 		},
 	}
 }
@@ -213,5 +241,16 @@ func (d *Builder) AddPodAntiAffinity(affinity corev1.PodAntiAffinity) *Builder {
 	}
 
 	d.deployment.Spec.Template.Spec.Affinity.PodAntiAffinity = &affinity
+	return d
+}
+
+// SetResourceRequests sets CPU and memory resource requests for the first container.
+func (d *Builder) SetResourceRequests(cpu, memory string) *Builder {
+	if len(d.deployment.Spec.Template.Spec.Containers) > 0 {
+		d.deployment.Spec.Template.Spec.Containers[0].Resources.Requests = corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(cpu),
+			corev1.ResourceMemory: resource.MustParse(memory),
+		}
+	}
 	return d
 }

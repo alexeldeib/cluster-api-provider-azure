@@ -10,12 +10,16 @@ spec:
         privateIP: ${AZURE_INTERNAL_LB_IP}
       name: ${CLUSTER_NAME}-internal-lb
       type: Internal
+      availabilityZones:
+        - "1"
+        - "2"
+        - "3"
     vnet:
       name: ${AZURE_VNET_NAME}
       cidrBlocks:
       - ${AZURE_PRIVATE_VNET_CIDR}
       peerings:
-      - resourceGroup: ${AZURE_RESOURCE_GROUP}
+      - resourceGroup: ${AZURE_CUSTOM_VNET_RESOURCE_GROUP}
         remoteVnetName: ${AZURE_CUSTOM_VNET_NAME}
     subnets:
       - name: private-cp-subnet

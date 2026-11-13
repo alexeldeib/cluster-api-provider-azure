@@ -19,12 +19,16 @@ package azure
 import (
 	"fmt"
 	"net/http"
+	"regexp"
+	"strings"
 
-	"github.com/Azure/go-autorest/autorest"
-	"github.com/Azure/go-autorest/autorest/azure"
-	"github.com/blang/semver"
-	"github.com/pkg/errors"
-	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
+	"github.com/Azure/azure-sdk-for-go/sdk/tracing/azotel"
+	"go.opentelemetry.io/otel"
+
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
 	"sigs.k8s.io/cluster-api-provider-azure/version"
 )
@@ -32,17 +36,27 @@ import (
 const (
 	// DefaultUserName is the default username for a created VM.
 	DefaultUserName = "capi"
+	// DefaultAKSUserName is the default username for a created AKS VM.
+	DefaultAKSUserName = "azureuser"
+	// PublicCloudName is the name of the Azure public cloud.
+	PublicCloudName = "AzurePublicCloud"
+	// ChinaCloudName is the name of the Azure China cloud.
+	ChinaCloudName = "AzureChinaCloud"
+	// USGovernmentCloudName is the name of the Azure US Government cloud.
+	USGovernmentCloudName = "AzureUSGovernmentCloud"
+	// GermanCloudName is the name of the Azure German cloud.
+	GermanCloudName = "AzureGermanCloud"
+	// USSecCloudName is the name of the Azure US Government Secret cloud (IL6).
+	USSecCloudName = "AzureUSSecCloud"
 )
 
 const (
-	// DefaultImageOfferID is the default Azure Marketplace offer ID.
-	DefaultImageOfferID = "capi"
-	// DefaultWindowsImageOfferID is the default Azure Marketplace offer ID for Windows.
-	DefaultWindowsImageOfferID = "capi-windows"
-	// DefaultImagePublisherID is the default Azure Marketplace publisher ID.
-	DefaultImagePublisherID = "cncf-upstream"
-	// LatestVersion is the image version latest.
-	LatestVersion = "latest"
+	// DefaultPublicGalleryName is the default Azure compute gallery.
+	DefaultPublicGalleryName = "ClusterAPI-f72ceb4f-5159-4c26-a0fe-2ea738f0d019"
+	// DefaultLinuxGalleryImageName is the default Linux community gallery image definition.
+	DefaultLinuxGalleryImageName = "capi-ubun2-2404"
+	// DefaultWindowsGalleryImageName is the default Windows community gallery image definition.
+	DefaultWindowsGalleryImageName = "capi-win-2022-containerd"
 )
 
 const (
@@ -50,6 +64,19 @@ const (
 	LinuxOS = "Linux"
 	// WindowsOS is Windows OS value for OSDisk.OSType.
 	WindowsOS = "Windows"
+)
+
+const (
+	// BootstrappingExtensionLinux is the name of the Linux CAPZ bootstrapping VM extension.
+	BootstrappingExtensionLinux = "CAPZ.Linux.Bootstrapping"
+	// BootstrappingExtensionWindows is the name of the Windows CAPZ bootstrapping VM extension.
+	BootstrappingExtensionWindows = "CAPZ.Windows.Bootstrapping"
+)
+
+const (
+	// DefaultWindowsOsAndVersion is the default Windows Server version to use when
+	// generating default images for Windows nodes.
+	DefaultWindowsOsAndVersion = "windows-2022"
 )
 
 const (
@@ -79,57 +106,29 @@ const (
 )
 
 const (
-	// ProviderIDPrefix will be appended to the beginning of Azure resource IDs to form the Kubernetes Provider ID.
-	// NOTE: this format matches the 2 slashes format used in cloud-provider and cluster-autoscaler.
-	ProviderIDPrefix = "azure://"
+	// CustomHeaderPrefix is the prefix of annotations that enable additional cluster / node pool features.
+	// Whatever follows the prefix will be passed as a header to cluster/node pool creation/update requests.
+	// E.g. add `"infrastructure.cluster.x-k8s.io/custom-header-UseGPUDedicatedVHD": "true"` annotation to
+	// AzureManagedMachinePool CR to enable creating GPU nodes by the node pool.
+	CustomHeaderPrefix = "infrastructure.cluster.x-k8s.io/custom-header-"
 )
 
 var (
 	// LinuxBootstrapExtensionCommand is the command the VM bootstrap extension will execute to verify Linux nodes bootstrap completes successfully.
-	LinuxBootstrapExtensionCommand = fmt.Sprintf("for i in $(seq 1 %d); do test -f %s && break; if [ $i -eq %d ]; then return 1; else sleep %d; fi; done", bootstrapExtensionRetries, bootstrapSentinelFile, bootstrapExtensionRetries, bootstrapExtensionSleep)
+	LinuxBootstrapExtensionCommand = fmt.Sprintf("for i in $(seq 1 %d); do test -f %s && break; if [ $i -eq %d ]; then echo 'Error joining node to cluster: kubeadm init or join failed. To debug, check the cloud-init, kubelet, or other bootstrap logs: https://capz.sigs.k8s.io/self-managed/troubleshooting.html#checking-cloud-init-logs-ubuntu'; exit 1; else sleep %d; fi; done", bootstrapExtensionRetries, bootstrapSentinelFile, bootstrapExtensionRetries, bootstrapExtensionSleep)
 	// WindowsBootstrapExtensionCommand is the command the VM bootstrap extension will execute to verify Windows nodes bootstrap completes successfully.
 	WindowsBootstrapExtensionCommand = fmt.Sprintf("powershell.exe -Command \"for ($i = 0; $i -lt %d; $i++) {if (Test-Path '%s') {exit 0} else {Start-Sleep -Seconds %d}} exit -2\"",
 		bootstrapExtensionRetries, bootstrapSentinelFile, bootstrapExtensionSleep)
 )
-
-// GenerateBackendAddressPoolName generates a load balancer backend address pool name.
-func GenerateBackendAddressPoolName(lbName string) string {
-	return fmt.Sprintf("%s-%s", lbName, "backendPool")
-}
-
-// GenerateOutboundBackendAddressPoolName generates a load balancer outbound backend address pool name.
-func GenerateOutboundBackendAddressPoolName(lbName string) string {
-	return fmt.Sprintf("%s-%s", lbName, "outboundBackendPool")
-}
 
 // GenerateFrontendIPConfigName generates a load balancer frontend IP config name.
 func GenerateFrontendIPConfigName(lbName string) string {
 	return fmt.Sprintf("%s-%s", lbName, "frontEnd")
 }
 
-// GenerateNatGatewayIPName generates a NAT gateway IP name.
-func GenerateNatGatewayIPName(clusterName, subnetName string) string {
-	return fmt.Sprintf("pip-%s-%s-natgw", clusterName, subnetName)
-}
-
-// GenerateNodeOutboundIPName generates a public IP name, based on the cluster name.
-func GenerateNodeOutboundIPName(clusterName string) string {
-	return fmt.Sprintf("pip-%s-node-outbound", clusterName)
-}
-
 // GenerateNodePublicIPName generates a node public IP name, based on the machine name.
 func GenerateNodePublicIPName(machineName string) string {
 	return fmt.Sprintf("pip-%s", machineName)
-}
-
-// GenerateControlPlaneOutboundLBName generates the name of the control plane outbound LB.
-func GenerateControlPlaneOutboundLBName(clusterName string) string {
-	return fmt.Sprintf("%s-outbound-lb", clusterName)
-}
-
-// GenerateControlPlaneOutboundIPName generates a public IP name, based on the cluster name.
-func GenerateControlPlaneOutboundIPName(clusterName string) string {
-	return fmt.Sprintf("pip-%s-controlplane-outbound", clusterName)
 }
 
 // GeneratePrivateDNSZoneName generates the name of a private DNS zone based on the cluster name.
@@ -148,13 +147,11 @@ func GenerateVNetLinkName(vnetName string) string {
 }
 
 // GenerateNICName generates the name of a network interface based on the name of a VM.
-func GenerateNICName(machineName string) string {
+func GenerateNICName(machineName string, multiNIC bool, index int) string {
+	if multiNIC {
+		return fmt.Sprintf("%s-nic-%d", machineName, index)
+	}
 	return fmt.Sprintf("%s-nic", machineName)
-}
-
-// GeneratePublicNICName generates the name of a public network interface based on the name of a VM.
-func GeneratePublicNICName(machineName string) string {
-	return fmt.Sprintf("%s-public-nic", machineName)
 }
 
 // GenerateOSDiskName generates the name of an OS disk based on the name of a VM.
@@ -180,19 +177,14 @@ func GenerateAvailabilitySetName(clusterName, nodeGroup string) string {
 	return fmt.Sprintf("%s_%s-as", clusterName, nodeGroup)
 }
 
-// WithIndex appends the index as suffix to a generated name.
-func WithIndex(name string, n int) string {
-	return fmt.Sprintf("%s-%d", name, n)
-}
-
-// ResourceGroupID returns the azure resource ID for a given resource group.
-func ResourceGroupID(subscriptionID, resourceGroup string) string {
-	return fmt.Sprintf("/subscriptions/%s/resourceGroups/%s", subscriptionID, resourceGroup)
-}
-
 // VMID returns the azure resource ID for a given VM.
 func VMID(subscriptionID, resourceGroup, vmName string) string {
 	return fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Compute/virtualMachines/%s", subscriptionID, resourceGroup, vmName)
+}
+
+// VMSSID returns the azure resource ID for a given VMSS.
+func VMSSID(subscriptionID, resourceGroup, vmssName string) string {
+	return fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Compute/virtualMachineScaleSets/%s", subscriptionID, resourceGroup, vmssName)
 }
 
 // VNetID returns the azure resource ID for a given VNet.
@@ -208,6 +200,11 @@ func SubnetID(subscriptionID, resourceGroup, vnetName, subnetName string) string
 // PublicIPID returns the azure resource ID for a given public IP.
 func PublicIPID(subscriptionID, resourceGroup, ipName string) string {
 	return fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/publicIPAddresses/%s", subscriptionID, resourceGroup, ipName)
+}
+
+// PublicIPPrefixID returns the azure resource ID for a given public IP prefix.
+func PublicIPPrefixID(subscriptionID, resourceGroup, ipName string) string {
+	return fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/publicipprefixes/%s", subscriptionID, resourceGroup, ipName)
 }
 
 // RouteTableID returns the azure resource ID for a given route table.
@@ -255,106 +252,57 @@ func AvailabilitySetID(subscriptionID, resourceGroup, availabilitySetName string
 	return fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Compute/availabilitySets/%s", subscriptionID, resourceGroup, availabilitySetName)
 }
 
-// GetDefaultImageSKUID gets the SKU ID of the image to use for the provided version of Kubernetes.
-func getDefaultImageSKUID(k8sVersion, os, osVersion string) (string, error) {
-	version, err := semver.ParseTolerant(k8sVersion)
-	if err != nil {
-		return "", errors.Wrapf(err, "unable to parse Kubernetes version \"%s\" in spec, expected valid SemVer string", k8sVersion)
-	}
-	return fmt.Sprintf("k8s-%ddot%ddot%d-%s-%s", version.Major, version.Minor, version.Patch, os, osVersion), nil
+// PrivateDNSZoneID returns the azure resource ID for a given private DNS zone.
+func PrivateDNSZoneID(subscriptionID, resourceGroup, privateDNSZoneName string) string {
+	return fmt.Sprintf("subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/privateDnsZones/%s", subscriptionID, resourceGroup, privateDNSZoneName)
 }
 
-// GetDefaultUbuntuImage returns the default image spec for Ubuntu.
-func GetDefaultUbuntuImage(k8sVersion string) (*infrav1.Image, error) {
-	v, err := semver.ParseTolerant(k8sVersion)
-	if err != nil {
-		return nil, errors.Wrapf(err, "unable to parse Kubernetes version \"%s\"", k8sVersion)
-	}
-	// Default to Ubuntu 20.04 LTS, except for k8s versions which have only 18.04 reference images.
-	osVersion := "2004"
-	if (v.Major == 1 && v.Minor == 21 && v.Patch < 2) ||
-		(v.Major == 1 && v.Minor == 20 && v.Patch < 8) ||
-		(v.Major == 1 && v.Minor == 19 && v.Patch < 12) ||
-		(v.Major == 1 && v.Minor == 18 && v.Patch < 20) ||
-		(v.Major == 1 && v.Minor < 18) {
-		osVersion = "1804"
-	}
-
-	skuID, err := getDefaultImageSKUID(k8sVersion, "ubuntu", osVersion)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get default image")
-	}
-
-	defaultImage := &infrav1.Image{
-		Marketplace: &infrav1.AzureMarketplaceImage{
-			Publisher: DefaultImagePublisherID,
-			Offer:     DefaultImageOfferID,
-			SKU:       skuID,
-			Version:   LatestVersion,
-		},
-	}
-
-	return defaultImage, nil
+// VirtualNetworkLinkID returns the azure resource ID for a given virtual network link.
+func VirtualNetworkLinkID(subscriptionID, resourceGroup, privateDNSZoneName, virtualNetworkLinkName string) string {
+	return fmt.Sprintf("subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/privateDnsZones/%s/virtualNetworkLinks/%s", subscriptionID, resourceGroup, privateDNSZoneName, virtualNetworkLinkName)
 }
 
-// GetDefaultWindowsImage returns the default image spec for Windows.
-func GetDefaultWindowsImage(k8sVersion, runtime string) (*infrav1.Image, error) {
-	v122 := semver.MustParse("1.22.0")
-	v, err := semver.ParseTolerant(k8sVersion)
-	if err != nil {
-		return nil, errors.Wrapf(err, "unable to parse Kubernetes version \"%s\"", k8sVersion)
-	}
+// ManagedClusterID returns the azure resource ID for a given managed cluster.
+func ManagedClusterID(subscriptionID, resourceGroup, managedClusterName string) string {
+	return fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.ContainerService/managedClusters/%s", subscriptionID, resourceGroup, managedClusterName)
+}
 
-	// If containerd is specified we don't currently support less than 1.22
-	if v.LE(v122) && runtime == "containerd" {
-		return nil, errors.New("containerd image only supported in 1.22+")
-	}
-
-	skuID, err := getDefaultImageSKUID(k8sVersion, "windows", "2019")
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get default image")
-	}
-
-	// Starting with 1.22 we default to containerd for Windows unless the runtime flag is set.
-	if v.GTE(v122) && runtime != "dockershim" {
-		skuID = skuID + "-containerd"
-	}
-
-	defaultImage := &infrav1.Image{
-		Marketplace: &infrav1.AzureMarketplaceImage{
-			Publisher: DefaultImagePublisherID,
-			Offer:     DefaultWindowsImageOfferID,
-			SKU:       skuID,
-			Version:   LatestVersion,
-		},
-	}
-
-	return defaultImage, nil
+// FleetID returns the azure resource ID for a given fleet manager.
+func FleetID(subscriptionID, resourceGroup, fleetName string) string {
+	return fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.ContainerService/fleets/%s", subscriptionID, resourceGroup, fleetName)
 }
 
 // GetBootstrappingVMExtension returns the CAPZ Bootstrapping VM extension.
 // The CAPZ Bootstrapping extension is a simple clone of https://github.com/Azure/custom-script-extension-linux for Linux or
-// https://docs.microsoft.com/en-us/azure/virtual-machines/extensions/custom-script-windows for Windows.
+// https://learn.microsoft.com/azure/virtual-machines/extensions/custom-script-windows for Windows.
 // This extension allows running arbitrary scripts on the VM.
 // Its role is to detect and report Kubernetes bootstrap failure or success.
-func GetBootstrappingVMExtension(osType string, cloud string, vmName string) *ExtensionSpec {
+func GetBootstrappingVMExtension(osType string, cloud string, vmName string, cpuArchitectureType string) *ExtensionSpec {
 	// currently, the bootstrap extension is only available in AzurePublicCloud.
-	if osType == LinuxOS && cloud == azure.PublicCloud.Name {
+	if osType == LinuxOS && cloud == PublicCloudName {
 		// The command checks for the existence of the bootstrapSentinelFile on the machine, with retries and sleep between retries.
+		// We set the version to 1.1 (will target 1.1.1) for arm64 machines and 1.0 for x64. This is due to a known issue with newer versions of
+		// Go on Ubuntu 20.04. The issue is being tracked here: https://github.com/golang/go/issues/58550
+		// TODO: Remove this once the issue is fixed, or when Ubuntu 20.04 is no longer supported.
+		// We are using 1.1 instead of 1.1.1 for Arm64 as AzureAPI do not allow us to specify the full version.
+		extensionVersion := "1.0"
+		if cpuArchitectureType == string(armcompute.ArchitectureTypesArm64) {
+			extensionVersion = "1.1"
+		}
 		return &ExtensionSpec{
-			Name:      "CAPZ.Linux.Bootstrapping",
+			Name:      BootstrappingExtensionLinux,
 			VMName:    vmName,
 			Publisher: "Microsoft.Azure.ContainerUpstream",
-			Version:   "1.0",
+			Version:   extensionVersion,
 			ProtectedSettings: map[string]string{
 				"commandToExecute": LinuxBootstrapExtensionCommand,
 			},
 		}
-	} else if osType == WindowsOS && cloud == azure.PublicCloud.Name {
+	} else if osType == WindowsOS && cloud == PublicCloudName {
 		// This command for the existence of the bootstrapSentinelFile on the machine, with retries and sleep between reties.
 		// If the file is not present after the retries are exhausted the extension fails with return code '-2' - ERROR_FILE_NOT_FOUND.
 		return &ExtensionSpec{
-			Name:      "CAPZ.Windows.Bootstrapping",
+			Name:      BootstrappingExtensionWindows,
 			VMName:    vmName,
 			Publisher: "Microsoft.Azure.ContainerUpstream",
 			Version:   "1.0",
@@ -372,35 +320,128 @@ func UserAgent() string {
 	return fmt.Sprintf("cluster-api-provider-azure/%s", version.Get().String())
 }
 
-// SetAutoRestClientDefaults set authorizer and user agent for autorest client.
-func SetAutoRestClientDefaults(c *autorest.Client, auth autorest.Authorizer) {
-	c.Authorizer = auth
-	// Wrap the original Sender on the autorest.Client c.
-	// The wrapped Sender should set the x-ms-correlation-request-id on the given
-	// request, then pass the new request to the underlying Sender.
-	c.Sender = autorest.DecorateSender(c.Sender, msCorrelationIDSendDecorator)
-	// The default number of retries is 3. This means the client will attempt to retry operation results like resource
-	// conflicts (HTTP 409). For a reconciling controller, this is undesirable behavior since if the controller runs
-	// into an error reconciling, the controller would be better off to end with an error and try again later.
-	//
-	// Unfortunately, the naming of this field is a bit misleading. This is not actually "retry attempts", it actually
-	// is attempts. Setting this to a value of 0 will cause a panic in Go AutoRest.
-	c.RetryAttempts = 1
-	AutoRestClientAppendUserAgent(c, UserAgent())
+// ARMClientOptions returns default ARM client options for CAPZ SDK v2 requests.
+func ARMClientOptions(azureEnvironment string, extraPolicies ...policy.Policy) (*arm.ClientOptions, error) {
+	opts := &arm.ClientOptions{}
+
+	switch azureEnvironment {
+	case PublicCloudName:
+		opts.Cloud = cloud.AzurePublic
+	case ChinaCloudName:
+		opts.Cloud = cloud.AzureChina
+	case USGovernmentCloudName:
+		opts.Cloud = cloud.AzureGovernment
+	case USSecCloudName:
+		// USSec cloud.Configuration is populated at runtime from the environment
+		// file. The caller must set opts.Cloud from Authorizer.CloudConfiguration().
+	case "":
+		// No cloud name provided, so leave at defaults.
+	default:
+		return nil, fmt.Errorf("invalid cloud name %q", azureEnvironment)
+	}
+	opts.PerCallPolicies = []policy.Policy{
+		correlationIDPolicy{},
+		userAgentPolicy{},
+	}
+	opts.PerCallPolicies = append(opts.PerCallPolicies, extraPolicies...)
+	opts.Retry.MaxRetries = -1 // Less than zero means one try and no retries.
+
+	opts.TracingProvider = azotel.NewTracingProvider(otel.GetTracerProvider(), nil)
+
+	return opts, nil
 }
 
-// AutoRestClientAppendUserAgent autorest client calls "AddToUserAgent" but ignores errors.
-func AutoRestClientAppendUserAgent(c *autorest.Client, extension string) {
-	_ = c.AddToUserAgent(extension) // intentionally ignore error as it doesn't matter
+// ARMClientOptionsForAuth returns ARM client options for CAPZ SDK v2 requests,
+// applying the cloud configuration resolved by the Authorizer.
+//
+// For air-gapped clouds such as USSec (IL6) the cloud.Configuration (ARM
+// endpoint and token audience) is discovered at runtime from the environment
+// file and carried on the Authorizer rather than being known at compile time.
+// Applying it here guarantees every client targets the air-gapped endpoint
+// instead of public Azure, so individual callers cannot forget to set it.
+func ARMClientOptionsForAuth(authorizer Authorizer, extraPolicies ...policy.Policy) (*arm.ClientOptions, error) {
+	if authorizer == nil {
+		return nil, fmt.Errorf("authorizer cannot be nil")
+	}
+	opts, err := ARMClientOptions(authorizer.CloudEnvironment(), extraPolicies...)
+	if err != nil {
+		return nil, err
+	}
+	if authorizer.CloudEnvironment() == USSecCloudName {
+		opts.Cloud = authorizer.CloudConfiguration()
+	}
+	return opts, nil
 }
 
-func msCorrelationIDSendDecorator(snd autorest.Sender) autorest.Sender {
-	return autorest.SenderFunc(func(r *http.Request) (*http.Response, error) {
-		// if the correlation ID was found in the request context, set
-		// it in the header
-		if corrID, ok := tele.CorrIDFromCtx(r.Context()); ok {
-			r.Header.Set(string(tele.CorrIDKeyVal), string(corrID))
+// ShouldDisableInstanceDiscovery reports whether Microsoft Entra (AAD) instance
+// discovery must be disabled for the given Active Directory authority host.
+//
+// Instance discovery validates the authority against the public
+// login.microsoftonline.com metadata endpoint, which is unreachable in
+// air-gapped clouds such as USSec (IL6). Built-in, publicly reachable clouds
+// keep discovery enabled; any other (custom) authority, such as the IL6
+// authority discovered at runtime from the environment file, disables it so
+// credential creation does not hang trying to reach the public endpoint.
+func ShouldDisableInstanceDiscovery(authorityHost string) bool {
+	switch strings.TrimRight(authorityHost, "/") {
+	case "",
+		strings.TrimRight(cloud.AzurePublic.ActiveDirectoryAuthorityHost, "/"),
+		strings.TrimRight(cloud.AzureGovernment.ActiveDirectoryAuthorityHost, "/"),
+		strings.TrimRight(cloud.AzureChina.ActiveDirectoryAuthorityHost, "/"),
+		"https://login.microsoftonline.de": // Azure Germany; not built into SDKv2.
+		return false
+	default:
+		return true
+	}
+}
+
+// correlationIDPolicy adds the "x-ms-correlation-request-id" header to requests.
+// It implements the policy.Policy interface.
+type correlationIDPolicy struct{}
+
+// Do adds the "x-ms-correlation-request-id" header if a request has a correlation ID in its context.
+func (p correlationIDPolicy) Do(req *policy.Request) (*http.Response, error) {
+	if corrID, ok := tele.CorrIDFromCtx(req.Raw().Context()); ok {
+		req.Raw().Header.Set(string(tele.CorrIDKeyVal), string(corrID))
+	}
+	return req.Next()
+}
+
+// userAgentPolicy extends the "User-Agent" header on requests.
+// It implements the policy.Policy interface.
+type userAgentPolicy struct{}
+
+// Do extends the "User-Agent" header of a request by appending CAPZ's user agent.
+func (p userAgentPolicy) Do(req *policy.Request) (*http.Response, error) {
+	req.Raw().Header.Set("User-Agent", req.Raw().UserAgent()+" "+UserAgent())
+	return req.Next()
+}
+
+// CustomPutPatchHeaderPolicy adds custom headers to a PUT or PATCH request.
+// It implements the policy.Policy interface.
+type CustomPutPatchHeaderPolicy struct {
+	Headers map[string]string
+}
+
+// Do adds any custom headers to a PUT or PATCH request.
+func (p CustomPutPatchHeaderPolicy) Do(req *policy.Request) (*http.Response, error) {
+	if req.Raw().Method == http.MethodPut || req.Raw().Method == http.MethodPatch {
+		for key, element := range p.Headers {
+			req.Raw().Header.Set(key, element)
 		}
-		return snd.Do(r)
-	})
+	}
+
+	return req.Next()
+}
+
+// GetNormalizedKubernetesName returns a normalized name for a Kubernetes resource.
+func GetNormalizedKubernetesName(name string) string {
+	// Remove non-alphanumeric characters, convert to lowercase, and replace underscores with hyphens
+	name = strings.ToLower(name)
+	re := regexp.MustCompile(`[^a-z0-9\-]+`)
+	name = re.ReplaceAllString(name, "-")
+
+	// Remove leading and trailing hyphens
+	name = strings.Trim(name, "-")
+	return name
 }

@@ -17,9 +17,13 @@ limitations under the License.
 package loadbalancers
 
 import (
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-02-01/network"
-	"github.com/Azure/go-autorest/autorest/to"
+	"context"
+	"strings"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v4"
 	"github.com/pkg/errors"
+	"k8s.io/utils/ptr"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/converters"
@@ -27,22 +31,26 @@ import (
 
 // LBSpec defines the specification for a Load Balancer.
 type LBSpec struct {
-	Name                 string
-	ResourceGroup        string
-	SubscriptionID       string
-	ClusterName          string
-	Location             string
-	Role                 string
-	Type                 infrav1.LBType
-	SKU                  infrav1.SKU
-	VNetName             string
-	VNetResourceGroup    string
-	SubnetName           string
-	BackendPoolName      string
-	FrontendIPConfigs    []infrav1.FrontendIP
-	APIServerPort        int32
-	IdleTimeoutInMinutes *int32
-	AdditionalTags       map[string]string
+	Name                  string
+	ResourceGroup         string
+	SubscriptionID        string
+	ClusterName           string
+	Location              string
+	ExtendedLocation      *infrav1.ExtendedLocationSpec
+	Role                  string
+	Type                  infrav1.LBType
+	SKU                   infrav1.SKU
+	VNetName              string
+	VNetResourceGroup     string
+	SubnetName            string
+	BackendPoolName       string
+	FrontendIPConfigs     []infrav1.FrontendIP
+	APIServerPort         int32
+	APIServerFrontendPort int32
+	IdleTimeoutInMinutes  *int32
+	AdditionalTags        map[string]string
+	AdditionalPorts       []infrav1.LoadBalancerPort
+	AvailabilityZones     []string
 }
 
 // ResourceName returns the name of the load balancer.
@@ -61,21 +69,21 @@ func (s *LBSpec) OwnerResourceName() string {
 }
 
 // Parameters returns the parameters for the load balancer.
-func (s *LBSpec) Parameters(existing interface{}) (parameters interface{}, err error) {
+func (s *LBSpec) Parameters(_ context.Context, existing any) (parameters any, err error) {
 	var (
 		etag                *string
-		frontendIDs         []network.SubResource
-		frontendIPConfigs   = make([]network.FrontendIPConfiguration, 0)
-		loadBalancingRules  = make([]network.LoadBalancingRule, 0)
-		backendAddressPools = make([]network.BackendAddressPool, 0)
-		outboundRules       = make([]network.OutboundRule, 0)
-		probes              = make([]network.Probe, 0)
+		frontendIDs         []*armnetwork.SubResource
+		frontendIPConfigs   []*armnetwork.FrontendIPConfiguration
+		loadBalancingRules  []*armnetwork.LoadBalancingRule
+		backendAddressPools []*armnetwork.BackendAddressPool
+		outboundRules       []*armnetwork.OutboundRule
+		probes              []*armnetwork.Probe
 	)
 
 	if existing != nil {
-		existingLB, ok := existing.(network.LoadBalancer)
+		existingLB, ok := existing.(armnetwork.LoadBalancer)
 		if !ok {
-			return nil, errors.Errorf("%T is not a network.LoadBalancer", existing)
+			return nil, errors.Errorf("%T is not an armnetwork.LoadBalancer", existing)
 		}
 		// LB already exists
 		// We append the existing LB etag to the header to ensure we only apply the updates if the LB has not been modified.
@@ -83,45 +91,41 @@ func (s *LBSpec) Parameters(existing interface{}) (parameters interface{}, err e
 		update := false
 
 		// merge existing LB properties with desired properties
-		frontendIPConfigs = *existingLB.FrontendIPConfigurations
+		frontendIPConfigs = existingLB.Properties.FrontendIPConfigurations
 		wantedIPs, wantedFrontendIDs := getFrontendIPConfigs(*s)
 		for _, ip := range wantedIPs {
-			if !ipExists(frontendIPConfigs, ip) {
+			if !ipExists(frontendIPConfigs, *ip) {
 				update = true
 				frontendIPConfigs = append(frontendIPConfigs, ip)
 			}
 		}
 
-		loadBalancingRules = *existingLB.LoadBalancingRules
-		for _, rule := range getLoadBalancingRules(*s, wantedFrontendIDs) {
-			if !lbRuleExists(loadBalancingRules, rule) {
-				update = true
-				loadBalancingRules = append(loadBalancingRules, rule)
-			}
+		loadBalancingRules = existingLB.Properties.LoadBalancingRules
+		if mergedRules, changed := mergeLoadBalancingRules(loadBalancingRules, getLoadBalancingRules(*s, wantedFrontendIDs)); changed {
+			update = true
+			loadBalancingRules = mergedRules
 		}
 
-		backendAddressPools = *existingLB.BackendAddressPools
+		backendAddressPools = existingLB.Properties.BackendAddressPools
 		for _, pool := range getBackendAddressPools(*s) {
-			if !poolExists(backendAddressPools, pool) {
+			if !poolExists(backendAddressPools, *pool) {
 				update = true
 				backendAddressPools = append(backendAddressPools, pool)
 			}
 		}
 
-		outboundRules = *existingLB.OutboundRules
+		outboundRules = existingLB.Properties.OutboundRules
 		for _, rule := range getOutboundRules(*s, wantedFrontendIDs) {
-			if !outboundRuleExists(outboundRules, rule) {
+			if !outboundRuleExists(outboundRules, *rule) {
 				update = true
 				outboundRules = append(outboundRules, rule)
 			}
 		}
 
-		probes = *existingLB.Probes
-		for _, probe := range getProbes(*s) {
-			if !probeExists(probes, probe) {
-				update = true
-				probes = append(probes, probe)
-			}
+		probes = existingLB.Properties.Probes
+		if mergedProbes, changed := mergeProbes(probes, getProbes(*s)); changed {
+			update = true
+			probes = mergedProbes
 		}
 
 		if !update {
@@ -136,175 +140,297 @@ func (s *LBSpec) Parameters(existing interface{}) (parameters interface{}, err e
 		probes = getProbes(*s)
 	}
 
-	lb := network.LoadBalancer{
-		Etag:     etag,
-		Sku:      &network.LoadBalancerSku{Name: converters.SKUtoSDK(s.SKU)},
-		Location: to.StringPtr(s.Location),
+	lb := armnetwork.LoadBalancer{
+		Etag:             etag,
+		SKU:              &armnetwork.LoadBalancerSKU{Name: ptr.To(converters.SKUtoSDK(s.SKU))},
+		Location:         ptr.To(s.Location),
+		ExtendedLocation: converters.ExtendedLocationToNetworkSDK(s.ExtendedLocation),
 		Tags: converters.TagsToMap(infrav1.Build(infrav1.BuildParams{
 			ClusterName: s.ClusterName,
 			Lifecycle:   infrav1.ResourceLifecycleOwned,
-			Role:        to.StringPtr(s.Role),
+			Role:        ptr.To(s.Role),
 			Additional:  s.AdditionalTags,
 		})),
-		LoadBalancerPropertiesFormat: &network.LoadBalancerPropertiesFormat{
-			FrontendIPConfigurations: &frontendIPConfigs,
-			BackendAddressPools:      &backendAddressPools,
-			OutboundRules:            &outboundRules,
-			Probes:                   &probes,
-			LoadBalancingRules:       &loadBalancingRules,
+		Properties: &armnetwork.LoadBalancerPropertiesFormat{
+			FrontendIPConfigurations: frontendIPConfigs,
+			BackendAddressPools:      backendAddressPools,
+			OutboundRules:            outboundRules,
+			Probes:                   probes,
+			LoadBalancingRules:       loadBalancingRules,
 		},
 	}
 
 	return lb, nil
 }
 
-func getFrontendIPConfigs(lbSpec LBSpec) ([]network.FrontendIPConfiguration, []network.SubResource) {
-	frontendIPConfigurations := make([]network.FrontendIPConfiguration, 0)
-	frontendIDs := make([]network.SubResource, 0)
+func getFrontendIPConfigs(lbSpec LBSpec) ([]*armnetwork.FrontendIPConfiguration, []*armnetwork.SubResource) {
+	frontendIPConfigurations := make([]*armnetwork.FrontendIPConfiguration, 0)
+	frontendIDs := make([]*armnetwork.SubResource, 0)
+
+	// Convert availability zones to []*string for Azure SDK.
+	// IMPORTANT: Zones can only be set on frontend IP configurations for internal load balancers
+	// (where the frontend references a subnet). For public load balancers, zone-redundancy is
+	// achieved by setting zones on the associated public IP address resource, NOT on the load
+	// balancer's frontend IP configuration.
+	//
+	// Azure returns error "LoadBalancerFrontendIPConfigCannotHaveZoneWhenReferencingPublicIPAddress"
+	// if zones are specified on a frontend that references a public IP.
+	//
+	// See: https://learn.microsoft.com/en-us/azure/reliability/reliability-load-balancer#zone-redundant-load-balancer
+	// Section: "Zone-redundant load balancer" - "For public load balancers, if the public IP in the
+	// Load balancer's frontend is zone redundant then the load balancer is also zone-redundant."
+	var zones []*string
+	if len(lbSpec.AvailabilityZones) > 0 && lbSpec.Type == infrav1.Internal {
+		zones = make([]*string, len(lbSpec.AvailabilityZones))
+		for i, zone := range lbSpec.AvailabilityZones {
+			zones[i] = ptr.To(zone)
+		}
+	}
+
 	for _, ipConfig := range lbSpec.FrontendIPConfigs {
-		var properties network.FrontendIPConfigurationPropertiesFormat
+		var properties armnetwork.FrontendIPConfigurationPropertiesFormat
 		if lbSpec.Type == infrav1.Internal {
-			properties = network.FrontendIPConfigurationPropertiesFormat{
-				PrivateIPAllocationMethod: network.IPAllocationMethodStatic,
-				Subnet: &network.Subnet{
-					ID: to.StringPtr(azure.SubnetID(lbSpec.SubscriptionID, lbSpec.VNetResourceGroup, lbSpec.VNetName, lbSpec.SubnetName)),
+			properties = armnetwork.FrontendIPConfigurationPropertiesFormat{
+				PrivateIPAllocationMethod: ptr.To(armnetwork.IPAllocationMethodStatic),
+				Subnet: &armnetwork.Subnet{
+					ID: ptr.To(azure.SubnetID(lbSpec.SubscriptionID, lbSpec.VNetResourceGroup, lbSpec.VNetName, lbSpec.SubnetName)),
 				},
-				PrivateIPAddress: to.StringPtr(ipConfig.PrivateIPAddress),
+				PrivateIPAddress: ptr.To(ipConfig.PrivateIPAddress),
 			}
 		} else {
-			properties = network.FrontendIPConfigurationPropertiesFormat{
-				PublicIPAddress: &network.PublicIPAddress{
-					ID: to.StringPtr(azure.PublicIPID(lbSpec.SubscriptionID, lbSpec.ResourceGroup, ipConfig.PublicIP.Name)),
+			properties = armnetwork.FrontendIPConfigurationPropertiesFormat{
+				PublicIPAddress: &armnetwork.PublicIPAddress{
+					ID: ptr.To(azure.PublicIPID(lbSpec.SubscriptionID, lbSpec.ResourceGroup, ipConfig.PublicIP.Name)),
 				},
 			}
 		}
-		frontendIPConfigurations = append(frontendIPConfigurations, network.FrontendIPConfiguration{
-			FrontendIPConfigurationPropertiesFormat: &properties,
-			Name:                                    to.StringPtr(ipConfig.Name),
+		frontendIPConfigurations = append(frontendIPConfigurations, &armnetwork.FrontendIPConfiguration{
+			Properties: &properties,
+			Name:       ptr.To(ipConfig.Name),
+			Zones:      zones,
 		})
-		frontendIDs = append(frontendIDs, network.SubResource{
-			ID: to.StringPtr(azure.FrontendIPConfigID(lbSpec.SubscriptionID, lbSpec.ResourceGroup, lbSpec.Name, ipConfig.Name)),
+		frontendIDs = append(frontendIDs, &armnetwork.SubResource{
+			ID: ptr.To(azure.FrontendIPConfigID(lbSpec.SubscriptionID, lbSpec.ResourceGroup, lbSpec.Name, ipConfig.Name)),
 		})
 	}
 	return frontendIPConfigurations, frontendIDs
 }
 
-func getOutboundRules(lbSpec LBSpec, frontendIDs []network.SubResource) []network.OutboundRule {
+func getOutboundRules(lbSpec LBSpec, frontendIDs []*armnetwork.SubResource) []*armnetwork.OutboundRule {
 	if lbSpec.Type == infrav1.Internal {
-		return []network.OutboundRule{}
+		return []*armnetwork.OutboundRule{}
 	}
-	return []network.OutboundRule{
+	return []*armnetwork.OutboundRule{
 		{
-			Name: to.StringPtr(outboundNAT),
-			OutboundRulePropertiesFormat: &network.OutboundRulePropertiesFormat{
-				Protocol:                 network.LoadBalancerOutboundRuleProtocolAll,
+			Name: ptr.To(outboundNAT),
+			Properties: &armnetwork.OutboundRulePropertiesFormat{
+				Protocol:                 ptr.To(armnetwork.LoadBalancerOutboundRuleProtocolAll),
 				IdleTimeoutInMinutes:     lbSpec.IdleTimeoutInMinutes,
-				FrontendIPConfigurations: &frontendIDs,
-				BackendAddressPool: &network.SubResource{
-					ID: to.StringPtr(azure.AddressPoolID(lbSpec.SubscriptionID, lbSpec.ResourceGroup, lbSpec.Name, lbSpec.BackendPoolName)),
+				FrontendIPConfigurations: frontendIDs,
+				BackendAddressPool: &armnetwork.SubResource{
+					ID: ptr.To(azure.AddressPoolID(lbSpec.SubscriptionID, lbSpec.ResourceGroup, lbSpec.Name, lbSpec.BackendPoolName)),
 				},
 			},
 		},
 	}
 }
 
-func getLoadBalancingRules(lbSpec LBSpec, frontendIDs []network.SubResource) []network.LoadBalancingRule {
-	if lbSpec.Role == infrav1.APIServerRole {
+func getLoadBalancingRules(lbSpec LBSpec, frontendIDs []*armnetwork.SubResource) []*armnetwork.LoadBalancingRule {
+	if lbSpec.Role == infrav1.APIServerRole || lbSpec.Role == infrav1.APIServerRoleInternal {
 		// We disable outbound SNAT explicitly in the HTTPS LB rule and enable TCP and UDP outbound NAT with an outbound rule.
-		// For more information on Standard LB outbound connections see https://docs.microsoft.com/en-us/azure/load-balancer/load-balancer-outbound-connections.
-		var frontendIPConfig network.SubResource
+		// For more information on Standard LB outbound connections see https://learn.microsoft.com/azure/load-balancer/load-balancer-outbound-connections.
+		var frontendIPConfig *armnetwork.SubResource
 		if len(frontendIDs) != 0 {
 			frontendIPConfig = frontendIDs[0]
 		}
-		return []network.LoadBalancingRule{
+		rules := []*armnetwork.LoadBalancingRule{
 			{
-				Name: to.StringPtr(lbRuleHTTPS),
-				LoadBalancingRulePropertiesFormat: &network.LoadBalancingRulePropertiesFormat{
-					DisableOutboundSnat:     to.BoolPtr(true),
-					Protocol:                network.TransportProtocolTCP,
-					FrontendPort:            to.Int32Ptr(lbSpec.APIServerPort),
-					BackendPort:             to.Int32Ptr(lbSpec.APIServerPort),
+				Name: ptr.To(lbRuleHTTPS),
+				Properties: &armnetwork.LoadBalancingRulePropertiesFormat{
+					DisableOutboundSnat:     ptr.To(true),
+					Protocol:                ptr.To(armnetwork.TransportProtocolTCP),
+					FrontendPort:            ptr.To(lbSpec.apiServerFrontendPort()),
+					BackendPort:             ptr.To(lbSpec.APIServerPort),
 					IdleTimeoutInMinutes:    lbSpec.IdleTimeoutInMinutes,
-					EnableFloatingIP:        to.BoolPtr(false),
-					LoadDistribution:        network.LoadDistributionDefault,
-					FrontendIPConfiguration: &frontendIPConfig,
-					BackendAddressPool: &network.SubResource{
-						ID: to.StringPtr(azure.AddressPoolID(lbSpec.SubscriptionID, lbSpec.ResourceGroup, lbSpec.Name, lbSpec.BackendPoolName)),
+					EnableFloatingIP:        ptr.To(false),
+					LoadDistribution:        ptr.To(armnetwork.LoadDistributionDefault),
+					FrontendIPConfiguration: frontendIPConfig,
+					BackendAddressPool: &armnetwork.SubResource{
+						ID: ptr.To(azure.AddressPoolID(lbSpec.SubscriptionID, lbSpec.ResourceGroup, lbSpec.Name, lbSpec.BackendPoolName)),
 					},
-					Probe: &network.SubResource{
-						ID: to.StringPtr(azure.ProbeID(lbSpec.SubscriptionID, lbSpec.ResourceGroup, lbSpec.Name, tcpProbe)),
+					Probe: &armnetwork.SubResource{
+						ID: ptr.To(azure.ProbeID(lbSpec.SubscriptionID, lbSpec.ResourceGroup, lbSpec.Name, httpsProbe)),
 					},
 				},
 			},
 		}
+
+		for _, port := range lbSpec.AdditionalPorts {
+			rules = append(rules, &armnetwork.LoadBalancingRule{
+				Name: ptr.To(port.Name),
+				Properties: &armnetwork.LoadBalancingRulePropertiesFormat{
+					DisableOutboundSnat:     ptr.To(true),
+					Protocol:                ptr.To(armnetwork.TransportProtocolTCP),
+					FrontendPort:            ptr.To(port.Port),
+					BackendPort:             ptr.To(port.Port),
+					IdleTimeoutInMinutes:    lbSpec.IdleTimeoutInMinutes,
+					EnableFloatingIP:        ptr.To(false),
+					LoadDistribution:        ptr.To(armnetwork.LoadDistributionDefault),
+					FrontendIPConfiguration: frontendIPConfig,
+					BackendAddressPool: &armnetwork.SubResource{
+						ID: ptr.To(azure.AddressPoolID(lbSpec.SubscriptionID, lbSpec.ResourceGroup, lbSpec.Name, lbSpec.BackendPoolName)),
+					},
+					Probe: &armnetwork.SubResource{
+						ID: ptr.To(azure.ProbeID(lbSpec.SubscriptionID, lbSpec.ResourceGroup, lbSpec.Name, httpsProbe)),
+					},
+				},
+			})
+		}
+
+		return rules
 	}
-	return []network.LoadBalancingRule{}
+	return []*armnetwork.LoadBalancingRule{}
 }
 
-func getBackendAddressPools(lbSpec LBSpec) []network.BackendAddressPool {
-	return []network.BackendAddressPool{
+func getBackendAddressPools(lbSpec LBSpec) []*armnetwork.BackendAddressPool {
+	return []*armnetwork.BackendAddressPool{
 		{
-			Name: to.StringPtr(lbSpec.BackendPoolName),
+			Name: ptr.To(lbSpec.BackendPoolName),
 		},
 	}
 }
 
-func getProbes(lbSpec LBSpec) []network.Probe {
-	if lbSpec.Role == infrav1.APIServerRole {
-		return []network.Probe{
+func getProbes(lbSpec LBSpec) []*armnetwork.Probe {
+	if lbSpec.Role == infrav1.APIServerRole || lbSpec.Role == infrav1.APIServerRoleInternal {
+		return []*armnetwork.Probe{
 			{
-				Name: to.StringPtr(tcpProbe),
-				ProbePropertiesFormat: &network.ProbePropertiesFormat{
-					Protocol:          network.ProbeProtocolTCP,
-					Port:              to.Int32Ptr(lbSpec.APIServerPort),
-					IntervalInSeconds: to.Int32Ptr(15),
-					NumberOfProbes:    to.Int32Ptr(4),
+				Name: ptr.To(httpsProbe),
+				Properties: &armnetwork.ProbePropertiesFormat{
+					Protocol:          ptr.To(armnetwork.ProbeProtocolHTTPS),
+					Port:              ptr.To[int32](lbSpec.APIServerPort),
+					RequestPath:       ptr.To(httpsProbeRequestPath),
+					IntervalInSeconds: ptr.To[int32](15),
+					ProbeThreshold:    ptr.To[int32](1),
 				},
 			},
 		}
 	}
-	return []network.Probe{}
+	return []*armnetwork.Probe{}
 }
 
-func probeExists(probes []network.Probe, probe network.Probe) bool {
-	for _, p := range probes {
-		if to.String(p.Name) == to.String(probe.Name) {
-			return true
+func (s LBSpec) apiServerFrontendPort() int32 {
+	if s.APIServerFrontendPort != 0 {
+		return s.APIServerFrontendPort
+	}
+	return s.APIServerPort
+}
+
+func mergeProbes(existing, desired []*armnetwork.Probe) ([]*armnetwork.Probe, bool) {
+	merged := append([]*armnetwork.Probe(nil), existing...)
+	changed := false
+	for _, desiredProbe := range desired {
+		found := false
+		for i, existingProbe := range merged {
+			if !strings.EqualFold(ptr.Deref(existingProbe.Name, ""), ptr.Deref(desiredProbe.Name, "")) {
+				continue
+			}
+			found = true
+			if !probeMatches(existingProbe, desiredProbe) {
+				merged[i] = desiredProbe
+				changed = true
+			}
+			break
+		}
+		if !found {
+			merged = append(merged, desiredProbe)
+			changed = true
 		}
 	}
-	return false
+	return merged, changed
 }
 
-func outboundRuleExists(rules []network.OutboundRule, rule network.OutboundRule) bool {
+func probeMatches(existing, desired *armnetwork.Probe) bool {
+	if existing == nil || desired == nil || existing.Properties == nil || desired.Properties == nil {
+		return existing == desired
+	}
+	return strings.EqualFold(ptr.Deref(existing.Name, ""), ptr.Deref(desired.Name, "")) &&
+		pointerMatches(existing.Properties.Protocol, desired.Properties.Protocol) &&
+		pointerMatches(existing.Properties.Port, desired.Properties.Port) &&
+		pointerMatches(existing.Properties.RequestPath, desired.Properties.RequestPath) &&
+		pointerMatches(existing.Properties.IntervalInSeconds, desired.Properties.IntervalInSeconds) &&
+		pointerMatches(existing.Properties.ProbeThreshold, desired.Properties.ProbeThreshold)
+}
+
+func outboundRuleExists(rules []*armnetwork.OutboundRule, rule armnetwork.OutboundRule) bool {
 	for _, r := range rules {
-		if to.String(r.Name) == to.String(rule.Name) {
+		if ptr.Deref(r.Name, "") == ptr.Deref(rule.Name, "") {
 			return true
 		}
 	}
 	return false
 }
 
-func poolExists(pools []network.BackendAddressPool, pool network.BackendAddressPool) bool {
+func poolExists(pools []*armnetwork.BackendAddressPool, pool armnetwork.BackendAddressPool) bool {
 	for _, p := range pools {
-		if to.String(p.Name) == to.String(pool.Name) {
+		if ptr.Deref(p.Name, "") == ptr.Deref(pool.Name, "") {
 			return true
 		}
 	}
 	return false
 }
 
-func lbRuleExists(rules []network.LoadBalancingRule, rule network.LoadBalancingRule) bool {
-	for _, r := range rules {
-		if to.String(r.Name) == to.String(rule.Name) {
-			return true
+func mergeLoadBalancingRules(existing, desired []*armnetwork.LoadBalancingRule) ([]*armnetwork.LoadBalancingRule, bool) {
+	merged := append([]*armnetwork.LoadBalancingRule(nil), existing...)
+	changed := false
+	for _, desiredRule := range desired {
+		found := false
+		for i, existingRule := range merged {
+			if !strings.EqualFold(ptr.Deref(existingRule.Name, ""), ptr.Deref(desiredRule.Name, "")) {
+				continue
+			}
+			found = true
+			if !loadBalancingRuleMatches(existingRule, desiredRule) {
+				merged[i] = desiredRule
+				changed = true
+			}
+			break
+		}
+		if !found {
+			merged = append(merged, desiredRule)
+			changed = true
 		}
 	}
-	return false
+	return merged, changed
 }
 
-func ipExists(configs []network.FrontendIPConfiguration, config network.FrontendIPConfiguration) bool {
+func loadBalancingRuleMatches(existing, desired *armnetwork.LoadBalancingRule) bool {
+	if existing == nil || desired == nil || existing.Properties == nil || desired.Properties == nil {
+		return existing == desired
+	}
+	return strings.EqualFold(ptr.Deref(existing.Name, ""), ptr.Deref(desired.Name, "")) &&
+		pointerMatches(existing.Properties.DisableOutboundSnat, desired.Properties.DisableOutboundSnat) &&
+		pointerMatches(existing.Properties.Protocol, desired.Properties.Protocol) &&
+		pointerMatches(existing.Properties.FrontendPort, desired.Properties.FrontendPort) &&
+		pointerMatches(existing.Properties.BackendPort, desired.Properties.BackendPort) &&
+		pointerMatches(existing.Properties.IdleTimeoutInMinutes, desired.Properties.IdleTimeoutInMinutes) &&
+		pointerMatches(existing.Properties.EnableFloatingIP, desired.Properties.EnableFloatingIP) &&
+		pointerMatches(existing.Properties.LoadDistribution, desired.Properties.LoadDistribution) &&
+		subResourceMatches(existing.Properties.FrontendIPConfiguration, desired.Properties.FrontendIPConfiguration) &&
+		subResourceMatches(existing.Properties.BackendAddressPool, desired.Properties.BackendAddressPool) &&
+		subResourceMatches(existing.Properties.Probe, desired.Properties.Probe)
+}
+
+func pointerMatches[T comparable](existing, desired *T) bool {
+	return desired == nil || existing != nil && *existing == *desired
+}
+
+func subResourceMatches(existing, desired *armnetwork.SubResource) bool {
+	return desired == nil || existing != nil && strings.EqualFold(ptr.Deref(existing.ID, ""), ptr.Deref(desired.ID, ""))
+}
+
+func ipExists(configs []*armnetwork.FrontendIPConfiguration, config armnetwork.FrontendIPConfiguration) bool {
 	for _, ip := range configs {
-		if to.String(ip.Name) == to.String(config.Name) {
+		if ptr.Deref(ip.Name, "") == ptr.Deref(config.Name, "") {
 			return true
 		}
 	}

@@ -1,0 +1,16 @@
+ignore:
+  - "**/*_mock.go"
+  - "**/zz_generated*.go"
+
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%
+        informational: true
+    patch:
+      default:
+        target: auto
+        threshold: 1%
+        informational: true

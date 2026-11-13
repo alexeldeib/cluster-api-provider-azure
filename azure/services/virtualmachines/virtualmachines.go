@@ -20,24 +20,29 @@ import (
 	"context"
 	"strings"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2021-04-01/compute"
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-02-01/network"
-	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v4"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/utils/ptr"
+	azprovider "sigs.k8s.io/cloud-provider-azure/pkg/provider"
+	clusterv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/converters"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/async"
-	"sigs.k8s.io/cluster-api-provider-azure/azure/services/availabilitysets"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/networkinterfaces"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/publicips"
-	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
+	azureutil "sigs.k8s.io/cluster-api-provider-azure/util/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
 )
 
-const serviceName = "virtualmachine"
+const (
+	serviceName        = "virtualmachine"
+	reapplyServiceName = serviceName + "-reapply"
+	vmMissingUAI       = "VM is missing expected user assigned identity with client ID: "
+)
 
 // VMScope defines the scope interface for a virtual machines service.
 type VMScope interface {
@@ -48,53 +53,126 @@ type VMScope interface {
 	SetProviderID(string)
 	SetAddresses([]corev1.NodeAddress)
 	SetVMState(infrav1.ProvisioningState)
+	SetConditionFalse(clusterv1beta1.ConditionType, string, clusterv1beta1.ConditionSeverity, string)
 }
 
 // Service provides operations on Azure resources.
 type Service struct {
 	Scope VMScope
 	async.Reconciler
-	interfacesClient       networkinterfaces.Client
-	publicIPsClient        publicips.Client
-	availabilitySetsClient availabilitysets.Client
+	client           Client
+	interfacesGetter async.Getter
+	publicIPsGetter  async.Getter
 }
 
 // New creates a new service.
-func New(scope VMScope) *Service {
-	Client := NewClient(scope)
-	return &Service{
-		Scope:                  scope,
-		interfacesClient:       networkinterfaces.NewClient(scope),
-		publicIPsClient:        publicips.NewClient(scope),
-		availabilitySetsClient: availabilitysets.NewClient(scope),
-		Reconciler:             async.New(scope, Client, Client),
+func New(scope VMScope) (*Service, error) {
+	Client, err := NewClient(scope, scope.DefaultedAzureCallTimeout())
+	if err != nil {
+		return nil, err
 	}
+	interfacesSvc, err := networkinterfaces.NewClient(scope, scope.DefaultedAzureCallTimeout())
+	if err != nil {
+		return nil, err
+	}
+	publicIPsSvc, err := publicips.NewClient(scope, scope.DefaultedAzureCallTimeout())
+	if err != nil {
+		return nil, err
+	}
+	return &Service{
+		Scope:            scope,
+		client:           Client,
+		interfacesGetter: interfacesSvc,
+		publicIPsGetter:  publicIPsSvc,
+		Reconciler: async.New[armcompute.VirtualMachinesClientCreateOrUpdateResponse,
+			armcompute.VirtualMachinesClientDeleteResponse](scope, Client, Client),
+	}, nil
 }
 
-// Reconcile gets/creates/updates a virtual machine.
+// Name returns the service name.
+func (s *Service) Name() string {
+	return serviceName
+}
+
+// Reconcile idempotently creates or updates a virtual machine.
 func (s *Service) Reconcile(ctx context.Context) error {
-	ctx, _, done := tele.StartSpanWithLogger(ctx, "virtualmachines.Service.Reconcile")
+	ctx, log, done := tele.StartSpanWithLogger(ctx, "virtualmachines.Service.Reconcile")
 	defer done()
 
-	ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultAzureServiceReconcileTimeout)
+	ctx, cancel := context.WithTimeout(ctx, s.Scope.DefaultedAzureServiceReconcileTimeout())
 	defer cancel()
 
 	vmSpec := s.Scope.VMSpec()
+	if vmSpec == nil {
+		return nil
+	}
 
-	result, err := s.CreateResource(ctx, vmSpec, serviceName)
-	s.Scope.UpdatePutStatus(infrav1.VMRunningCondition, serviceName, err)
-	// Set the DiskReady condition here since the disk gets created with the VM.
-	s.Scope.UpdatePutStatus(infrav1.DisksReadyCondition, serviceName, err)
-	if err == nil && result != nil {
-		vm, ok := result.(compute.VirtualMachine)
+	// Check if the VM exists and is in a Failed provisioning state.
+	// If so, use the Reapply operation to recover it instead of CreateOrUpdate.
+	existingResource, err := s.client.Get(ctx, vmSpec)
+	if err != nil && !azure.ResourceNotFound(err) {
+		return azure.WithTransientError(
+			errors.Wrapf(err, "failed to get existing VM %s/%s", vmSpec.ResourceGroupName(), vmSpec.ResourceName()),
+			async.GetRetryAfterFromError(err),
+		)
+	}
+
+	var result any
+	if err == nil && existingResource != nil {
+		vm, ok := existingResource.(armcompute.VirtualMachine)
 		if !ok {
-			return errors.Errorf("%T is not a compute.VirtualMachine", result)
+			return errors.Errorf("%T is not an armcompute.VirtualMachine", existingResource)
 		}
-		infraVM, err := converters.SDKToVM(vm)
+
+		// Enter the reapply path if the VM is in Failed provisioning state, or if a
+		// reapply long-running operation was started in a previous reconcile. The second
+		// condition handles the case where the VM has already transitioned out of "Failed"
+		// (e.g. to "Updating") mid-reapply — without it the resumed reapply would skip
+		// the status updates and the condition would never be cleared.
+		hasActiveReapplyFuture := s.Scope.GetLongRunningOperationState(vmSpec.ResourceName(), reapplyServiceName, infrav1.PutFuture) != nil
+		vmIsFailed := vm.Properties != nil && vm.Properties.ProvisioningState != nil && *vm.Properties.ProvisioningState == "Failed"
+		if vmIsFailed || hasActiveReapplyFuture {
+			log.V(2).Info("VM is in Failed provisioning state or has an active reapply operation, using Reapply operation to recover",
+				"vm", vmSpec.ResourceName(),
+				"resourceGroup", vmSpec.ResourceGroupName(),
+				"vmIsFailed", vmIsFailed,
+				"hasActiveReapplyFuture", hasActiveReapplyFuture)
+			result, err = s.reapplyVM(ctx, vmSpec)
+			// If recovery of a Failed VM fails non-transiently (e.g. Azure reports the OS
+			// provisioning failure as non-recoverable), publish the observed Failed state so
+			// consumers of status.vmState (e.g. remediation tooling) can replace the VM.
+			// In-progress and transient failures are not published, so that CAPZ can still
+			// retry recovery; a successful reapply updates the state below from the refreshed VM.
+			if err != nil && vmIsFailed && !azure.IsOperationNotDoneError(err) && !azure.IsTransientError(err) {
+				s.Scope.SetVMState(infrav1.Failed)
+			}
+			s.Scope.UpdatePutStatus(infrav1.VMRunningCondition, serviceName, err)
+			s.Scope.UpdatePutStatus(infrav1.DisksReadyCondition, serviceName, err)
+		} else {
+			// VM exists and is not in Failed state, use standard reconcile flow
+			result, err = s.CreateOrUpdateResource(ctx, vmSpec, serviceName)
+			s.Scope.UpdatePutStatus(infrav1.VMRunningCondition, serviceName, err)
+			s.Scope.UpdatePutStatus(infrav1.DisksReadyCondition, serviceName, err)
+		}
+	} else {
+		// VM doesn't exist, use standard create flow
+		result, err = s.CreateOrUpdateResource(ctx, vmSpec, serviceName)
+		s.Scope.UpdatePutStatus(infrav1.VMRunningCondition, serviceName, err)
+		s.Scope.UpdatePutStatus(infrav1.DisksReadyCondition, serviceName, err)
+	}
+
+	if err == nil && result != nil {
+		vm, ok := result.(armcompute.VirtualMachine)
+		if !ok {
+			return errors.Errorf("%T is not an armcompute.VirtualMachine", result)
+		}
+		infraVM := converters.SDKToVM(vm)
+		// Transform the VM resource representation to conform to the cloud-provider-azure representation
+		providerID, err := azprovider.ConvertResourceGroupNameToLower(azureutil.ProviderIDPrefix + infraVM.ID)
 		if err != nil {
-			return err
+			return errors.Wrapf(err, "failed to parse VM ID %s", infraVM.ID)
 		}
-		s.Scope.SetProviderID(azure.ProviderIDPrefix + infraVM.ID)
+		s.Scope.SetProviderID(providerID)
 		s.Scope.SetAnnotation("cluster-api-provider-azure", "true")
 
 		// Discover addresses for NICs associated with the VM
@@ -104,8 +182,77 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		}
 		s.Scope.SetAddresses(addresses)
 		s.Scope.SetVMState(infraVM.State)
+
+		spec, ok := vmSpec.(*VMSpec)
+		if !ok {
+			return errors.Errorf("%T is not a valid VM spec", vmSpec)
+		}
+
+		s.checkUserAssignedIdentities(spec.UserAssignedIdentities, infraVM.UserAssignedIdentities)
 	}
 	return err
+}
+
+// reapplyVM reapplies a virtual machine that is in Failed provisioning state.
+// This uses the Azure Reapply operation which is designed to recover VMs from failed states.
+// Reference: https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/windows/vm-stuck-in-failed-state
+func (s *Service) reapplyVM(ctx context.Context, spec azure.ResourceSpecGetter) (any, error) {
+	ctx, log, done := tele.StartSpanWithLogger(ctx, "virtualmachines.Service.reapplyVM")
+	defer done()
+
+	resourceName := spec.ResourceName()
+	rgName := spec.ResourceGroupName()
+	log.V(2).Info("reapplying VM", "resource", resourceName, "resourceGroup", rgName)
+
+	// Check for an ongoing reapply operation from a previous reconcile.
+	resumeToken := ""
+	if future := s.Scope.GetLongRunningOperationState(resourceName, reapplyServiceName, infrav1.PutFuture); future != nil {
+		t, err := converters.FutureToResumeToken(*future)
+		if err != nil {
+			s.Scope.DeleteLongRunningOperationState(resourceName, reapplyServiceName, infrav1.PutFuture)
+			return nil, errors.Wrap(err, "could not decode reapply future data, resetting long-running operation state")
+		}
+		resumeToken = t
+	}
+
+	poller, err := s.client.ReapplyAsync(ctx, spec, resumeToken)
+	if poller != nil && azure.IsContextDeadlineExceededOrCanceledError(err) {
+		// The operation is still in progress; save the future so it can be resumed on the next reconcile.
+		future, futErr := converters.PollerToFuture(poller, infrav1.PutFuture, reapplyServiceName, resourceName, rgName)
+		if futErr != nil {
+			return nil, errors.Wrapf(err, "failed to reapply VM %s/%s", rgName, resourceName)
+		}
+		s.Scope.SetLongRunningOperationState(future)
+		return nil, azure.WithTransientError(azure.NewOperationNotDoneError(future), s.Scope.DefaultedReconcilerRequeue())
+	}
+
+	// The operation is done (success or terminal error); clear any saved state.
+	s.Scope.DeleteLongRunningOperationState(resourceName, reapplyServiceName, infrav1.PutFuture)
+
+	if err != nil {
+		errWrapped := errors.Wrapf(err, "failed to reapply VM %s/%s", rgName, resourceName)
+		// Mirror async.CreateOrUpdateResource: retryable failures from ReapplyAsync
+		// (throttling, transient server-side errors, network faults, or a timeout
+		// before a poller was returned) are surfaced as transient so they are requeued,
+		// rather than reported as a terminal VM provisioning failure. Non-retryable
+		// failures (e.g. a failed provisioning state) are returned unwrapped.
+		if azure.IsTransientError(err) {
+			return nil, azure.WithTransientError(errWrapped, async.GetRetryAfterFromError(err))
+		}
+		return nil, errWrapped
+	}
+
+	// Fetch the VM after reapply to return the updated resource.
+	result, err := s.client.Get(ctx, spec)
+	if err != nil {
+		return nil, azure.WithTransientError(
+			errors.Wrapf(err, "failed to get VM after reapply %s/%s", rgName, resourceName),
+			async.GetRetryAfterFromError(err),
+		)
+	}
+
+	log.V(2).Info("successfully reapplied VM", "resource", resourceName, "resourceGroup", rgName)
+	return result, nil
 }
 
 // Delete deletes the virtual machine with the provided name.
@@ -113,10 +260,13 @@ func (s *Service) Delete(ctx context.Context) error {
 	ctx, _, done := tele.StartSpanWithLogger(ctx, "virtualmachines.Service.Delete")
 	defer done()
 
-	ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultAzureServiceReconcileTimeout)
+	ctx, cancel := context.WithTimeout(ctx, s.Scope.DefaultedAzureServiceReconcileTimeout())
 	defer cancel()
 
 	vmSpec := s.Scope.VMSpec()
+	if vmSpec == nil {
+		return nil
+	}
 
 	err := s.DeleteResource(ctx, vmSpec, serviceName)
 	if err != nil {
@@ -128,25 +278,48 @@ func (s *Service) Delete(ctx context.Context) error {
 	return err
 }
 
-func (s *Service) getAddresses(ctx context.Context, vm compute.VirtualMachine, rgName string) ([]corev1.NodeAddress, error) {
+func (s *Service) checkUserAssignedIdentities(specIdentities []infrav1.UserAssignedIdentity, vmIdentities []infrav1.UserAssignedIdentity) {
+	actualMap := make(map[string]struct{})
+
+	// Create a map of the actual identities from the vm.
+	for _, actualIdentity := range vmIdentities {
+		actualMap[actualIdentity.ProviderID] = struct{}{}
+	}
+
+	// Check if the expected identities are present in the vm.
+	for _, expectedIdentity := range specIdentities {
+		_, exists := actualMap[strings.TrimPrefix(expectedIdentity.ProviderID, azureutil.ProviderIDPrefix)]
+		if !exists {
+			s.Scope.SetConditionFalse(infrav1.VMIdentitiesReadyCondition, infrav1.UserAssignedIdentityMissingReason, clusterv1beta1.ConditionSeverityWarning, vmMissingUAI+expectedIdentity.ProviderID)
+			return
+		}
+	}
+}
+
+func (s *Service) getAddresses(ctx context.Context, vm armcompute.VirtualMachine, rgName string) ([]corev1.NodeAddress, error) {
 	ctx, _, done := tele.StartSpanWithLogger(ctx, "virtualmachines.Service.getAddresses")
 	defer done()
 
-	var addresses []corev1.NodeAddress
-	if vm.NetworkProfile.NetworkInterfaces == nil {
+	addresses := []corev1.NodeAddress{
+		{
+			Type:    corev1.NodeInternalDNS,
+			Address: ptr.Deref(vm.Name, ""),
+		},
+	}
+	if vm.Properties.NetworkProfile.NetworkInterfaces == nil {
 		return addresses, nil
 	}
-	for _, nicRef := range *vm.NetworkProfile.NetworkInterfaces {
+	for _, nicRef := range vm.Properties.NetworkProfile.NetworkInterfaces {
 		// The full ID includes the name at the very end. Split the string and pull the last element
 		// Ex: /subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.Network/networkInterfaces/$NICNAME
 		// We'll check to see if ID is nil and bail early if we don't have it
 		if nicRef.ID == nil {
 			continue
 		}
-		nicName := getResourceNameByID(to.String(nicRef.ID))
+		nicName := getResourceNameByID(ptr.Deref(nicRef.ID, ""))
 
 		// Fetch nic and append its addresses
-		existingNic, err := s.interfacesClient.Get(ctx, &networkinterfaces.NICSpec{
+		existingNic, err := s.interfacesGetter.Get(ctx, &networkinterfaces.NICSpec{
 			Name:          nicName,
 			ResourceGroup: rgName,
 		})
@@ -154,30 +327,30 @@ func (s *Service) getAddresses(ctx context.Context, vm compute.VirtualMachine, r
 			return addresses, err
 		}
 
-		nic, ok := existingNic.(network.Interface)
+		nic, ok := existingNic.(armnetwork.Interface)
 		if !ok {
-			return nil, errors.Errorf("%T is not a network.Interface", existingNic)
+			return nil, errors.Errorf("%T is not an armnetwork.Interface", existingNic)
 		}
 
-		if nic.IPConfigurations == nil {
+		if nic.Properties.IPConfigurations == nil {
 			continue
 		}
-		for _, ipConfig := range *nic.IPConfigurations {
-			if ipConfig.PrivateIPAddress != nil {
+		for _, ipConfig := range nic.Properties.IPConfigurations {
+			if ipConfig != nil && ipConfig.Properties != nil && ipConfig.Properties.PrivateIPAddress != nil {
 				addresses = append(addresses,
 					corev1.NodeAddress{
 						Type:    corev1.NodeInternalIP,
-						Address: to.String(ipConfig.PrivateIPAddress),
+						Address: ptr.Deref(ipConfig.Properties.PrivateIPAddress, ""),
 					},
 				)
 			}
 
-			if ipConfig.PublicIPAddress == nil {
+			if ipConfig.Properties.PublicIPAddress == nil {
 				continue
 			}
 			// ID is the only field populated in PublicIPAddress sub-resource.
 			// Thus, we have to go fetch the publicIP with the name.
-			publicIPName := getResourceNameByID(to.String(ipConfig.PublicIPAddress.ID))
+			publicIPName := getResourceNameByID(ptr.Deref(ipConfig.Properties.PublicIPAddress.ID, ""))
 			publicNodeAddress, err := s.getPublicIPAddress(ctx, publicIPName, rgName)
 			if err != nil {
 				return addresses, err
@@ -195,12 +368,21 @@ func (s *Service) getPublicIPAddress(ctx context.Context, publicIPAddressName st
 	defer done()
 
 	retAddress := corev1.NodeAddress{}
-	publicIP, err := s.publicIPsClient.Get(ctx, rgName, publicIPAddressName)
+	result, err := s.publicIPsGetter.Get(ctx, &publicips.PublicIPSpec{
+		Name:          publicIPAddressName,
+		ResourceGroup: rgName,
+	})
 	if err != nil {
 		return retAddress, err
 	}
+
+	publicIP, ok := result.(armnetwork.PublicIPAddress)
+	if !ok {
+		return retAddress, errors.Errorf("%T is not an armnetwork.PublicIPAddress", result)
+	}
+
 	retAddress.Type = corev1.NodeExternalIP
-	retAddress.Address = to.String(publicIP.IPAddress)
+	retAddress.Address = ptr.Deref(publicIP.Properties.IPAddress, "")
 
 	return retAddress, nil
 }
@@ -212,4 +394,9 @@ func getResourceNameByID(resourceID string) string {
 	explodedResourceID := strings.Split(resourceID, "/")
 	resourceName := explodedResourceID[len(explodedResourceID)-1]
 	return resourceName
+}
+
+// IsManaged returns always returns true as CAPZ does not support BYO VM.
+func (s *Service) IsManaged(_ context.Context) (bool, error) {
+	return true, nil
 }

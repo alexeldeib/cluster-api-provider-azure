@@ -21,8 +21,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
 	. "github.com/onsi/gomega"
+	"go.uber.org/mock/gomock"
+
 	gomockinternal "sigs.k8s.io/cluster-api-provider-azure/internal/test/matchers/gomock"
 	mockttllru "sigs.k8s.io/cluster-api-provider-azure/util/cache/ttllru/mocks"
 )
@@ -34,7 +35,7 @@ const (
 func TestNew(t *testing.T) {
 	g := NewWithT(t)
 	subject, err := New(128, defaultCacheDuration)
-	g.Expect(err).Should(BeNil())
+	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(subject).ShouldNot(BeNil())
 }
 
@@ -44,11 +45,11 @@ func TestCache_Add(t *testing.T) {
 	mockCache := mockttllru.NewMockCacher(mockCtrl)
 	defer mockCtrl.Finish()
 	subject, err := newCache(defaultCacheDuration, mockCache)
-	g.Expect(err).Should(BeNil())
+	g.Expect(err).NotTo(HaveOccurred())
 
 	key, value := "foo", "bar"
 	mockCache.EXPECT().Add(gomock.Eq(key), gomockinternal.CustomMatcher(
-		func(val interface{}, state map[string]interface{}) bool {
+		func(val any, state map[string]any) bool {
 			ttl, ok := val.(*timeToLiveItem)
 			if !ok {
 				state["error"] = "value was not a time to live item"
@@ -62,7 +63,7 @@ func TestCache_Add(t *testing.T) {
 
 			return true
 		},
-		func(state map[string]interface{}) string {
+		func(state map[string]any) string {
 			return state["error"].(string)
 		},
 	))
@@ -148,14 +149,13 @@ func TestCache_Get(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		c := c
 		t.Run(c.Name, func(t *testing.T) {
 			g := NewWithT(t)
 			mockCtrl := gomock.NewController(t)
 			mockCache := mockttllru.NewMockCacher(mockCtrl)
 			defer mockCtrl.Finish()
 			subject, err := newCache(defaultCacheDuration, mockCache)
-			g.Expect(err).Should(BeNil())
+			g.Expect(err).NotTo(HaveOccurred())
 			c.TestCase(g, subject, mockCache)
 		})
 	}

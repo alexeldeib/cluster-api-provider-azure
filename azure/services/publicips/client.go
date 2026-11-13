@@ -18,79 +18,104 @@ package publicips
 
 import (
 	"context"
+	"time"
 
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-02-01/network"
-	"github.com/Azure/go-autorest/autorest"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v4"
+	"github.com/pkg/errors"
 
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/async"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
 )
 
-// Client wraps go-sdk.
-type Client interface {
-	Get(context.Context, string, string) (network.PublicIPAddress, error)
-	CreateOrUpdate(context.Context, string, string, network.PublicIPAddress) error
-	Delete(context.Context, string, string) error
-}
-
 // AzureClient contains the Azure go-sdk Client.
 type AzureClient struct {
-	publicips network.PublicIPAddressesClient
+	publicips      *armnetwork.PublicIPAddressesClient
+	apiCallTimeout time.Duration
 }
 
-var _ Client = &AzureClient{}
-
-// NewClient creates a new public IP client from subscription ID.
-func NewClient(auth azure.Authorizer) *AzureClient {
-	c := newPublicIPAddressesClient(auth.SubscriptionID(), auth.BaseURI(), auth.Authorizer())
-	return &AzureClient{c}
-}
-
-// newPublicIPAddressesClient creates a new public IP client from subscription ID.
-func newPublicIPAddressesClient(subscriptionID string, baseURI string, authorizer autorest.Authorizer) network.PublicIPAddressesClient {
-	publicIPsClient := network.NewPublicIPAddressesClientWithBaseURI(baseURI, subscriptionID)
-	azure.SetAutoRestClientDefaults(&publicIPsClient.Client, authorizer)
-	return publicIPsClient
+// NewClient creates a new public IP client from an authorizer.
+func NewClient(auth azure.Authorizer, apiCallTimeout time.Duration) (*AzureClient, error) {
+	opts, err := azure.ARMClientOptionsForAuth(auth)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create publicips client options")
+	}
+	factory, err := armnetwork.NewClientFactory(auth.SubscriptionID(), auth.Token(), opts)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create publicips client factory")
+	}
+	return &AzureClient{factory.NewPublicIPAddressesClient(), apiCallTimeout}, nil
 }
 
 // Get gets the specified public IP address in a specified resource group.
-func (ac *AzureClient) Get(ctx context.Context, resourceGroupName, ipName string) (network.PublicIPAddress, error) {
+func (ac *AzureClient) Get(ctx context.Context, spec azure.ResourceSpecGetter) (result any, err error) {
 	ctx, _, done := tele.StartSpanWithLogger(ctx, "publicips.AzureClient.Get")
 	defer done()
 
-	return ac.publicips.Get(ctx, resourceGroupName, ipName, "")
+	resp, err := ac.publicips.Get(ctx, spec.ResourceGroupName(), spec.ResourceName(), nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp.PublicIPAddress, nil
 }
 
-// CreateOrUpdate creates or updates a static or dynamic public IP address.
-func (ac *AzureClient) CreateOrUpdate(ctx context.Context, resourceGroupName string, ipName string, ip network.PublicIPAddress) error {
+// CreateOrUpdateAsync creates or updates a static or dynamic public IP address.
+// It sends a PUT request to Azure and if accepted without error, the func will return a Poller which can be used to track the ongoing
+// progress of the operation.
+func (ac *AzureClient) CreateOrUpdateAsync(ctx context.Context, spec azure.ResourceSpecGetter, resumeToken string, parameters any) (result any, poller *runtime.Poller[armnetwork.PublicIPAddressesClientCreateOrUpdateResponse], err error) {
 	ctx, _, done := tele.StartSpanWithLogger(ctx, "publicips.AzureClient.CreateOrUpdate")
 	defer done()
 
-	future, err := ac.publicips.CreateOrUpdate(ctx, resourceGroupName, ipName, ip)
-	if err != nil {
-		return err
+	publicip, ok := parameters.(armnetwork.PublicIPAddress)
+	if !ok && parameters != nil {
+		return nil, nil, errors.Errorf("%T is not an armnetwork.PublicIPAddress", parameters)
 	}
-	err = future.WaitForCompletionRef(ctx, ac.publicips.Client)
+
+	opts := &armnetwork.PublicIPAddressesClientBeginCreateOrUpdateOptions{ResumeToken: resumeToken}
+	poller, err = ac.publicips.BeginCreateOrUpdate(ctx, spec.ResourceGroupName(), spec.ResourceName(), publicip, opts)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	_, err = future.Result(ac.publicips)
-	return err
+
+	ctx, cancel := context.WithTimeout(ctx, ac.apiCallTimeout)
+	defer cancel()
+
+	pollOpts := &runtime.PollUntilDoneOptions{Frequency: async.DefaultPollerFrequency}
+	resp, err := poller.PollUntilDone(ctx, pollOpts)
+	if err != nil {
+		// if an error occurs, return the poller.
+		// this means the long-running operation didn't finish in the specified timeout.
+		return nil, poller, err
+	}
+
+	// if the operation completed, return a nil poller.
+	return resp.PublicIPAddress, nil, err
 }
 
-// Delete deletes the specified public IP address.
-func (ac *AzureClient) Delete(ctx context.Context, resourceGroupName, ipName string) error {
-	ctx, _, done := tele.StartSpanWithLogger(ctx, "publicips.AzureClient.Delete")
+// DeleteAsync deletes the specified public IP address asynchronously. DeleteAsync sends a DELETE
+// request to Azure and if accepted without error, the func will return a Poller which can be used to track the ongoing
+// progress of the operation.
+func (ac *AzureClient) DeleteAsync(ctx context.Context, spec azure.ResourceSpecGetter, resumeToken string) (poller *runtime.Poller[armnetwork.PublicIPAddressesClientDeleteResponse], err error) {
+	ctx, _, done := tele.StartSpanWithLogger(ctx, "publicips.AzureClient.DeleteAsync")
 	defer done()
 
-	future, err := ac.publicips.Delete(ctx, resourceGroupName, ipName)
+	opts := &armnetwork.PublicIPAddressesClientBeginDeleteOptions{ResumeToken: resumeToken}
+	poller, err = ac.publicips.BeginDelete(ctx, spec.ResourceGroupName(), spec.ResourceName(), opts)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	err = future.WaitForCompletionRef(ctx, ac.publicips.Client)
+
+	ctx, cancel := context.WithTimeout(ctx, ac.apiCallTimeout)
+	defer cancel()
+
+	pollOpts := &runtime.PollUntilDoneOptions{Frequency: async.DefaultPollerFrequency}
+	_, err = poller.PollUntilDone(ctx, pollOpts)
 	if err != nil {
-		return err
+		// if an error occurs, return the poller.
+		// this means the long-running operation didn't finish in the specified timeout.
+		return poller, err
 	}
-	_, err = future.Result(ac.publicips)
-	return err
+	// if the operation completed, return a nil poller.
+	return nil, err
 }

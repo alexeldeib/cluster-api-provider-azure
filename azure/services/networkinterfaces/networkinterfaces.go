@@ -19,11 +19,12 @@ package networkinterfaces
 import (
 	"context"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v4"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/async"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/resourceskus"
-	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
 )
 
@@ -44,37 +45,33 @@ type Service struct {
 }
 
 // New creates a new service.
-func New(scope NICScope, skuCache *resourceskus.Cache) *Service {
-	Client := NewClient(scope)
-	return &Service{
-		Scope:            scope,
-		Reconciler:       async.New(scope, Client, Client),
-		resourceSKUCache: skuCache,
+func New(scope NICScope, skuCache *resourceskus.Cache) (*Service, error) {
+	client, err := NewClient(scope, scope.DefaultedAzureCallTimeout())
+	if err != nil {
+		return nil, err
 	}
+	return &Service{
+		Scope: scope,
+		Reconciler: async.New[armnetwork.InterfacesClientCreateOrUpdateResponse,
+			armnetwork.InterfacesClientDeleteResponse](scope, client, client),
+		resourceSKUCache: skuCache,
+	}, nil
 }
 
-// Reconcile gets/creates/updates a network interface.
+// Name returns the service name.
+func (s *Service) Name() string {
+	return serviceName
+}
+
+// Reconcile idempotently creates or updates a network interface.
 func (s *Service) Reconcile(ctx context.Context) error {
 	ctx, _, done := tele.StartSpanWithLogger(ctx, "networkinterfaces.Service.Reconcile")
 	defer done()
 
-	ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultAzureServiceReconcileTimeout)
+	ctx, cancel := context.WithTimeout(ctx, s.Scope.DefaultedAzureServiceReconcileTimeout())
 	defer cancel()
 
-	// We go through the list of NICSpecs to reconcile each one, independently of the result of the previous one.
-	// If multiple errors occur, we return the most pressing one.
-	//  Order of precedence (highest -> lowest) is: error that is not an operationNotDoneError (i.e. error creating) -> operationNotDoneError (i.e. creating in progress) -> no error (i.e. created)
-	var result error
-	for _, nicSpec := range s.Scope.NICSpecs() {
-		if _, err := s.CreateResource(ctx, nicSpec, serviceName); err != nil {
-			if !azure.IsOperationNotDoneError(err) || result == nil {
-				result = err
-			}
-		}
-	}
-
-	s.Scope.UpdatePutStatus(infrav1.NetworkInterfaceReadyCondition, serviceName, result)
-	return result
+	return azure.ReconcileAll(ctx, s.Reconciler, s.Scope, s.Scope.NICSpecs(), serviceName, infrav1.NetworkInterfaceReadyCondition)
 }
 
 // Delete deletes the network interface with the provided name.
@@ -82,21 +79,13 @@ func (s *Service) Delete(ctx context.Context) error {
 	ctx, _, done := tele.StartSpanWithLogger(ctx, "networkinterfaces.Service.Delete")
 	defer done()
 
-	ctx, cancel := context.WithTimeout(ctx, reconciler.DefaultAzureServiceReconcileTimeout)
+	ctx, cancel := context.WithTimeout(ctx, s.Scope.DefaultedAzureServiceReconcileTimeout())
 	defer cancel()
 
-	var result error
+	return azure.DeleteAll(ctx, s.Reconciler, s.Scope, s.Scope.NICSpecs(), serviceName, infrav1.NetworkInterfaceReadyCondition)
+}
 
-	// We go through the list of NICSpecs to delete each one, independently of the result of the previous one.
-	// If multiple errors occur, we return the most pressing one.
-	//  Order of precedence (highest -> lowest) is: error that is not an operationNotDoneError (i.e. error deleting) -> operationNotDoneError (i.e. deleting in progress) -> no error (i.e. deleted)
-	for _, nicSpec := range s.Scope.NICSpecs() {
-		if err := s.DeleteResource(ctx, nicSpec, serviceName); err != nil {
-			if !azure.IsOperationNotDoneError(err) || result == nil {
-				result = err
-			}
-		}
-	}
-	s.Scope.UpdateDeleteStatus(infrav1.NetworkInterfaceReadyCondition, serviceName, result)
-	return result
+// IsManaged returns always returns true as CAPZ does not support BYO network interfaces.
+func (s *Service) IsManaged(_ context.Context) (bool, error) {
+	return true, nil
 }

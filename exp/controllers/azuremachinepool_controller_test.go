@@ -18,14 +18,25 @@ package controllers
 
 import (
 	"context"
+	"testing"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	infrav1exp "sigs.k8s.io/cluster-api-provider-azure/exp/api/v1beta1"
-	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
+	"sigs.k8s.io/cluster-api-provider-azure/azure"
+	infrav1exp "sigs.k8s.io/cluster-api-provider-azure/exp/api/v1beta1"
+	"sigs.k8s.io/cluster-api-provider-azure/internal/test"
+	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
 )
 
 var _ = Describe("AzureMachinePoolReconciler", func() {
@@ -35,7 +46,7 @@ var _ = Describe("AzureMachinePoolReconciler", func() {
 	Context("Reconcile an AzureMachinePool", func() {
 		It("should not error with minimal set up", func() {
 			reconciler := NewAzureMachinePoolReconciler(testEnv, testEnv.GetEventRecorderFor("azuremachinepool-reconciler"),
-				reconciler.DefaultLoopTimeout, "")
+				reconciler.Timeouts{}, "", testEnv.CredentialCache)
 			By("Calling reconcile")
 			instance := &infrav1exp.AzureMachinePool{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "default"}}
 			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
@@ -44,8 +55,135 @@ var _ = Describe("AzureMachinePoolReconciler", func() {
 					Name:      instance.Name,
 				},
 			})
-			Expect(err).To(BeNil())
+			Expect(err).NotTo(HaveOccurred())
 			Expect(result.RequeueAfter).To(BeZero())
 		})
 	})
 })
+
+func TestAzureMachinePoolReconcilePaused(t *testing.T) {
+	g := NewWithT(t)
+
+	ctx := t.Context()
+
+	sb := runtime.NewSchemeBuilder(
+		clusterv1.AddToScheme,
+		infrav1.AddToScheme,
+		infrav1exp.AddToScheme,
+		corev1.AddToScheme,
+	)
+	s := runtime.NewScheme()
+	g.Expect(sb.AddToScheme(s)).To(Succeed())
+	c := fake.NewClientBuilder().
+		WithScheme(s).
+		Build()
+
+	recorder := record.NewFakeRecorder(1)
+
+	reconciler := NewAzureMachinePoolReconciler(c, recorder, reconciler.Timeouts{}, "", azure.NewCredentialCache())
+	name := test.RandomName("paused", 10)
+	namespace := "default"
+
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: clusterv1.ClusterSpec{
+			Paused: ptr.To(true),
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				Kind: "AzureCluster",
+				Name: name,
+			},
+		},
+	}
+	g.Expect(c.Create(ctx, cluster)).To(Succeed())
+
+	azCluster := &infrav1.AzureCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: infrav1.AzureClusterSpec{
+			AzureClusterClassSpec: infrav1.AzureClusterClassSpec{
+				SubscriptionID: "something",
+				IdentityRef: &corev1.ObjectReference{
+					Name:      "fake-identity",
+					Namespace: "default",
+					Kind:      "AzureClusterIdentity",
+				},
+			},
+		},
+	}
+	g.Expect(c.Create(ctx, azCluster)).To(Succeed())
+
+	fakeIdentity := &infrav1.AzureClusterIdentity{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "fake-identity",
+			Namespace: "default",
+		},
+		Spec: infrav1.AzureClusterIdentitySpec{
+			Type: infrav1.ServicePrincipal,
+			ClientSecret: corev1.SecretReference{
+				Name:      "fooSecret",
+				Namespace: "default",
+			},
+			TenantID: "fake-tenantid",
+		},
+	}
+	fakeSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "fooSecret",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			"clientSecret": []byte("fooSecret"),
+		},
+	}
+	g.Expect(c.Create(ctx, fakeIdentity)).To(Succeed())
+	g.Expect(c.Create(ctx, fakeSecret)).To(Succeed())
+
+	mp := &clusterv1.MachinePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: map[string]string{
+				clusterv1.ClusterNameLabel: name,
+			},
+		},
+		Spec: clusterv1.MachinePoolSpec{
+			ClusterName: name,
+			Template: clusterv1.MachineTemplateSpec{
+				Spec: clusterv1.MachineSpec{
+					ClusterName: name,
+				},
+			},
+		},
+	}
+	g.Expect(c.Create(ctx, mp)).To(Succeed())
+
+	instance := &infrav1exp.AzureMachinePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					Kind:       "MachinePool",
+					APIVersion: clusterv1.GroupVersion.String(),
+					Name:       mp.Name,
+				},
+			},
+		},
+	}
+	g.Expect(c.Create(ctx, instance)).To(Succeed())
+
+	result, err := reconciler.Reconcile(t.Context(), ctrl.Request{
+		NamespacedName: client.ObjectKey{
+			Namespace: instance.Namespace,
+			Name:      instance.Name,
+		},
+	})
+
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(result.RequeueAfter).To(BeZero())
+}

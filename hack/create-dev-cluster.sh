@@ -17,15 +17,22 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
+REPO_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
+# shellcheck source=hack/util.sh
+source "${REPO_ROOT}/hack/util.sh"
+
+KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-capz}"
+KIND="${KIND:-${REPO_ROOT}/hack/tools/bin/kind}"
+KUBECTL="${KUBECTL:-${REPO_ROOT}/hack/tools/bin/kubectl}"
+
 # Verify the required Environment Variables are present.
-: "${AZURE_SUBSCRIPTION_ID:?Environment variable empty or not defined.}"
-: "${AZURE_TENANT_ID:?Environment variable empty or not defined.}"
-: "${AZURE_CLIENT_ID:?Environment variable empty or not defined.}"
-: "${AZURE_CLIENT_SECRET:?Environment variable empty or not defined.}"
+capz::util::ensure_azure_envs
 
 make envsubst
 
 export REGISTRY="${REGISTRY:-registry.local/fake}"
+
+export CLUSTER_CREATE_ATTEMPTS="${CLUSTER_CREATE_ATTEMPTS:-3}"
 
 # Cluster settings.
 export CLUSTER_NAME="${CLUSTER_NAME:-capz-test}"
@@ -35,46 +42,79 @@ export AZURE_VNET_NAME=${CLUSTER_NAME}-vnet
 export AZURE_LOCATION="${AZURE_LOCATION:-southcentralus}"
 export AZURE_RESOURCE_GROUP=${CLUSTER_NAME}
 
+AZURE_SUBSCRIPTION_ID="${AZURE_SUBSCRIPTION_ID:=}"
+AZURE_TENANT_ID="${AZURE_TENANT_ID:=}"
+AZURE_CLIENT_ID="${AZURE_CLIENT_ID:=}"
+
 AZURE_SUBSCRIPTION_ID_B64="$(echo -n "$AZURE_SUBSCRIPTION_ID" | base64 | tr -d '\n')"
 AZURE_TENANT_ID_B64="$(echo -n "$AZURE_TENANT_ID" | base64 | tr -d '\n')"
 AZURE_CLIENT_ID_B64="$(echo -n "$AZURE_CLIENT_ID" | base64 | tr -d '\n')"
-AZURE_CLIENT_SECRET_B64="$(echo -n "$AZURE_CLIENT_SECRET" | base64 | tr -d '\n')"
 
-export AZURE_SUBSCRIPTION_ID_B64 AZURE_TENANT_ID_B64 AZURE_CLIENT_ID_B64 AZURE_CLIENT_SECRET_B64
+export AZURE_SUBSCRIPTION_ID_B64 AZURE_TENANT_ID_B64 AZURE_CLIENT_ID_B64
 
 # Machine settings.
 export CONTROL_PLANE_MACHINE_COUNT=${CONTROL_PLANE_MACHINE_COUNT:-3}
 export AZURE_CONTROL_PLANE_MACHINE_TYPE="${CONTROL_PLANE_MACHINE_TYPE:-Standard_D2s_v3}"
-export AZURE_NODE_MACHINE_TYPE="${NODE_MACHINE_TYPE:-Standard_D2s_v3}"
+export AZURE_NODE_MACHINE_TYPE="${NODE_MACHINE_TYPE:-Standard_B2s}"
 export WORKER_MACHINE_COUNT=${WORKER_MACHINE_COUNT:-2}
-export KUBERNETES_VERSION="${KUBERNETES_VERSION:-v1.22.1}"
+export KUBERNETES_VERSION="${KUBERNETES_VERSION:-v1.35.4}"
 export CLUSTER_TEMPLATE="${CLUSTER_TEMPLATE:-cluster-template.yaml}"
 
 # identity secret settings.
-export AZURE_CLUSTER_IDENTITY_SECRET_NAME="cluster-identity-secret"
-export CLUSTER_IDENTITY_NAME=${CLUSTER_IDENTITY_NAME:="cluster-identity"} 
-export AZURE_CLUSTER_IDENTITY_SECRET_NAMESPACE="default"
+export CLUSTER_IDENTITY_NAME=${CLUSTER_IDENTITY_NAME:="cluster-identity"}
+export ASO_CREDENTIAL_SECRET_NAME=${ASO_CREDENTIAL_SECRET_NAME:="aso-credentials"}
 
 # Generate SSH key.
-SSH_KEY_FILE=${SSH_KEY_FILE:-""}
-if [ -z "$SSH_KEY_FILE" ]; then
-    SSH_KEY_FILE=.sshkey
-    rm -f "${SSH_KEY_FILE}" 2>/dev/null
-    ssh-keygen -t rsa -b 2048 -f "${SSH_KEY_FILE}" -N '' 1>/dev/null
-    echo "Machine SSH key generated in ${SSH_KEY_FILE}"
-fi
-
-AZURE_SSH_PUBLIC_KEY_B64=$(base64 "${SSH_KEY_FILE}.pub" | tr -d '\r\n')
-export AZURE_SSH_PUBLIC_KEY_B64
+capz::util::generate_ssh_key
 
 echo "================ DOCKER BUILD ==============="
 PULL_POLICY=IfNotPresent make modules docker-build
 
-echo "================ MAKE CLEAN ==============="
-make clean
+# cleanup_previous_attempt deletes any workload cluster and Azure RG left behind
+# by a previous create_cluster iteration, so retries start with a clean slate.
+cleanup_previous_attempt() {
+    local kind_kubeconfig="${REPO_ROOT}/${KIND_CLUSTER_NAME}.kubeconfig"
 
-echo "================ KIND RESET ==============="
-make kind-reset
+    if [[ -x "${KIND}" ]] && [[ -r "${kind_kubeconfig}" ]] && \
+       "${KIND}" get clusters 2>/dev/null | grep -qxF "${KIND_CLUSTER_NAME}"; then
+        echo "================ DELETE WORKLOAD CLUSTER (graceful) ==============="
+        if timeout 1200 "${KUBECTL}" --kubeconfig "${kind_kubeconfig}" \
+            delete cluster "${CLUSTER_NAME}" -n default --wait=true --ignore-not-found=true; then
+            return 0
+        fi
+        echo "Graceful cluster delete failed or timed out; falling back to az group delete"
+    fi
 
-echo "================ CREATE CLUSTER ==============="
-make create-cluster
+    # Synchronous so attempt N+1 doesn't race a still-deleting RG.
+    if command -v az >/dev/null 2>&1 \
+        && [[ -n "${AZURE_RESOURCE_GROUP:-}" ]] \
+        && [[ "${AZURE_RESOURCE_GROUP}" == "${CLUSTER_NAME}" ]] \
+        && [[ "$(az group exists --name "${AZURE_RESOURCE_GROUP}" 2>/dev/null)" == "true" ]]; then
+        echo "================ AZURE RG CLEANUP (fallback) ==============="
+        timeout 1800 az group delete --name "${AZURE_RESOURCE_GROUP}" --yes \
+            || echo "WARNING: az group delete failed; subsequent attempt may see leftover Azure resources"
+    fi
+}
+
+create_cluster() {
+    cleanup_previous_attempt
+
+    echo "================ MAKE CLEAN ==============="
+    make clean
+
+    echo "================ KIND RESET ==============="
+    make kind-reset
+
+    echo "================ INSTALL TOOLS ==============="
+    make install-tools
+
+    echo "================ CREATE CLUSTER ==============="
+    make create-cluster
+}
+
+retries=$CLUSTER_CREATE_ATTEMPTS
+until create_cluster; do
+  if ((--retries == 0)); then
+    exit 1
+  fi
+done

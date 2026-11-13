@@ -11,7 +11,6 @@ containers:
     command:
       - /{{ .Values.command.name }}
       - --config=/conf/relay.yaml
-      - --metrics-addr=0.0.0.0:8888
       {{- range .Values.command.extraArgs }}
       - {{ . }}
       {{- end }}
@@ -84,6 +83,9 @@ containers:
         mountPath: /var/lib/docker/containers
         readOnly: true
       {{- end }}
+      {{- if .Values.extraVolumeMounts }}
+      {{- toYaml .Values.extraVolumeMounts | nindent 6 }}
+      {{- end }}
 {{- if .Values.priorityClassName }}
 priorityClassName: {{ .Values.priorityClassName | quote }}
 {{- end }}
@@ -116,6 +118,9 @@ volumes:
   - name: varlibdockercontainers
     hostPath:
       path: /var/lib/docker/containers
+  {{- end }}
+  {{- if .Values.extraVolumes }}
+  {{- toYaml .Values.extraVolumes | nindent 2 }}
   {{- end }}
 {{- with .Values.nodeSelector }}
 nodeSelector:

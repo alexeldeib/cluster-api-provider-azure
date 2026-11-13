@@ -19,11 +19,12 @@ package virtualmachines
 import (
 	"testing"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2021-04-01/compute"
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-02-01/network"
-	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v4"
 	"github.com/google/go-cmp/cmp"
 	. "github.com/onsi/gomega"
+	"k8s.io/utils/ptr"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/resourceskus"
@@ -32,161 +33,233 @@ import (
 
 var (
 	validSKU = resourceskus.SKU{
-		Name: to.StringPtr("Standard_D2v3"),
-		Kind: to.StringPtr(string(resourceskus.VirtualMachines)),
-		Locations: &[]string{
-			"test-location",
+		Name: ptr.To("Standard_D2v3"),
+		Kind: ptr.To(string(resourceskus.VirtualMachines)),
+		Locations: []*string{
+			ptr.To("test-location"),
 		},
-		Capabilities: &[]compute.ResourceSkuCapabilities{
+		Capabilities: []*armcompute.ResourceSKUCapabilities{
 			{
-				Name:  to.StringPtr(resourceskus.VCPUs),
-				Value: to.StringPtr("2"),
+				Name:  ptr.To(resourceskus.VCPUs),
+				Value: ptr.To("2"),
 			},
 			{
-				Name:  to.StringPtr(resourceskus.MemoryGB),
-				Value: to.StringPtr("4"),
+				Name:  ptr.To(resourceskus.MemoryGB),
+				Value: ptr.To("4"),
 			},
 		},
 	}
 
 	validSKUWithEncryptionAtHost = resourceskus.SKU{
-		Name: to.StringPtr("Standard_D2v3"),
-		Kind: to.StringPtr(string(resourceskus.VirtualMachines)),
-		Locations: &[]string{
-			"test-location",
+		Name: ptr.To("Standard_D2v3"),
+		Kind: ptr.To(string(resourceskus.VirtualMachines)),
+		Locations: []*string{
+			ptr.To("test-location"),
 		},
-		Capabilities: &[]compute.ResourceSkuCapabilities{
+		Capabilities: []*armcompute.ResourceSKUCapabilities{
 			{
-				Name:  to.StringPtr(resourceskus.VCPUs),
-				Value: to.StringPtr("2"),
+				Name:  ptr.To(resourceskus.VCPUs),
+				Value: ptr.To("2"),
 			},
 			{
-				Name:  to.StringPtr(resourceskus.MemoryGB),
-				Value: to.StringPtr("4"),
+				Name:  ptr.To(resourceskus.MemoryGB),
+				Value: ptr.To("4"),
 			},
 			{
-				Name:  to.StringPtr(resourceskus.EncryptionAtHost),
-				Value: to.StringPtr(string(resourceskus.CapabilitySupported)),
+				Name:  ptr.To(resourceskus.EncryptionAtHost),
+				Value: ptr.To(string(resourceskus.CapabilitySupported)),
+			},
+		},
+	}
+
+	validSKUWithTrustedLaunchDisabled = resourceskus.SKU{
+		Name: ptr.To("Standard_D2v3"),
+		Kind: ptr.To(string(resourceskus.VirtualMachines)),
+		Locations: []*string{
+			ptr.To("test-location"),
+		},
+		Capabilities: []*armcompute.ResourceSKUCapabilities{
+			{
+				Name:  ptr.To(resourceskus.VCPUs),
+				Value: ptr.To("2"),
+			},
+			{
+				Name:  ptr.To(resourceskus.MemoryGB),
+				Value: ptr.To("4"),
+			},
+			{
+				Name:  ptr.To(resourceskus.TrustedLaunchDisabled),
+				Value: ptr.To(string(resourceskus.CapabilitySupported)),
+			},
+		},
+	}
+
+	validSKUWithConfidentialComputingTypeAndEncryptionAtHost = resourceskus.SKU{
+		Name: ptr.To("Standard_D2v3"),
+		Kind: ptr.To(string(resourceskus.VirtualMachines)),
+		Locations: []*string{
+			ptr.To("test-location"),
+		},
+		Capabilities: []*armcompute.ResourceSKUCapabilities{
+			{
+				Name:  ptr.To(resourceskus.VCPUs),
+				Value: ptr.To("2"),
+			},
+			{
+				Name:  ptr.To(resourceskus.MemoryGB),
+				Value: ptr.To("4"),
+			},
+			{
+				Name:  ptr.To(resourceskus.ConfidentialComputingType),
+				Value: ptr.To(string(resourceskus.CapabilitySupported)),
+			},
+			{
+				Name:  ptr.To(resourceskus.EncryptionAtHost),
+				Value: ptr.To(string(resourceskus.CapabilitySupported)),
+			},
+		},
+	}
+
+	validSKUWithConfidentialComputingType = resourceskus.SKU{
+		Name: ptr.To("Standard_D2v3"),
+		Kind: ptr.To(string(resourceskus.VirtualMachines)),
+		Locations: []*string{
+			ptr.To("test-location"),
+		},
+		Capabilities: []*armcompute.ResourceSKUCapabilities{
+			{
+				Name:  ptr.To(resourceskus.VCPUs),
+				Value: ptr.To("2"),
+			},
+			{
+				Name:  ptr.To(resourceskus.MemoryGB),
+				Value: ptr.To("4"),
+			},
+			{
+				Name:  ptr.To(resourceskus.ConfidentialComputingType),
+				Value: ptr.To(string(resourceskus.CapabilitySupported)),
 			},
 		},
 	}
 
 	validSKUWithEphemeralOS = resourceskus.SKU{
-		Name: to.StringPtr("Standard_D2v3"),
-		Kind: to.StringPtr(string(resourceskus.VirtualMachines)),
-		Locations: &[]string{
-			"test-location",
+		Name: ptr.To("Standard_D2v3"),
+		Kind: ptr.To(string(resourceskus.VirtualMachines)),
+		Locations: []*string{
+			ptr.To("test-location"),
 		},
-		Capabilities: &[]compute.ResourceSkuCapabilities{
+		Capabilities: []*armcompute.ResourceSKUCapabilities{
 			{
-				Name:  to.StringPtr(resourceskus.VCPUs),
-				Value: to.StringPtr("2"),
+				Name:  ptr.To(resourceskus.VCPUs),
+				Value: ptr.To("2"),
 			},
 			{
-				Name:  to.StringPtr(resourceskus.MemoryGB),
-				Value: to.StringPtr("4"),
+				Name:  ptr.To(resourceskus.MemoryGB),
+				Value: ptr.To("4"),
 			},
 			{
-				Name:  to.StringPtr(resourceskus.EphemeralOSDisk),
-				Value: to.StringPtr("True"),
+				Name:  ptr.To(resourceskus.EphemeralOSDisk),
+				Value: ptr.To("True"),
 			},
 		},
 	}
 
 	validSKUWithUltraSSD = resourceskus.SKU{
-		Name: to.StringPtr("Standard_D2v3"),
-		Kind: to.StringPtr(string(resourceskus.VirtualMachines)),
-		Locations: &[]string{
-			"test-location",
+		Name: ptr.To("Standard_D2v3"),
+		Kind: ptr.To(string(resourceskus.VirtualMachines)),
+		Locations: []*string{
+			ptr.To("test-location"),
 		},
-		LocationInfo: &[]compute.ResourceSkuLocationInfo{
+		LocationInfo: []*armcompute.ResourceSKULocationInfo{
 			{
-				Location: to.StringPtr("test-location"),
-				Zones:    &[]string{"1"},
-				ZoneDetails: &[]compute.ResourceSkuZoneDetails{
+				Location: ptr.To("test-location"),
+				Zones:    []*string{ptr.To("1")},
+				ZoneDetails: []*armcompute.ResourceSKUZoneDetails{
 					{
-						Capabilities: &[]compute.ResourceSkuCapabilities{
+						Capabilities: []*armcompute.ResourceSKUCapabilities{
 							{
-								Name:  to.StringPtr("UltraSSDAvailable"),
-								Value: to.StringPtr("True"),
+								Name:  ptr.To("UltraSSDAvailable"),
+								Value: ptr.To("True"),
 							},
 						},
-						Name: &[]string{"1"},
+						Name: []*string{ptr.To("1")},
 					},
 				},
 			},
 		},
-		Capabilities: &[]compute.ResourceSkuCapabilities{
+		Capabilities: []*armcompute.ResourceSKUCapabilities{
 			{
-				Name:  to.StringPtr(resourceskus.VCPUs),
-				Value: to.StringPtr("2"),
+				Name:  ptr.To(resourceskus.VCPUs),
+				Value: ptr.To("2"),
 			},
 			{
-				Name:  to.StringPtr(resourceskus.MemoryGB),
-				Value: to.StringPtr("4"),
+				Name:  ptr.To(resourceskus.MemoryGB),
+				Value: ptr.To("4"),
 			},
 		},
 	}
 
 	invalidCPUSKU = resourceskus.SKU{
-		Name: to.StringPtr("Standard_D2v3"),
-		Kind: to.StringPtr(string(resourceskus.VirtualMachines)),
-		Locations: &[]string{
-			"test-location",
+		Name: ptr.To("Standard_D2v3"),
+		Kind: ptr.To(string(resourceskus.VirtualMachines)),
+		Locations: []*string{
+			ptr.To("test-location"),
 		},
-		Capabilities: &[]compute.ResourceSkuCapabilities{
+		Capabilities: []*armcompute.ResourceSKUCapabilities{
 			{
-				Name:  to.StringPtr(resourceskus.VCPUs),
-				Value: to.StringPtr("1"),
+				Name:  ptr.To(resourceskus.VCPUs),
+				Value: ptr.To("1"),
 			},
 			{
-				Name:  to.StringPtr(resourceskus.MemoryGB),
-				Value: to.StringPtr("4"),
+				Name:  ptr.To(resourceskus.MemoryGB),
+				Value: ptr.To("4"),
 			},
 		},
 	}
 
 	invalidMemSKU = resourceskus.SKU{
-		Name: to.StringPtr("Standard_D2v3"),
-		Kind: to.StringPtr(string(resourceskus.VirtualMachines)),
-		Locations: &[]string{
-			"test-location",
+		Name: ptr.To("Standard_D2v3"),
+		Kind: ptr.To(string(resourceskus.VirtualMachines)),
+		Locations: []*string{
+			ptr.To("test-location"),
 		},
-		Capabilities: &[]compute.ResourceSkuCapabilities{
+		Capabilities: []*armcompute.ResourceSKUCapabilities{
 			{
-				Name:  to.StringPtr(resourceskus.VCPUs),
-				Value: to.StringPtr("2"),
+				Name:  ptr.To(resourceskus.VCPUs),
+				Value: ptr.To("2"),
 			},
 			{
-				Name:  to.StringPtr(resourceskus.MemoryGB),
-				Value: to.StringPtr("1"),
+				Name:  ptr.To(resourceskus.MemoryGB),
+				Value: ptr.To("1"),
 			},
 		},
 	}
+
+	deletePolicy = infrav1.SpotEvictionPolicyDelete
 )
 
 func TestParameters(t *testing.T) {
 	testcases := []struct {
 		name          string
 		spec          *VMSpec
-		existing      interface{}
-		expect        func(g *WithT, result interface{})
+		existing      any
+		expect        func(g *WithT, result any)
 		expectedError string
 	}{
 		{
 			name:     "fails if existing is not a VirtualMachine",
 			spec:     &VMSpec{},
-			existing: network.VirtualNetwork{},
-			expect: func(g *WithT, result interface{}) {
+			existing: armnetwork.VirtualNetwork{},
+			expect: func(g *WithT, result any) {
 				g.Expect(result).To(BeNil())
 			},
-			expectedError: "network.VirtualNetwork is not a compute.VirtualMachine",
+			expectedError: "armnetwork.VirtualNetwork is not an armcompute.VirtualMachine",
 		},
 		{
 			name:     "returns nil if vm already exists",
 			spec:     &VMSpec{},
-			existing: compute.VirtualMachine{},
-			expect: func(g *WithT, result interface{}) {
+			existing: armcompute.VirtualMachine{},
+			expect: func(g *WithT, result any) {
 				g.Expect(result).To(BeNil())
 			},
 			expectedError: "",
@@ -197,7 +270,7 @@ func TestParameters(t *testing.T) {
 				ProviderID: "fake/vm/id",
 			},
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
+			expect: func(g *WithT, result any) {
 				g.Expect(result).To(BeNil())
 			},
 			expectedError: azure.VMDeletedError{ProviderID: "fake/vm/id"}.Error(),
@@ -211,15 +284,15 @@ func TestParameters(t *testing.T) {
 				SSHKeyData: "fakesshpublickey",
 				Size:       "Standard_D2v3",
 				Zone:       "1",
-				Image:      &infrav1.Image{ID: to.StringPtr("fake-image-id")},
+				Image:      &infrav1.Image{ID: ptr.To("fake-image-id")},
 				Identity:   infrav1.VMIdentitySystemAssigned,
 				SKU:        validSKU,
 			},
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(compute.VirtualMachine{}))
-				g.Expect(result.(compute.VirtualMachine).Identity.Type).To(Equal(compute.ResourceIdentityTypeSystemAssigned))
-				g.Expect(result.(compute.VirtualMachine).Identity.UserAssignedIdentities).To(HaveLen(0))
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Identity.Type).To(Equal(ptr.To(armcompute.ResourceIdentityTypeSystemAssigned)))
+				g.Expect(result.(armcompute.VirtualMachine).Identity.UserAssignedIdentities).To(BeEmpty())
 			},
 			expectedError: "",
 		},
@@ -232,16 +305,16 @@ func TestParameters(t *testing.T) {
 				SSHKeyData:             "fakesshpublickey",
 				Size:                   "Standard_D2v3",
 				Zone:                   "1",
-				Image:                  &infrav1.Image{ID: to.StringPtr("fake-image-id")},
+				Image:                  &infrav1.Image{ID: ptr.To("fake-image-id")},
 				Identity:               infrav1.VMIdentityUserAssigned,
 				UserAssignedIdentities: []infrav1.UserAssignedIdentity{{ProviderID: "my-user-id"}},
 				SKU:                    validSKU,
 			},
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(compute.VirtualMachine{}))
-				g.Expect(result.(compute.VirtualMachine).Identity.Type).To(Equal(compute.ResourceIdentityTypeUserAssigned))
-				g.Expect(result.(compute.VirtualMachine).Identity.UserAssignedIdentities).To(Equal(map[string]*compute.VirtualMachineIdentityUserAssignedIdentitiesValue{"my-user-id": {}}))
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Identity.Type).To(Equal(ptr.To(armcompute.ResourceIdentityTypeUserAssigned)))
+				g.Expect(result.(armcompute.VirtualMachine).Identity.UserAssignedIdentities).To(Equal(map[string]*armcompute.UserAssignedIdentitiesValue{"my-user-id": {}}))
 			},
 			expectedError: "",
 		},
@@ -254,16 +327,38 @@ func TestParameters(t *testing.T) {
 				SSHKeyData:    "fakesshpublickey",
 				Size:          "Standard_D2v3",
 				Zone:          "1",
-				Image:         &infrav1.Image{ID: to.StringPtr("fake-image-id")},
+				Image:         &infrav1.Image{ID: ptr.To("fake-image-id")},
 				SpotVMOptions: &infrav1.SpotVMOptions{},
 				SKU:           validSKU,
 			},
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(compute.VirtualMachine{}))
-				g.Expect(result.(compute.VirtualMachine).Priority).To(Equal(compute.VirtualMachinePriorityTypesSpot))
-				g.Expect(result.(compute.VirtualMachine).EvictionPolicy).To(Equal(compute.VirtualMachineEvictionPolicyTypesDeallocate))
-				g.Expect(result.(compute.VirtualMachine).BillingProfile).To(BeNil())
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.Priority).To(Equal(ptr.To(armcompute.VirtualMachinePriorityTypesSpot)))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.BillingProfile).To(BeNil())
+			},
+			expectedError: "",
+		},
+
+		{
+			name: "can create a spot vm with evictionPolicy delete",
+			spec: &VMSpec{
+				Name:          "my-vm",
+				Role:          infrav1.Node,
+				NICIDs:        []string{"my-nic"},
+				SSHKeyData:    "fakesshpublickey",
+				Size:          "Standard_D2v3",
+				Zone:          "1",
+				Image:         &infrav1.Image{ID: ptr.To("fake-image-id")},
+				SpotVMOptions: &infrav1.SpotVMOptions{EvictionPolicy: &deletePolicy},
+				SKU:           validSKU,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.Priority).To(Equal(ptr.To(armcompute.VirtualMachinePriorityTypesSpot)))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.EvictionPolicy).To(Equal(ptr.To(armcompute.VirtualMachineEvictionPolicyTypesDelete)))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.BillingProfile).To(BeNil())
 			},
 			expectedError: "",
 		},
@@ -276,23 +371,23 @@ func TestParameters(t *testing.T) {
 				SSHKeyData: "fakesshpublickey",
 				Size:       "Standard_D2v3",
 				Zone:       "1",
-				Image:      &infrav1.Image{ID: to.StringPtr("fake-image-id")},
+				Image:      &infrav1.Image{ID: ptr.To("fake-image-id")},
 				OSDisk: infrav1.OSDisk{
 					OSType:     "Windows",
-					DiskSizeGB: to.Int32Ptr(128),
+					DiskSizeGB: ptr.To[int32](128),
 					ManagedDisk: &infrav1.ManagedDiskParameters{
-						StorageAccountType: "Premium_LRS",
+						StorageAccountType: string(armcompute.StorageAccountTypesPremiumLRS),
 					},
 				},
 				SKU: validSKU,
 			},
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(compute.VirtualMachine{}))
-				g.Expect(result.(compute.VirtualMachine).VirtualMachineProperties.StorageProfile.OsDisk.OsType).To(Equal(compute.OperatingSystemTypesWindows))
-				g.Expect(*result.(compute.VirtualMachine).VirtualMachineProperties.OsProfile.AdminPassword).Should(HaveLen(123))
-				g.Expect(*result.(compute.VirtualMachine).VirtualMachineProperties.OsProfile.AdminUsername).Should(Equal("capi"))
-				g.Expect(*result.(compute.VirtualMachine).VirtualMachineProperties.OsProfile.WindowsConfiguration.EnableAutomaticUpdates).Should(Equal(false))
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.StorageProfile.OSDisk.OSType).To(Equal(ptr.To(armcompute.OperatingSystemTypesWindows)))
+				g.Expect(*result.(armcompute.VirtualMachine).Properties.OSProfile.AdminPassword).Should(HaveLen(123))
+				g.Expect(*result.(armcompute.VirtualMachine).Properties.OSProfile.AdminUsername).Should(Equal("capi"))
+				g.Expect(*result.(armcompute.VirtualMachine).Properties.OSProfile.WindowsConfiguration.EnableAutomaticUpdates).Should(BeFalse())
 			},
 			expectedError: "",
 		},
@@ -305,10 +400,10 @@ func TestParameters(t *testing.T) {
 				SSHKeyData: "fakesshpublickey",
 				Size:       "Standard_D2v3",
 				Zone:       "1",
-				Image:      &infrav1.Image{ID: to.StringPtr("fake-image-id")},
+				Image:      &infrav1.Image{ID: ptr.To("fake-image-id")},
 				OSDisk: infrav1.OSDisk{
 					ManagedDisk: &infrav1.ManagedDiskParameters{
-						StorageAccountType: "Premium_LRS",
+						StorageAccountType: string(armcompute.StorageAccountTypesPremiumLRS),
 						DiskEncryptionSet: &infrav1.DiskEncryptionSetParameters{
 							ID: "my-diskencryptionset-id",
 						},
@@ -317,9 +412,9 @@ func TestParameters(t *testing.T) {
 				SKU: validSKU,
 			},
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(compute.VirtualMachine{}))
-				g.Expect(result.(compute.VirtualMachine).VirtualMachineProperties.StorageProfile.OsDisk.ManagedDisk.DiskEncryptionSet.ID).To(Equal(to.StringPtr("my-diskencryptionset-id")))
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.StorageProfile.OSDisk.ManagedDisk.DiskEncryptionSet.ID).To(Equal(ptr.To("my-diskencryptionset-id")))
 			},
 			expectedError: "",
 		},
@@ -332,14 +427,14 @@ func TestParameters(t *testing.T) {
 				SSHKeyData:      "fakesshpublickey",
 				Size:            "Standard_D2v3",
 				Zone:            "1",
-				Image:           &infrav1.Image{ID: to.StringPtr("fake-image-id")},
-				SecurityProfile: &infrav1.SecurityProfile{EncryptionAtHost: to.BoolPtr(true)},
+				Image:           &infrav1.Image{ID: ptr.To("fake-image-id")},
+				SecurityProfile: &infrav1.SecurityProfile{EncryptionAtHost: ptr.To(true)},
 				SKU:             validSKUWithEncryptionAtHost,
 			},
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(compute.VirtualMachine{}))
-				g.Expect(*result.(compute.VirtualMachine).VirtualMachineProperties.SecurityProfile.EncryptionAtHost).To(Equal(true))
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(*result.(armcompute.VirtualMachine).Properties.SecurityProfile.EncryptionAtHost).To(BeTrue())
 			},
 			expectedError: "",
 		},
@@ -353,16 +448,58 @@ func TestParameters(t *testing.T) {
 				Size:              "Standard_D2v3",
 				AvailabilitySetID: "fake-availability-set-id",
 				Zone:              "",
-				Image:             &infrav1.Image{ID: to.StringPtr("fake-image-id")},
+				Image:             &infrav1.Image{ID: ptr.To("fake-image-id")},
 				SKU:               validSKU,
 			},
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(compute.VirtualMachine{}))
-				g.Expect(result.(compute.VirtualMachine).Zones).To(BeNil())
-				g.Expect(result.(compute.VirtualMachine).AvailabilitySet.ID).To(Equal(to.StringPtr("fake-availability-set-id")))
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Zones).To(BeNil())
+				g.Expect(result.(armcompute.VirtualMachine).Properties.AvailabilitySet.ID).To(Equal(ptr.To("fake-availability-set-id")))
 			},
 			expectedError: "",
+		},
+		{
+			name: "can create a vm and assign it to a vmss flex",
+			spec: &VMSpec{
+				Name:                     "my-vm",
+				Role:                     infrav1.Node,
+				NICIDs:                   []string{"my-nic"},
+				SSHKeyData:               "fakesshpublickey",
+				Size:                     "Standard_D2v3",
+				VirtualMachineScaleSetID: "fake-vmss-id",
+				Zone:                     "",
+				Image:                    &infrav1.Image{ID: ptr.To("fake-image-id")},
+				SKU:                      validSKU,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Zones).To(BeNil())
+				g.Expect(result.(armcompute.VirtualMachine).Properties.VirtualMachineScaleSet.ID).To(Equal(ptr.To("fake-vmss-id")))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.AvailabilitySet).To(BeNil())
+			},
+			expectedError: "",
+		},
+		{
+			name: "fails if vmss flex and availability set are both set",
+			spec: &VMSpec{
+				Name:                     "my-vm",
+				Role:                     infrav1.Node,
+				NICIDs:                   []string{"my-nic"},
+				SSHKeyData:               "fakesshpublickey",
+				Size:                     "Standard_D2v3",
+				AvailabilitySetID:        "fake-availability-set-id",
+				VirtualMachineScaleSetID: "fake-vmss-id",
+				Zone:                     "",
+				Image:                    &infrav1.Image{ID: ptr.To("fake-image-id")},
+				SKU:                      validSKU,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeNil())
+			},
+			expectedError: "reconcile error that cannot be recovered occurred: availabilitySetID and virtualMachineScaleSetID cannot both be set. Object will not be requeued",
 		},
 		{
 			name: "can create a vm with EphemeralOSDisk",
@@ -374,23 +511,194 @@ func TestParameters(t *testing.T) {
 				Size:       "Standard_D2v3",
 				OSDisk: infrav1.OSDisk{
 					OSType:     "Linux",
-					DiskSizeGB: to.Int32Ptr(128),
+					DiskSizeGB: ptr.To[int32](128),
 					ManagedDisk: &infrav1.ManagedDiskParameters{
-						StorageAccountType: "Premium_LRS",
+						StorageAccountType: string(armcompute.StorageAccountTypesPremiumLRS),
 					},
 					DiffDiskSettings: &infrav1.DiffDiskSettings{
-						Option: string(compute.DiffDiskOptionsLocal),
+						Option: string(armcompute.DiffDiskOptionsLocal),
 					},
 				},
-				Image: &infrav1.Image{ID: to.StringPtr("fake-image-id")},
+				Image: &infrav1.Image{ID: ptr.To("fake-image-id")},
 				SKU:   validSKUWithEphemeralOS,
 			},
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(compute.VirtualMachine{}))
-				g.Expect(result.(compute.VirtualMachine).StorageProfile.OsDisk.DiffDiskSettings.Option).To(Equal(compute.DiffDiskOptionsLocal))
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.StorageProfile.OSDisk.DiffDiskSettings.Option).To(Equal(ptr.To(armcompute.DiffDiskOptionsLocal)))
 			},
 			expectedError: "",
+		},
+		{
+			name: "can create a vm with DiffDiskPlacement ResourceDisk",
+			spec: &VMSpec{
+				Name:       "my-vm",
+				Role:       infrav1.Node,
+				NICIDs:     []string{"my-nic"},
+				SSHKeyData: "fakesshpublickey",
+				Size:       "Standard_D2v3",
+				OSDisk: infrav1.OSDisk{
+					OSType:     "Linux",
+					DiskSizeGB: ptr.To[int32](128),
+					ManagedDisk: &infrav1.ManagedDiskParameters{
+						StorageAccountType: string(armcompute.StorageAccountTypesPremiumLRS),
+					},
+					DiffDiskSettings: &infrav1.DiffDiskSettings{
+						Option:    string(armcompute.DiffDiskOptionsLocal),
+						Placement: ptr.To(infrav1.DiffDiskPlacementResourceDisk),
+					},
+				},
+				Image: &infrav1.Image{ID: ptr.To("fake-image-id")},
+				SKU:   validSKUWithEphemeralOS,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.StorageProfile.OSDisk.DiffDiskSettings.Placement).To(Equal(ptr.To(armcompute.DiffDiskPlacementResourceDisk)))
+			},
+			expectedError: "",
+		},
+		{
+			name: "can create a trusted launch vm",
+			spec: &VMSpec{
+				Name:              "my-vm",
+				Role:              infrav1.Node,
+				NICIDs:            []string{"my-nic"},
+				SSHKeyData:        "fakesshpublickey",
+				Size:              "Standard_D2v3",
+				AvailabilitySetID: "fake-availability-set-id",
+				Zone:              "",
+				Image:             &infrav1.Image{ID: ptr.To("fake-image-id")},
+				SecurityProfile: &infrav1.SecurityProfile{
+					SecurityType: infrav1.SecurityTypesTrustedLaunch,
+					UefiSettings: &infrav1.UefiSettings{
+						SecureBootEnabled: ptr.To(true),
+						VTpmEnabled:       ptr.To(true),
+					},
+				},
+				SKU: validSKU,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(*result.(armcompute.VirtualMachine).Properties.SecurityProfile.UefiSettings.SecureBootEnabled).To(BeTrue())
+				g.Expect(*result.(armcompute.VirtualMachine).Properties.SecurityProfile.UefiSettings.VTpmEnabled).To(BeTrue())
+			},
+			expectedError: "",
+		},
+		{
+			name: "can create a confidential vm",
+			spec: &VMSpec{
+				Name:              "my-vm",
+				Role:              infrav1.Node,
+				NICIDs:            []string{"my-nic"},
+				SSHKeyData:        "fakesshpublickey",
+				Size:              "Standard_D2v3",
+				AvailabilitySetID: "fake-availability-set-id",
+				Zone:              "",
+				Image:             &infrav1.Image{ID: ptr.To("fake-image-id")},
+				OSDisk: infrav1.OSDisk{
+					OSType:     "Linux",
+					DiskSizeGB: ptr.To[int32](128),
+					ManagedDisk: &infrav1.ManagedDiskParameters{
+						StorageAccountType: string(armcompute.StorageAccountTypesPremiumLRS),
+						SecurityProfile: &infrav1.VMDiskSecurityProfile{
+							SecurityEncryptionType: infrav1.SecurityEncryptionTypeVMGuestStateOnly,
+						},
+					},
+				},
+				SecurityProfile: &infrav1.SecurityProfile{
+					SecurityType: infrav1.SecurityTypesConfidentialVM,
+					UefiSettings: &infrav1.UefiSettings{
+						SecureBootEnabled: ptr.To(false),
+						VTpmEnabled:       ptr.To(true),
+					},
+				},
+				SKU: validSKUWithConfidentialComputingType,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.StorageProfile.OSDisk.ManagedDisk.SecurityProfile.SecurityEncryptionType).To(Equal(ptr.To(armcompute.SecurityEncryptionTypesVMGuestStateOnly)))
+				g.Expect(*result.(armcompute.VirtualMachine).Properties.SecurityProfile.UefiSettings.VTpmEnabled).To(BeTrue())
+			},
+			expectedError: "",
+		},
+		{
+			name: "can create a confidential vm with VMGuestStateOnly and encryption at host",
+			spec: &VMSpec{
+				Name:              "my-vm",
+				Role:              infrav1.Node,
+				NICIDs:            []string{"my-nic"},
+				SSHKeyData:        "fakesshpublickey",
+				Size:              "Standard_D2v3",
+				AvailabilitySetID: "fake-availability-set-id",
+				Zone:              "",
+				Image:             &infrav1.Image{ID: ptr.To("fake-image-id")},
+				OSDisk: infrav1.OSDisk{
+					OSType:     "Linux",
+					DiskSizeGB: ptr.To[int32](128),
+					ManagedDisk: &infrav1.ManagedDiskParameters{
+						StorageAccountType: string(armcompute.StorageAccountTypesPremiumLRS),
+						SecurityProfile: &infrav1.VMDiskSecurityProfile{
+							SecurityEncryptionType: infrav1.SecurityEncryptionTypeVMGuestStateOnly,
+						},
+					},
+				},
+				SecurityProfile: &infrav1.SecurityProfile{
+					EncryptionAtHost: ptr.To(true),
+					SecurityType:     infrav1.SecurityTypesConfidentialVM,
+					UefiSettings: &infrav1.UefiSettings{
+						SecureBootEnabled: ptr.To(false),
+						VTpmEnabled:       ptr.To(true),
+					},
+				},
+				SKU: validSKUWithConfidentialComputingTypeAndEncryptionAtHost,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.StorageProfile.OSDisk.ManagedDisk.SecurityProfile.SecurityEncryptionType).To(Equal(ptr.To(armcompute.SecurityEncryptionTypesVMGuestStateOnly)))
+				g.Expect(*result.(armcompute.VirtualMachine).Properties.SecurityProfile.EncryptionAtHost).To(BeTrue())
+				g.Expect(*result.(armcompute.VirtualMachine).Properties.SecurityProfile.UefiSettings.VTpmEnabled).To(BeTrue())
+			},
+			expectedError: "",
+		},
+		{
+			name: "creating a confidential vm without the SecurityType set to ConfidentialVM fails",
+			spec: &VMSpec{
+				Name:              "my-vm",
+				Role:              infrav1.Node,
+				NICIDs:            []string{"my-nic"},
+				SSHKeyData:        "fakesshpublickey",
+				Size:              "Standard_D2v3",
+				AvailabilitySetID: "fake-availability-set-id",
+				Zone:              "",
+				Image:             &infrav1.Image{ID: ptr.To("fake-image-id")},
+				OSDisk: infrav1.OSDisk{
+					OSType:     "Linux",
+					DiskSizeGB: ptr.To[int32](128),
+					ManagedDisk: &infrav1.ManagedDiskParameters{
+						StorageAccountType: string(armcompute.StorageAccountTypesPremiumLRS),
+						SecurityProfile: &infrav1.VMDiskSecurityProfile{
+							SecurityEncryptionType: infrav1.SecurityEncryptionTypeVMGuestStateOnly,
+						},
+					},
+				},
+				SecurityProfile: &infrav1.SecurityProfile{
+					SecurityType: "",
+					UefiSettings: &infrav1.UefiSettings{
+						SecureBootEnabled: ptr.To(false),
+						VTpmEnabled:       ptr.To(true),
+					},
+				},
+				SKU: validSKUWithConfidentialComputingType,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeNil())
+			},
+			expectedError: "reconcile error that cannot be recovered occurred: securityType should be set to ConfidentialVM when securityEncryptionType is set. Object will not be requeued",
 		},
 		{
 			name: "creating a vm with encryption at host enabled for unsupported VM type fails",
@@ -402,15 +710,240 @@ func TestParameters(t *testing.T) {
 				Size:              "Standard_D2v3",
 				AvailabilitySetID: "fake-availability-set-id",
 				Zone:              "",
-				Image:             &infrav1.Image{ID: to.StringPtr("fake-image-id")},
-				SecurityProfile:   &infrav1.SecurityProfile{EncryptionAtHost: to.BoolPtr(true)},
+				Image:             &infrav1.Image{ID: ptr.To("fake-image-id")},
+				SecurityProfile:   &infrav1.SecurityProfile{EncryptionAtHost: ptr.To(true)},
 				SKU:               validSKU,
 			},
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
+			expect: func(g *WithT, result any) {
 				g.Expect(result).To(BeNil())
 			},
 			expectedError: "reconcile error that cannot be recovered occurred: encryption at host is not supported for VM type Standard_D2v3. Object will not be requeued",
+		},
+		{
+			name: "creating a trusted launch vm without the SecurityType set to TrustedLaunch fails",
+			spec: &VMSpec{
+				Name:              "my-vm",
+				Role:              infrav1.Node,
+				NICIDs:            []string{"my-nic"},
+				SSHKeyData:        "fakesshpublickey",
+				Size:              "Standard_D2v3",
+				AvailabilitySetID: "fake-availability-set-id",
+				Zone:              "",
+				Image:             &infrav1.Image{ID: ptr.To("fake-image-id")},
+				OSDisk: infrav1.OSDisk{
+					OSType:     "Linux",
+					DiskSizeGB: ptr.To[int32](128),
+					ManagedDisk: &infrav1.ManagedDiskParameters{
+						StorageAccountType: string(armcompute.StorageAccountTypesPremiumLRS),
+					},
+				},
+				SecurityProfile: &infrav1.SecurityProfile{
+					SecurityType: "",
+					UefiSettings: &infrav1.UefiSettings{
+						SecureBootEnabled: ptr.To(false),
+						VTpmEnabled:       ptr.To(true),
+					},
+				},
+				SKU: validSKUWithConfidentialComputingType,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeNil())
+			},
+			expectedError: "reconcile error that cannot be recovered occurred: securityType should be set to TrustedLaunch when vTpmEnabled is true. Object will not be requeued",
+		},
+		{
+			name: "creating a trusted launch vm with secure boot enabled on unsupported VM type fails",
+			spec: &VMSpec{
+				Name:              "my-vm",
+				Role:              infrav1.Node,
+				NICIDs:            []string{"my-nic"},
+				SSHKeyData:        "fakesshpublickey",
+				Size:              "Standard_D2v3",
+				AvailabilitySetID: "fake-availability-set-id",
+				Zone:              "",
+				Image:             &infrav1.Image{ID: ptr.To("fake-image-id")},
+				SecurityProfile: &infrav1.SecurityProfile{
+					SecurityType: infrav1.SecurityTypesTrustedLaunch,
+					UefiSettings: &infrav1.UefiSettings{
+						SecureBootEnabled: ptr.To(true),
+					},
+				},
+				SKU: validSKUWithTrustedLaunchDisabled,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeNil())
+			},
+			expectedError: "reconcile error that cannot be recovered occurred: secure boot is not supported for VM type Standard_D2v3. Object will not be requeued",
+		},
+		{
+			name: "creating a trusted launch vm with vTPM enabled on unsupported VM type fails",
+			spec: &VMSpec{
+				Name:              "my-vm",
+				Role:              infrav1.Node,
+				NICIDs:            []string{"my-nic"},
+				SSHKeyData:        "fakesshpublickey",
+				Size:              "Standard_D2v3",
+				AvailabilitySetID: "fake-availability-set-id",
+				Zone:              "",
+				Image:             &infrav1.Image{ID: ptr.To("fake-image-id")},
+				SecurityProfile: &infrav1.SecurityProfile{
+					SecurityType: infrav1.SecurityTypesTrustedLaunch,
+					UefiSettings: &infrav1.UefiSettings{
+						VTpmEnabled: ptr.To(true),
+					},
+				},
+				SKU: validSKUWithTrustedLaunchDisabled,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeNil())
+			},
+			expectedError: "reconcile error that cannot be recovered occurred: vTPM is not supported for VM type Standard_D2v3. Object will not be requeued",
+		},
+		{
+			name: "creating a confidential vm with securityTypeEncryption DiskWithVMGuestState and encryption at host enabled fails",
+			spec: &VMSpec{
+				Name:              "my-vm",
+				Role:              infrav1.Node,
+				NICIDs:            []string{"my-nic"},
+				SSHKeyData:        "fakesshpublickey",
+				Size:              "Standard_D2v3",
+				AvailabilitySetID: "fake-availability-set-id",
+				Zone:              "",
+				Image:             &infrav1.Image{ID: ptr.To("fake-image-id")},
+				OSDisk: infrav1.OSDisk{
+					OSType:     "Linux",
+					DiskSizeGB: ptr.To[int32](128),
+					ManagedDisk: &infrav1.ManagedDiskParameters{
+						StorageAccountType: string(armcompute.StorageAccountTypesPremiumLRS),
+						SecurityProfile: &infrav1.VMDiskSecurityProfile{
+							SecurityEncryptionType: infrav1.SecurityEncryptionTypeDiskWithVMGuestState,
+						},
+					},
+				},
+				SecurityProfile: &infrav1.SecurityProfile{
+					EncryptionAtHost: ptr.To(true),
+					SecurityType:     infrav1.SecurityTypesConfidentialVM,
+					UefiSettings: &infrav1.UefiSettings{
+						VTpmEnabled: ptr.To(true),
+					},
+				},
+				SKU: validSKUWithConfidentialComputingType,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeNil())
+			},
+			expectedError: "reconcile error that cannot be recovered occurred: encryption at host is not supported when securityEncryptionType is set to DiskWithVMGuestState. Object will not be requeued",
+		},
+		{
+			name: "creating a confidential vm with DiskWithVMGuestState encryption type and secure boot disabled fails",
+			spec: &VMSpec{
+				Name:              "my-vm",
+				Role:              infrav1.Node,
+				NICIDs:            []string{"my-nic"},
+				SSHKeyData:        "fakesshpublickey",
+				Size:              "Standard_D2v3",
+				AvailabilitySetID: "fake-availability-set-id",
+				Zone:              "",
+				Image:             &infrav1.Image{ID: ptr.To("fake-image-id")},
+				OSDisk: infrav1.OSDisk{
+					OSType:     "Linux",
+					DiskSizeGB: ptr.To[int32](128),
+					ManagedDisk: &infrav1.ManagedDiskParameters{
+						StorageAccountType: string(armcompute.StorageAccountTypesPremiumLRS),
+						SecurityProfile: &infrav1.VMDiskSecurityProfile{
+							SecurityEncryptionType: infrav1.SecurityEncryptionTypeDiskWithVMGuestState,
+						},
+					},
+				},
+				SecurityProfile: &infrav1.SecurityProfile{
+					SecurityType: infrav1.SecurityTypesConfidentialVM,
+					UefiSettings: &infrav1.UefiSettings{
+						SecureBootEnabled: ptr.To(false),
+						VTpmEnabled:       ptr.To(true),
+					},
+				},
+				SKU: validSKUWithConfidentialComputingType,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeNil())
+			},
+			expectedError: "reconcile error that cannot be recovered occurred: secureBootEnabled should be true when securityEncryptionType is set to DiskWithVMGuestState. Object will not be requeued",
+		},
+		{
+			name: "creating a confidential vm with vTPM disabled fails",
+			spec: &VMSpec{
+				Name:              "my-vm",
+				Role:              infrav1.Node,
+				NICIDs:            []string{"my-nic"},
+				SSHKeyData:        "fakesshpublickey",
+				Size:              "Standard_D2v3",
+				AvailabilitySetID: "fake-availability-set-id",
+				Zone:              "",
+				Image:             &infrav1.Image{ID: ptr.To("fake-image-id")},
+				OSDisk: infrav1.OSDisk{
+					OSType:     "Linux",
+					DiskSizeGB: ptr.To[int32](128),
+					ManagedDisk: &infrav1.ManagedDiskParameters{
+						StorageAccountType: string(armcompute.StorageAccountTypesPremiumLRS),
+						SecurityProfile: &infrav1.VMDiskSecurityProfile{
+							SecurityEncryptionType: infrav1.SecurityEncryptionTypeVMGuestStateOnly,
+						},
+					},
+				},
+				SecurityProfile: &infrav1.SecurityProfile{
+					SecurityType: infrav1.SecurityTypesConfidentialVM,
+					UefiSettings: &infrav1.UefiSettings{
+						VTpmEnabled: ptr.To(false),
+					},
+				},
+				SKU: validSKUWithConfidentialComputingType,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeNil())
+			},
+			expectedError: "reconcile error that cannot be recovered occurred: vTpmEnabled should be true when securityEncryptionType is set. Object will not be requeued",
+		},
+		{
+			name: "creating a confidential vm with unsupported VM type fails",
+			spec: &VMSpec{
+				Name:              "my-vm",
+				Role:              infrav1.Node,
+				NICIDs:            []string{"my-nic"},
+				SSHKeyData:        "fakesshpublickey",
+				Size:              "Standard_D2v3",
+				AvailabilitySetID: "fake-availability-set-id",
+				Zone:              "",
+				Image:             &infrav1.Image{ID: ptr.To("fake-image-id")},
+				OSDisk: infrav1.OSDisk{
+					OSType:     "Linux",
+					DiskSizeGB: ptr.To[int32](128),
+					ManagedDisk: &infrav1.ManagedDiskParameters{
+						StorageAccountType: string(armcompute.StorageAccountTypesPremiumLRS),
+						SecurityProfile: &infrav1.VMDiskSecurityProfile{
+							SecurityEncryptionType: infrav1.SecurityEncryptionTypeVMGuestStateOnly,
+						},
+					},
+				},
+				SecurityProfile: &infrav1.SecurityProfile{
+					SecurityType: infrav1.SecurityTypesConfidentialVM,
+					UefiSettings: &infrav1.UefiSettings{
+						VTpmEnabled: ptr.To(true),
+					},
+				},
+				SKU: validSKU,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeNil())
+			},
+			expectedError: "reconcile error that cannot be recovered occurred: VM size Standard_D2v3 does not support confidential computing. Select a different VM size or remove the security profile of the OS disk. Object will not be requeued",
 		},
 		{
 			name: "cannot create vm with EphemeralOSDisk if does not support ephemeral os",
@@ -422,22 +955,22 @@ func TestParameters(t *testing.T) {
 				Size:       "Standard_D2v3",
 				OSDisk: infrav1.OSDisk{
 					OSType:     "Linux",
-					DiskSizeGB: to.Int32Ptr(128),
+					DiskSizeGB: ptr.To[int32](128),
 					ManagedDisk: &infrav1.ManagedDiskParameters{
-						StorageAccountType: "Premium_LRS",
+						StorageAccountType: string(armcompute.StorageAccountTypesPremiumLRS),
 					},
 					DiffDiskSettings: &infrav1.DiffDiskSettings{
-						Option: string(compute.DiffDiskOptionsLocal),
+						Option: string(armcompute.DiffDiskOptionsLocal),
 					},
 				},
-				Image: &infrav1.Image{ID: to.StringPtr("fake-image-id")},
+				Image: &infrav1.Image{ID: ptr.To("fake-image-id")},
 				SKU:   validSKU,
 			},
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
+			expect: func(g *WithT, result any) {
 				g.Expect(result).To(BeNil())
 			},
-			expectedError: "reconcile error that cannot be recovered occurred: vm size Standard_D2v3 does not support ephemeral os. select a different vm size or disable ephemeral os. Object will not be requeued",
+			expectedError: "reconcile error that cannot be recovered occurred: VM size Standard_D2v3 does not support ephemeral os. Select a different VM size or disable ephemeral os. Object will not be requeued",
 		},
 		{
 			name: "cannot create vm if vCPU is less than 2",
@@ -447,14 +980,14 @@ func TestParameters(t *testing.T) {
 				NICIDs:     []string{"my-nic"},
 				SSHKeyData: "fakesshpublickey",
 				Size:       "Standard_D2v3",
-				Image:      &infrav1.Image{ID: to.StringPtr("fake-image-id")},
+				Image:      &infrav1.Image{ID: ptr.To("fake-image-id")},
 				SKU:        invalidCPUSKU,
 			},
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
+			expect: func(g *WithT, result any) {
 				g.Expect(result).To(BeNil())
 			},
-			expectedError: "reconcile error that cannot be recovered occurred: vm size should be bigger or equal to at least 2 vCPUs. Object will not be requeued",
+			expectedError: "reconcile error that cannot be recovered occurred: VM size should be bigger or equal to at least 2 vCPUs. Object will not be requeued",
 		},
 		{
 			name: "cannot create vm if memory is less than 2Gi",
@@ -464,14 +997,14 @@ func TestParameters(t *testing.T) {
 				NICIDs:     []string{"my-nic"},
 				SSHKeyData: "fakesshpublickey",
 				Size:       "Standard_D2v3",
-				Image:      &infrav1.Image{ID: to.StringPtr("fake-image-id")},
+				Image:      &infrav1.Image{ID: ptr.To("fake-image-id")},
 				SKU:        invalidMemSKU,
 			},
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
+			expect: func(g *WithT, result any) {
 				g.Expect(result).To(BeNil())
 			},
-			expectedError: "reconcile error that cannot be recovered occurred: vm memory should be bigger or equal to at least 2Gi. Object will not be requeued",
+			expectedError: "reconcile error that cannot be recovered occurred: VM memory should be bigger or equal to at least 2Gi. Object will not be requeued",
 		},
 		{
 			name: "can create a vm with a marketplace image using a plan",
@@ -483,9 +1016,11 @@ func TestParameters(t *testing.T) {
 				Size:       "Standard_D2v3",
 				Image: &infrav1.Image{
 					Marketplace: &infrav1.AzureMarketplaceImage{
-						Publisher:       "fake-publisher",
-						Offer:           "my-offer",
-						SKU:             "sku-id",
+						ImagePlan: infrav1.ImagePlan{
+							Publisher: "fake-publisher",
+							Offer:     "my-offer",
+							SKU:       "sku-id",
+						},
 						Version:         "1.0",
 						ThirdPartyImage: true,
 					},
@@ -493,15 +1028,15 @@ func TestParameters(t *testing.T) {
 				SKU: validSKU,
 			},
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(compute.VirtualMachine{}))
-				g.Expect(result.(compute.VirtualMachine).StorageProfile.ImageReference.Offer).To(Equal(to.StringPtr("my-offer")))
-				g.Expect(result.(compute.VirtualMachine).StorageProfile.ImageReference.Publisher).To(Equal(to.StringPtr("fake-publisher")))
-				g.Expect(result.(compute.VirtualMachine).StorageProfile.ImageReference.Sku).To(Equal(to.StringPtr("sku-id")))
-				g.Expect(result.(compute.VirtualMachine).StorageProfile.ImageReference.Version).To(Equal(to.StringPtr("1.0")))
-				g.Expect(result.(compute.VirtualMachine).Plan.Name).To(Equal(to.StringPtr("sku-id")))
-				g.Expect(result.(compute.VirtualMachine).Plan.Publisher).To(Equal(to.StringPtr("fake-publisher")))
-				g.Expect(result.(compute.VirtualMachine).Plan.Product).To(Equal(to.StringPtr("my-offer")))
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.StorageProfile.ImageReference.Offer).To(Equal(ptr.To("my-offer")))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.StorageProfile.ImageReference.Publisher).To(Equal(ptr.To("fake-publisher")))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.StorageProfile.ImageReference.SKU).To(Equal(ptr.To("sku-id")))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.StorageProfile.ImageReference.Version).To(Equal(ptr.To("1.0")))
+				g.Expect(result.(armcompute.VirtualMachine).Plan.Name).To(Equal(ptr.To("sku-id")))
+				g.Expect(result.(armcompute.VirtualMachine).Plan.Publisher).To(Equal(ptr.To("fake-publisher")))
+				g.Expect(result.(armcompute.VirtualMachine).Plan.Product).To(Equal(ptr.To("my-offer")))
 			},
 			expectedError: "",
 		},
@@ -520,20 +1055,20 @@ func TestParameters(t *testing.T) {
 						Gallery:        "fake-gallery",
 						Name:           "fake-name",
 						Version:        "1.0",
-						Publisher:      to.StringPtr("fake-publisher"),
-						Offer:          to.StringPtr("my-offer"),
-						SKU:            to.StringPtr("sku-id"),
+						Publisher:      ptr.To("fake-publisher"),
+						Offer:          ptr.To("my-offer"),
+						SKU:            ptr.To("sku-id"),
 					},
 				},
 				SKU: validSKU,
 			},
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(compute.VirtualMachine{}))
-				g.Expect(result.(compute.VirtualMachine).StorageProfile.ImageReference.ID).To(Equal(to.StringPtr("/subscriptions/fake-sub-id/resourceGroups/fake-rg/providers/Microsoft.Compute/galleries/fake-gallery/images/fake-name/versions/1.0")))
-				g.Expect(result.(compute.VirtualMachine).Plan.Name).To(Equal(to.StringPtr("sku-id")))
-				g.Expect(result.(compute.VirtualMachine).Plan.Publisher).To(Equal(to.StringPtr("fake-publisher")))
-				g.Expect(result.(compute.VirtualMachine).Plan.Product).To(Equal(to.StringPtr("my-offer")))
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.StorageProfile.ImageReference.ID).To(Equal(ptr.To("/subscriptions/fake-sub-id/resourceGroups/fake-rg/providers/Microsoft.Compute/galleries/fake-gallery/images/fake-name/versions/1.0")))
+				g.Expect(result.(armcompute.VirtualMachine).Plan.Name).To(Equal(ptr.To("sku-id")))
+				g.Expect(result.(armcompute.VirtualMachine).Plan.Publisher).To(Equal(ptr.To("fake-publisher")))
+				g.Expect(result.(armcompute.VirtualMachine).Plan.Product).To(Equal(ptr.To("my-offer")))
 			},
 			expectedError: "",
 		},
@@ -547,35 +1082,35 @@ func TestParameters(t *testing.T) {
 				Size:       "Standard_D2v3",
 				Location:   "test-location",
 				Zone:       "1",
-				Image:      &infrav1.Image{ID: to.StringPtr("fake-image-id")},
+				Image:      &infrav1.Image{ID: ptr.To("fake-image-id")},
 				DataDisks: []infrav1.DataDisk{
 					{
 						NameSuffix: "mydisk",
 						DiskSizeGB: 64,
-						Lun:        to.Int32Ptr(0),
+						Lun:        ptr.To[int32](0),
 					},
 					{
 						NameSuffix: "myDiskWithUltraDisk",
 						DiskSizeGB: 128,
-						Lun:        to.Int32Ptr(1),
+						Lun:        ptr.To[int32](1),
 						ManagedDisk: &infrav1.ManagedDiskParameters{
-							StorageAccountType: "UltraSSD_LRS",
+							StorageAccountType: string(armcompute.StorageAccountTypesUltraSSDLRS),
 						},
 					},
 					{
 						NameSuffix: "myDiskWithManagedDisk",
 						DiskSizeGB: 128,
-						Lun:        to.Int32Ptr(2),
+						Lun:        ptr.To[int32](2),
 						ManagedDisk: &infrav1.ManagedDiskParameters{
-							StorageAccountType: "Premium_LRS",
+							StorageAccountType: string(armcompute.StorageAccountTypesPremiumLRS),
 						},
 					},
 					{
 						NameSuffix: "managedDiskWithEncryption",
 						DiskSizeGB: 128,
-						Lun:        to.Int32Ptr(3),
+						Lun:        ptr.To[int32](3),
 						ManagedDisk: &infrav1.ManagedDiskParameters{
-							StorageAccountType: "Premium_LRS",
+							StorageAccountType: string(armcompute.StorageAccountTypesPremiumLRS),
 							DiskEncryptionSet: &infrav1.DiskEncryptionSetParameters{
 								ID: "my_id",
 							},
@@ -585,48 +1120,48 @@ func TestParameters(t *testing.T) {
 				SKU: validSKUWithUltraSSD,
 			},
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
-				g.Expect(result).To(BeAssignableToTypeOf(compute.VirtualMachine{}))
-				g.Expect(result.(compute.VirtualMachine).AdditionalCapabilities.UltraSSDEnabled).To(Equal(to.BoolPtr(true)))
-				expectedDataDisks := &[]compute.DataDisk{
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.AdditionalCapabilities.UltraSSDEnabled).To(Equal(ptr.To(true)))
+				expectedDataDisks := []*armcompute.DataDisk{
 					{
-						Lun:          to.Int32Ptr(0),
-						Name:         to.StringPtr("my-ultra-ssd-vm_mydisk"),
-						CreateOption: "Empty",
-						DiskSizeGB:   to.Int32Ptr(64),
+						Lun:          ptr.To[int32](0),
+						Name:         ptr.To("my-ultra-ssd-vm_mydisk"),
+						CreateOption: ptr.To(armcompute.DiskCreateOptionTypesEmpty),
+						DiskSizeGB:   ptr.To[int32](64),
 					},
 					{
-						Lun:          to.Int32Ptr(1),
-						Name:         to.StringPtr("my-ultra-ssd-vm_myDiskWithUltraDisk"),
-						CreateOption: "Empty",
-						DiskSizeGB:   to.Int32Ptr(128),
-						ManagedDisk: &compute.ManagedDiskParameters{
-							StorageAccountType: "UltraSSD_LRS",
+						Lun:          ptr.To[int32](1),
+						Name:         ptr.To("my-ultra-ssd-vm_myDiskWithUltraDisk"),
+						CreateOption: ptr.To(armcompute.DiskCreateOptionTypesEmpty),
+						DiskSizeGB:   ptr.To[int32](128),
+						ManagedDisk: &armcompute.ManagedDiskParameters{
+							StorageAccountType: ptr.To(armcompute.StorageAccountTypesUltraSSDLRS),
 						},
 					},
 					{
-						Lun:          to.Int32Ptr(2),
-						Name:         to.StringPtr("my-ultra-ssd-vm_myDiskWithManagedDisk"),
-						CreateOption: "Empty",
-						DiskSizeGB:   to.Int32Ptr(128),
-						ManagedDisk: &compute.ManagedDiskParameters{
-							StorageAccountType: "Premium_LRS",
+						Lun:          ptr.To[int32](2),
+						Name:         ptr.To("my-ultra-ssd-vm_myDiskWithManagedDisk"),
+						CreateOption: ptr.To(armcompute.DiskCreateOptionTypesEmpty),
+						DiskSizeGB:   ptr.To[int32](128),
+						ManagedDisk: &armcompute.ManagedDiskParameters{
+							StorageAccountType: ptr.To(armcompute.StorageAccountTypesPremiumLRS),
 						},
 					},
 					{
-						Lun:          to.Int32Ptr(3),
-						Name:         to.StringPtr("my-ultra-ssd-vm_managedDiskWithEncryption"),
-						CreateOption: "Empty",
-						DiskSizeGB:   to.Int32Ptr(128),
-						ManagedDisk: &compute.ManagedDiskParameters{
-							StorageAccountType: "Premium_LRS",
-							DiskEncryptionSet: &compute.DiskEncryptionSetParameters{
-								ID: to.StringPtr("my_id"),
+						Lun:          ptr.To[int32](3),
+						Name:         ptr.To("my-ultra-ssd-vm_managedDiskWithEncryption"),
+						CreateOption: ptr.To(armcompute.DiskCreateOptionTypesEmpty),
+						DiskSizeGB:   ptr.To[int32](128),
+						ManagedDisk: &armcompute.ManagedDiskParameters{
+							StorageAccountType: ptr.To(armcompute.StorageAccountTypesPremiumLRS),
+							DiskEncryptionSet: &armcompute.DiskEncryptionSetParameters{
+								ID: ptr.To("my_id"),
 							},
 						},
 					},
 				}
-				g.Expect(gomockinternal.DiffEq(expectedDataDisks).Matches(result.(compute.VirtualMachine).StorageProfile.DataDisks)).To(BeTrue(), cmp.Diff(expectedDataDisks, result.(compute.VirtualMachine).StorageProfile.DataDisks))
+				g.Expect(gomockinternal.DiffEq(expectedDataDisks).Matches(result.(armcompute.VirtualMachine).Properties.StorageProfile.DataDisks)).To(BeTrue(), cmp.Diff(expectedDataDisks, result.(armcompute.VirtualMachine).Properties.StorageProfile.DataDisks))
 			},
 			expectedError: "",
 		},
@@ -640,33 +1175,362 @@ func TestParameters(t *testing.T) {
 				Size:       "Standard_D2v3",
 				Location:   "test-location",
 				Zone:       "1",
-				Image:      &infrav1.Image{ID: to.StringPtr("fake-image-id")},
+				Image:      &infrav1.Image{ID: ptr.To("fake-image-id")},
 				DataDisks: []infrav1.DataDisk{
 					{
 						NameSuffix: "myDiskWithUltraDisk",
 						DiskSizeGB: 128,
-						Lun:        to.Int32Ptr(1),
+						Lun:        ptr.To[int32](1),
 						ManagedDisk: &infrav1.ManagedDiskParameters{
-							StorageAccountType: "UltraSSD_LRS",
+							StorageAccountType: string(armcompute.StorageAccountTypesUltraSSDLRS),
 						},
 					},
 				},
 				SKU: validSKU,
 			},
 			existing: nil,
-			expect: func(g *WithT, result interface{}) {
+			expect: func(g *WithT, result any) {
 				g.Expect(result).To(BeNil())
 			},
-			expectedError: "reconcile error that cannot be recovered occurred: vm size Standard_D2v3 does not support ultra disks in location test-location. select a different vm size or disable ultra disks. Object will not be requeued",
+			expectedError: "reconcile error that cannot be recovered occurred: VM size Standard_D2v3 does not support ultra disks in location test-location. Select a different VM size or disable ultra disks. Object will not be requeued",
+		},
+		{
+			name: "creates a vm with AdditionalCapabilities.UltraSSDEnabled false, if an ultra disk is specified as data disk but AdditionalCapabilities.UltraSSDEnabled is false",
+			spec: &VMSpec{
+				Name:       "my-ultra-ssd-vm",
+				Role:       infrav1.Node,
+				NICIDs:     []string{"my-nic"},
+				SSHKeyData: "fakesshpublickey",
+				Size:       "Standard_D2v3",
+				Location:   "test-location",
+				Zone:       "1",
+				Image:      &infrav1.Image{ID: ptr.To("fake-image-id")},
+				AdditionalCapabilities: &infrav1.AdditionalCapabilities{
+					UltraSSDEnabled: ptr.To(false),
+				},
+				DataDisks: []infrav1.DataDisk{
+					{
+						NameSuffix: "myDiskWithUltraDisk",
+						DiskSizeGB: 128,
+						Lun:        ptr.To[int32](1),
+						ManagedDisk: &infrav1.ManagedDiskParameters{
+							StorageAccountType: string(armcompute.StorageAccountTypesUltraSSDLRS),
+						},
+					},
+				},
+				SKU: validSKUWithUltraSSD,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.AdditionalCapabilities.UltraSSDEnabled).To(Equal(ptr.To(false)))
+				expectedDataDisks := []*armcompute.DataDisk{
+					{
+						Lun:          ptr.To[int32](1),
+						Name:         ptr.To("my-ultra-ssd-vm_myDiskWithUltraDisk"),
+						CreateOption: ptr.To(armcompute.DiskCreateOptionTypesEmpty),
+						DiskSizeGB:   ptr.To[int32](128),
+						ManagedDisk: &armcompute.ManagedDiskParameters{
+							StorageAccountType: ptr.To(armcompute.StorageAccountTypesUltraSSDLRS),
+						},
+					},
+				}
+				g.Expect(gomockinternal.DiffEq(expectedDataDisks).Matches(result.(armcompute.VirtualMachine).Properties.StorageProfile.DataDisks)).To(BeTrue(), cmp.Diff(expectedDataDisks, result.(armcompute.VirtualMachine).Properties.StorageProfile.DataDisks))
+			},
+			expectedError: "",
+		},
+		{
+			name: "creates a vm with AdditionalCapabilities.UltraSSDEnabled true, if an ultra disk is specified as data disk and no AdditionalCapabilities.UltraSSDEnabled is set",
+			spec: &VMSpec{
+				Name:       "my-ultra-ssd-vm",
+				Role:       infrav1.Node,
+				NICIDs:     []string{"my-nic"},
+				SSHKeyData: "fakesshpublickey",
+				Size:       "Standard_D2v3",
+				Location:   "test-location",
+				Zone:       "1",
+				Image:      &infrav1.Image{ID: ptr.To("fake-image-id")},
+				DataDisks: []infrav1.DataDisk{
+					{
+						NameSuffix: "myDiskWithUltraDisk",
+						DiskSizeGB: 128,
+						Lun:        ptr.To[int32](1),
+						ManagedDisk: &infrav1.ManagedDiskParameters{
+							StorageAccountType: string(armcompute.StorageAccountTypesUltraSSDLRS),
+						},
+					},
+				},
+				SKU: validSKUWithUltraSSD,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.AdditionalCapabilities.UltraSSDEnabled).To(Equal(ptr.To(true)))
+				expectedDataDisks := []*armcompute.DataDisk{
+					{
+						Lun:          ptr.To[int32](1),
+						Name:         ptr.To("my-ultra-ssd-vm_myDiskWithUltraDisk"),
+						CreateOption: ptr.To(armcompute.DiskCreateOptionTypesEmpty),
+						DiskSizeGB:   ptr.To[int32](128),
+						ManagedDisk: &armcompute.ManagedDiskParameters{
+							StorageAccountType: ptr.To(armcompute.StorageAccountTypesUltraSSDLRS),
+						},
+					},
+				}
+				g.Expect(gomockinternal.DiffEq(expectedDataDisks).Matches(result.(armcompute.VirtualMachine).Properties.StorageProfile.DataDisks)).To(BeTrue(), cmp.Diff(expectedDataDisks, result.(armcompute.VirtualMachine).Properties.StorageProfile.DataDisks))
+			},
+			expectedError: "",
+		},
+		{
+			name: "creates a vm with AdditionalCapabilities.UltraSSDEnabled true, if an ultra disk is specified as data disk and AdditionalCapabilities.UltraSSDEnabled is true",
+			spec: &VMSpec{
+				Name:       "my-ultra-ssd-vm",
+				Role:       infrav1.Node,
+				NICIDs:     []string{"my-nic"},
+				SSHKeyData: "fakesshpublickey",
+				Size:       "Standard_D2v3",
+				Location:   "test-location",
+				Zone:       "1",
+				Image:      &infrav1.Image{ID: ptr.To("fake-image-id")},
+				AdditionalCapabilities: &infrav1.AdditionalCapabilities{
+					UltraSSDEnabled: ptr.To(true),
+				},
+				DataDisks: []infrav1.DataDisk{
+					{
+						NameSuffix: "myDiskWithUltraDisk",
+						DiskSizeGB: 128,
+						Lun:        ptr.To[int32](1),
+						ManagedDisk: &infrav1.ManagedDiskParameters{
+							StorageAccountType: string(armcompute.StorageAccountTypesUltraSSDLRS),
+						},
+					},
+				},
+				SKU: validSKUWithUltraSSD,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.AdditionalCapabilities.UltraSSDEnabled).To(Equal(ptr.To(true)))
+				expectedDataDisks := []*armcompute.DataDisk{
+					{
+						Lun:          ptr.To[int32](1),
+						Name:         ptr.To("my-ultra-ssd-vm_myDiskWithUltraDisk"),
+						CreateOption: ptr.To(armcompute.DiskCreateOptionTypesEmpty),
+						DiskSizeGB:   ptr.To[int32](128),
+						ManagedDisk: &armcompute.ManagedDiskParameters{
+							StorageAccountType: ptr.To(armcompute.StorageAccountTypesUltraSSDLRS),
+						},
+					},
+				}
+				g.Expect(gomockinternal.DiffEq(expectedDataDisks).Matches(result.(armcompute.VirtualMachine).Properties.StorageProfile.DataDisks)).To(BeTrue(), cmp.Diff(expectedDataDisks, result.(armcompute.VirtualMachine).Properties.StorageProfile.DataDisks))
+			},
+			expectedError: "",
+		},
+		{
+			name: "creates a vm with AdditionalCapabilities.UltraSSDEnabled true, if no ultra disk is specified as data disk and AdditionalCapabilities.UltraSSDEnabled is true",
+			spec: &VMSpec{
+				Name:       "my-ultra-ssd-vm",
+				Role:       infrav1.Node,
+				NICIDs:     []string{"my-nic"},
+				SSHKeyData: "fakesshpublickey",
+				Size:       "Standard_D2v3",
+				Location:   "test-location",
+				Zone:       "1",
+				Image:      &infrav1.Image{ID: ptr.To("fake-image-id")},
+				AdditionalCapabilities: &infrav1.AdditionalCapabilities{
+					UltraSSDEnabled: ptr.To(true),
+				},
+				SKU: validSKUWithUltraSSD,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.AdditionalCapabilities.UltraSSDEnabled).To(Equal(ptr.To(true)))
+			},
+			expectedError: "",
+		},
+		{
+			name: "creates a vm with AdditionalCapabilities.UltraSSDEnabled false, if no ultra disk is specified as data disk and AdditionalCapabilities.UltraSSDEnabled is false",
+			spec: &VMSpec{
+				Name:       "my-ultra-ssd-vm",
+				Role:       infrav1.Node,
+				NICIDs:     []string{"my-nic"},
+				SSHKeyData: "fakesshpublickey",
+				Size:       "Standard_D2v3",
+				Location:   "test-location",
+				Zone:       "1",
+				Image:      &infrav1.Image{ID: ptr.To("fake-image-id")},
+				AdditionalCapabilities: &infrav1.AdditionalCapabilities{
+					UltraSSDEnabled: ptr.To(false),
+				},
+				SKU: validSKUWithUltraSSD,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.AdditionalCapabilities.UltraSSDEnabled).To(Equal(ptr.To(false)))
+			},
+			expectedError: "",
+		},
+		{
+			name: "creates a vm with Diagnostics disabled",
+			spec: &VMSpec{
+				Name:       "my-ultra-ssd-vm",
+				Role:       infrav1.Node,
+				NICIDs:     []string{"my-nic"},
+				SSHKeyData: "fakesshpublickey",
+				Size:       "Standard_D2v3",
+				Location:   "test-location",
+				Zone:       "1",
+				Image:      &infrav1.Image{ID: ptr.To("fake-image-id")},
+				DiagnosticsProfile: &infrav1.Diagnostics{
+					Boot: &infrav1.BootDiagnostics{
+						StorageAccountType: infrav1.DisabledDiagnosticsStorage,
+					},
+				},
+				SKU: validSKUWithUltraSSD,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.DiagnosticsProfile.BootDiagnostics.Enabled).To(Equal(ptr.To(false)))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.DiagnosticsProfile.BootDiagnostics.StorageURI).To(BeNil())
+			},
+			expectedError: "",
+		},
+		{
+			name: "creates a vm with Managed Diagnostics enabled",
+			spec: &VMSpec{
+				Name:       "my-ultra-ssd-vm",
+				Role:       infrav1.Node,
+				NICIDs:     []string{"my-nic"},
+				SSHKeyData: "fakesshpublickey",
+				Size:       "Standard_D2v3",
+				Location:   "test-location",
+				Zone:       "1",
+				Image:      &infrav1.Image{ID: ptr.To("fake-image-id")},
+				DiagnosticsProfile: &infrav1.Diagnostics{
+					Boot: &infrav1.BootDiagnostics{
+						StorageAccountType: infrav1.ManagedDiagnosticsStorage,
+					},
+				},
+				SKU: validSKUWithUltraSSD,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.DiagnosticsProfile.BootDiagnostics.Enabled).To(Equal(ptr.To(true)))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.DiagnosticsProfile.BootDiagnostics.StorageURI).To(BeNil())
+			},
+			expectedError: "",
+		},
+		{
+			name: "creates a vm with User Managed Diagnostics enabled",
+			spec: &VMSpec{
+				Name:       "my-ultra-ssd-vm",
+				Role:       infrav1.Node,
+				NICIDs:     []string{"my-nic"},
+				SSHKeyData: "fakesshpublickey",
+				Size:       "Standard_D2v3",
+				Location:   "test-location",
+				Zone:       "1",
+				Image:      &infrav1.Image{ID: ptr.To("fake-image-id")},
+				DiagnosticsProfile: &infrav1.Diagnostics{
+					Boot: &infrav1.BootDiagnostics{
+						StorageAccountType: infrav1.UserManagedDiagnosticsStorage,
+						UserManaged: &infrav1.UserManagedBootDiagnostics{
+							StorageAccountURI: "aaa",
+						},
+					},
+				},
+				SKU: validSKUWithUltraSSD,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.DiagnosticsProfile.BootDiagnostics.Enabled).To(Equal(ptr.To(true)))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.DiagnosticsProfile.BootDiagnostics.StorageURI).To(Equal(ptr.To("aaa")))
+			},
+			expectedError: "",
+		},
+		{
+			name: "creates a vm with User Managed Diagnostics enabled, but missing StorageAccountURI",
+			spec: &VMSpec{
+				Name:       "my-ultra-ssd-vm",
+				Role:       infrav1.Node,
+				NICIDs:     []string{"my-nic"},
+				SSHKeyData: "fakesshpublickey",
+				Size:       "Standard_D2v3",
+				Location:   "test-location",
+				Zone:       "1",
+				Image:      &infrav1.Image{ID: ptr.To("fake-image-id")},
+				DiagnosticsProfile: &infrav1.Diagnostics{
+					Boot: &infrav1.BootDiagnostics{
+						StorageAccountType: infrav1.UserManagedDiagnosticsStorage,
+						UserManaged: &infrav1.UserManagedBootDiagnostics{
+							StorageAccountURI: "aaa",
+						},
+					},
+				},
+				SKU: validSKUWithUltraSSD,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.DiagnosticsProfile.BootDiagnostics.Enabled).To(Equal(ptr.To(true)))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.DiagnosticsProfile.BootDiagnostics.StorageURI).To(Equal(ptr.To("aaa")))
+			},
+			expectedError: "",
+		},
+		{
+			name: "creates a vm and associate it with a capacity reservation group",
+			spec: &VMSpec{
+				Name:                       "my-vm",
+				Role:                       infrav1.Node,
+				NICIDs:                     []string{"my-nic"},
+				SSHKeyData:                 "fakesshpublickey",
+				Size:                       "Standard_D2v3",
+				Location:                   "test-location",
+				Zone:                       "1",
+				Image:                      &infrav1.Image{ID: ptr.To("fake-image-id")},
+				CapacityReservationGroupID: "my-crg-id",
+				SKU:                        validSKU,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.CapacityReservation.CapacityReservationGroup.ID).To(Equal(ptr.To("my-crg-id")))
+			},
+			expectedError: "",
+		},
+		{
+			name: "creates a vm without capacity reservation group",
+			spec: &VMSpec{
+				Name:                       "my-vm",
+				Role:                       infrav1.Node,
+				NICIDs:                     []string{"my-nic"},
+				SSHKeyData:                 "fakesshpublickey",
+				Size:                       "Standard_D2v3",
+				Location:                   "test-location",
+				Zone:                       "1",
+				Image:                      &infrav1.Image{ID: ptr.To("fake-image-id")},
+				CapacityReservationGroupID: "",
+				SKU:                        validSKU,
+			},
+			existing: nil,
+			expect: func(g *WithT, result any) {
+				g.Expect(result).To(BeAssignableToTypeOf(armcompute.VirtualMachine{}))
+				g.Expect(result.(armcompute.VirtualMachine).Properties.CapacityReservation).To(BeNil())
+			},
+			expectedError: "",
 		},
 	}
 	for _, tc := range testcases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 			t.Parallel()
 
-			result, err := tc.spec.Parameters(tc.existing)
+			result, err := tc.spec.Parameters(t.Context(), tc.existing)
 			if tc.expectedError != "" {
 				g.Expect(err).To(HaveOccurred())
 				g.Expect(err).To(MatchError(tc.expectedError))

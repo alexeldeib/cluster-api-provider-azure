@@ -18,171 +18,186 @@ package scope
 
 import (
 	"context"
-	"fmt"
+	"os"
 	"reflect"
+	"slices"
+	"strings"
 
-	"k8s.io/apimachinery/pkg/types"
-
-	"github.com/Azure/go-autorest/autorest"
-	"github.com/Azure/go-autorest/autorest/adal"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/tracing/azotel"
 	"github.com/pkg/errors"
-	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
-	infrav1exp "sigs.k8s.io/cluster-api-provider-azure/exp/api/v1beta1"
-	"sigs.k8s.io/cluster-api-provider-azure/util/identity"
-	"sigs.k8s.io/cluster-api-provider-azure/util/system"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
-	clusterctl "sigs.k8s.io/cluster-api/cmd/clusterctl/api/v1alpha3"
+	"go.opentelemetry.io/otel"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	aadpodv1 "github.com/Azure/aad-pod-identity/pkg/apis/aadpodidentity/v1"
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
+	"sigs.k8s.io/cluster-api-provider-azure/azure"
+	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
 )
 
-const azureSecretKey = "clientSecret"
+// AzureSecretKey is the value for they client secret key.
+const AzureSecretKey = "clientSecret"
 
 // CredentialsProvider defines the behavior for azure identity based credential providers.
 type CredentialsProvider interface {
-	GetAuthorizer(ctx context.Context, resourceManagerEndpoint, activeDirectoryEndpoint string) (autorest.Authorizer, error)
 	GetClientID() string
 	GetClientSecret(ctx context.Context) (string, error)
 	GetTenantID() string
+	GetTokenCredential(ctx context.Context, resourceManagerEndpoint, activeDirectoryEndpoint, tokenAudience, subscriptionID string) (azcore.TokenCredential, error)
+	Type() infrav1.IdentityType
 }
 
 // AzureCredentialsProvider represents a credential provider with azure cluster identity.
 type AzureCredentialsProvider struct {
 	Client   client.Client
 	Identity *infrav1.AzureClusterIdentity
+
+	cache azure.CredentialCache
 }
 
-// AzureClusterCredentialsProvider wraps AzureCredentialsProvider with AzureCluster.
-type AzureClusterCredentialsProvider struct {
-	AzureCredentialsProvider
-	AzureCluster *infrav1.AzureCluster
-}
-
-// ManagedControlPlaneCredentialsProvider wraps AzureCredentialsProvider with AzureManagedControlPlane.
-type ManagedControlPlaneCredentialsProvider struct {
-	AzureCredentialsProvider
-	AzureManagedControlPlane *infrav1exp.AzureManagedControlPlane
-}
-
-var _ CredentialsProvider = (*AzureClusterCredentialsProvider)(nil)
-var _ CredentialsProvider = (*ManagedControlPlaneCredentialsProvider)(nil)
-
-// NewAzureClusterCredentialsProvider creates a new AzureClusterCredentialsProvider from the supplied inputs.
-func NewAzureClusterCredentialsProvider(ctx context.Context, kubeClient client.Client, azureCluster *infrav1.AzureCluster) (*AzureClusterCredentialsProvider, error) {
-	if azureCluster.Spec.IdentityRef == nil {
+// NewAzureCredentialsProvider creates a new AzureClusterCredentialsProvider from the supplied inputs.
+func NewAzureCredentialsProvider(ctx context.Context, cache azure.CredentialCache, kubeClient client.Client, identityRef *corev1.ObjectReference, defaultNamespace string) (*AzureCredentialsProvider, error) {
+	if identityRef == nil {
 		return nil, errors.New("failed to generate new AzureClusterCredentialsProvider from empty identityName")
 	}
 
-	ref := azureCluster.Spec.IdentityRef
 	// if the namespace isn't specified then assume it's in the same namespace as the AzureCluster
-	namespace := ref.Namespace
+	namespace := identityRef.Namespace
 	if namespace == "" {
-		namespace = azureCluster.Namespace
+		namespace = defaultNamespace
 	}
 	identity := &infrav1.AzureClusterIdentity{}
-	key := client.ObjectKey{Name: ref.Name, Namespace: namespace}
+	key := client.ObjectKey{Name: identityRef.Name, Namespace: namespace}
 	if err := kubeClient.Get(ctx, key, identity); err != nil {
 		return nil, errors.Errorf("failed to retrieve AzureClusterIdentity external object %q/%q: %v", key.Namespace, key.Name, err)
 	}
 
-	if identity.Spec.Type != infrav1.ServicePrincipal {
-		return nil, errors.New("AzureClusterIdentity is not of type Service Principal")
+	// AzureCLI uses the controller process login. Re-check the allowlist here so
+	// machine and ASO secret reconcilers cannot keep using it after the cluster
+	// namespace is removed from the identity.
+	if identity.Spec.Type == infrav1.AzureCLI && !IsClusterNamespaceAllowed(ctx, kubeClient, identity.Spec.AllowedNamespaces, defaultNamespace) {
+		return nil, errors.New("AzureClusterIdentity list of allowed namespaces doesn't include current cluster namespace")
 	}
 
-	return &AzureClusterCredentialsProvider{
-		AzureCredentialsProvider{
-			Client:   kubeClient,
-			Identity: identity,
-		},
-		azureCluster,
+	return &AzureCredentialsProvider{
+		Client:   kubeClient,
+		Identity: identity,
+		cache:    cache,
 	}, nil
 }
 
-// GetAuthorizer returns an Azure authorizer based on the provided azure identity. It delegates to AzureCredentialsProvider with AzureCluster metadata.
-func (p *AzureClusterCredentialsProvider) GetAuthorizer(ctx context.Context, resourceManagerEndpoint, activeDirectoryEndpoint string) (autorest.Authorizer, error) {
-	return p.AzureCredentialsProvider.GetAuthorizer(ctx, resourceManagerEndpoint, activeDirectoryEndpoint, p.AzureCluster.ObjectMeta)
-}
+// GetTokenCredential returns an Azure TokenCredential based on the provided azure identity.
+func (p *AzureCredentialsProvider) GetTokenCredential(ctx context.Context, resourceManagerEndpoint, activeDirectoryEndpoint, tokenAudience, subscriptionID string) (azcore.TokenCredential, error) {
+	ctx, log, done := tele.StartSpanWithLogger(ctx, "azure.scope.AzureCredentialsProvider.GetTokenCredential")
+	defer done()
 
-// NewManagedControlPlaneCredentialsProvider creates a new ManagedControlPlaneCredentialsProvider from the supplied inputs.
-func NewManagedControlPlaneCredentialsProvider(ctx context.Context, kubeClient client.Client, managedControlPlane *infrav1exp.AzureManagedControlPlane) (*ManagedControlPlaneCredentialsProvider, error) {
-	if managedControlPlane.Spec.IdentityRef == nil {
-		return nil, errors.New("failed to generate new ManagedControlPlaneCredentialsProvider from empty identityName")
-	}
+	var authErr error
+	var cred azcore.TokenCredential
 
-	ref := managedControlPlane.Spec.IdentityRef
-	// if the namespace isn't specified then assume it's in the same namespace as the AzureManagedControlPlane
-	namespace := ref.Namespace
-	if namespace == "" {
-		namespace = managedControlPlane.Namespace
-	}
-	identity := &infrav1.AzureClusterIdentity{}
-	key := client.ObjectKey{Name: ref.Name, Namespace: namespace}
-	if err := kubeClient.Get(ctx, key, identity); err != nil {
-		return nil, errors.Errorf("failed to retrieve AzureClusterIdentity external object %q/%q: %v", key.Namespace, key.Name, err)
-	}
+	tracingProvider := azotel.NewTracingProvider(otel.GetTracerProvider(), nil)
 
-	if identity.Spec.Type != infrav1.ServicePrincipal {
-		return nil, errors.New("AzureClusterIdentity is not of type Service Principal")
-	}
-
-	return &ManagedControlPlaneCredentialsProvider{
-		AzureCredentialsProvider{
-			Client:   kubeClient,
-			Identity: identity,
+	// Every credential type must target the resolved Azure environment (ARM
+	// endpoint, token audience, and AAD authority). For air-gapped clouds such as
+	// USSec (IL6) these values are discovered at runtime and AAD instance
+	// discovery must be disabled, because the public login.microsoftonline.com
+	// metadata endpoint used to validate the authority is unreachable.
+	clientOpts := azcore.ClientOptions{
+		TracingProvider: tracingProvider,
+		Cloud: cloud.Configuration{
+			ActiveDirectoryAuthorityHost: activeDirectoryEndpoint,
+			Services: map[cloud.ServiceName]cloud.ServiceConfiguration{
+				cloud.ResourceManager: {
+					Audience: tokenAudience,
+					Endpoint: resourceManagerEndpoint,
+				},
+			},
 		},
-		managedControlPlane,
-	}, nil
-}
+	}
+	disableInstanceDiscovery := azure.ShouldDisableInstanceDiscovery(activeDirectoryEndpoint)
 
-// GetAuthorizer returns an Azure authorizer based on the provided azure identity. It delegates to AzureCredentialsProvider with AzureManagedControlPlane metadata.
-func (p *ManagedControlPlaneCredentialsProvider) GetAuthorizer(ctx context.Context, resourceManagerEndpoint, activeDirectoryEndpoint string) (autorest.Authorizer, error) {
-	return p.AzureCredentialsProvider.GetAuthorizer(ctx, resourceManagerEndpoint, activeDirectoryEndpoint, p.AzureManagedControlPlane.ObjectMeta)
-}
-
-// GetAuthorizer returns an Azure authorizer based on the provided azure identity and cluster metadata.
-func (p *AzureCredentialsProvider) GetAuthorizer(ctx context.Context, resourceManagerEndpoint, activeDirectoryEndpoint string, clusterMeta metav1.ObjectMeta) (autorest.Authorizer, error) {
-	var spt *adal.ServicePrincipalToken
 	switch p.Identity.Spec.Type {
-	case infrav1.ServicePrincipal:
-		if err := createAzureIdentityWithBindings(ctx, p.Identity, resourceManagerEndpoint, activeDirectoryEndpoint, clusterMeta, p.Client); err != nil {
-			return nil, err
-		}
-
-		msiEndpoint, err := adal.GetMSIVMEndpoint()
-		if err != nil {
-			return nil, errors.Errorf("failed to get MSI endpoint: %v", err)
-		}
-
-		spt, err = adal.NewServicePrincipalTokenFromMSIWithUserAssignedID(msiEndpoint, resourceManagerEndpoint, p.Identity.Spec.ClientID)
-		if err != nil {
-			return nil, errors.Errorf("failed to get token from service principal identity: %v", err)
-		}
+	case infrav1.WorkloadIdentity:
+		cred, authErr = p.cache.GetOrStoreWorkloadIdentity(&azidentity.WorkloadIdentityCredentialOptions{
+			ClientOptions:            clientOpts,
+			DisableInstanceDiscovery: disableInstanceDiscovery,
+			TenantID:                 p.Identity.Spec.TenantID,
+			ClientID:                 p.Identity.Spec.ClientID,
+			TokenFilePath:            GetProjectedTokenPath(),
+		})
 
 	case infrav1.ManualServicePrincipal:
-		oauthConfig, err := adal.NewOAuthConfig(activeDirectoryEndpoint, p.GetTenantID())
-		if err != nil {
-			return nil, err
-		}
-
+		log.Info("Identity type ManualServicePrincipal is deprecated and will be removed in a future release. See https://capz.sigs.k8s.io/topics/identities to find a supported identity type.")
+		fallthrough
+	case infrav1.ServicePrincipal:
 		clientSecret, err := p.GetClientSecret(ctx)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to get client secret")
 		}
-
-		spt, err = adal.NewServicePrincipalToken(*oauthConfig, p.Identity.Spec.ClientID, clientSecret, resourceManagerEndpoint)
-		if err != nil {
-			return nil, errors.Errorf("failed to get token from service principal identity: %v", err)
+		options := azidentity.ClientSecretCredentialOptions{
+			ClientOptions:            clientOpts,
+			DisableInstanceDiscovery: disableInstanceDiscovery,
 		}
+		cred, authErr = p.cache.GetOrStoreClientSecret(p.GetTenantID(), p.Identity.Spec.ClientID, clientSecret, &options)
+
+	case infrav1.ServicePrincipalCertificate:
+		var certsContent []byte
+		if p.Identity.Spec.CertPath != "" {
+			var err error
+			certsContent, err = os.ReadFile(p.Identity.Spec.CertPath)
+			if err != nil {
+				return nil, errors.Wrap(err, "failed to read certificate file")
+			}
+		} else {
+			clientSecret, err := p.GetClientSecret(ctx)
+			if err != nil {
+				return nil, errors.Wrap(err, "failed to get client secret")
+			}
+			certsContent = []byte(clientSecret)
+		}
+		cred, authErr = p.cache.GetOrStoreClientCert(p.GetTenantID(), p.Identity.Spec.ClientID, certsContent, nil, &azidentity.ClientCertificateCredentialOptions{
+			ClientOptions:            clientOpts,
+			DisableInstanceDiscovery: disableInstanceDiscovery,
+		})
+
+	case infrav1.UserAssignedMSI:
+		options := azidentity.ManagedIdentityCredentialOptions{
+			ClientOptions: azcore.ClientOptions{
+				TracingProvider: tracingProvider,
+			},
+			ID: azidentity.ClientID(p.Identity.Spec.ClientID),
+		}
+		cred, authErr = p.cache.GetOrStoreManagedIdentity(&options)
+
+	case infrav1.AzureCLI:
+		cred, authErr = p.cache.GetOrStoreAzureCLI(azureCLICredentialOptions(subscriptionID, p.Identity.Spec.TenantID))
+
+	case infrav1.UserAssignedIdentityCredential:
+		cloudType, err := parseCloudType(p.Identity.Spec.UserAssignedIdentityCredentialsCloudType)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to parse cloud type")
+		}
+		clientOptions := azcore.ClientOptions{
+			TracingProvider: tracingProvider,
+			Cloud:           cloudType,
+		}
+		// Using context.Background() here as something is cancelling the context prematurely in the ctx passed into the
+		// function. This authentication method is long lived and has built in capabilities to rotate the certificates
+		// when they change.
+		cred, authErr = p.cache.GetOrStoreUserAssignedManagedIdentityCredentials(context.Background(), p.Identity.Spec.UserAssignedIdentityCredentialsPath, clientOptions, &log)
 
 	default:
 		return nil, errors.Errorf("identity type %s not supported", p.Identity.Spec.Type)
 	}
 
-	return autorest.NewBearerAuthorizer(spt), nil
+	if authErr != nil {
+		return nil, errors.Errorf("failed to create credential: %v", authErr)
+	}
+
+	return cred, nil
 }
 
 // GetClientID returns the Client ID associated with the AzureCredentialsProvider's Identity.
@@ -194,17 +209,20 @@ func (p *AzureCredentialsProvider) GetClientID() string {
 // NOTE: this only works if the Identity references a Service Principal Client Secret.
 // If using another type of credentials, such a Certificate, we return an empty string.
 func (p *AzureCredentialsProvider) GetClientSecret(ctx context.Context) (string, error) {
-	secretRef := p.Identity.Spec.ClientSecret
-	key := types.NamespacedName{
-		Namespace: secretRef.Namespace,
-		Name:      secretRef.Name,
-	}
-	secret := &corev1.Secret{}
+	if p.hasClientSecret() {
+		secretRef := p.Identity.Spec.ClientSecret
+		key := types.NamespacedName{
+			Namespace: secretRef.Namespace,
+			Name:      secretRef.Name,
+		}
+		secret := &corev1.Secret{}
 
-	if err := p.Client.Get(ctx, key, secret); err != nil {
-		return "", errors.Wrap(err, "Unable to fetch ClientSecret")
+		if err := p.Client.Get(ctx, key, secret); err != nil {
+			return "", errors.Wrap(err, "Unable to fetch ClientSecret")
+		}
+		return string(secret.Data[AzureSecretKey]), nil
 	}
-	return string(secret.Data[azureSecretKey]), nil
+	return "", nil
 }
 
 // GetTenantID returns the Tenant ID associated with the AzureCredentialsProvider's Identity.
@@ -212,86 +230,22 @@ func (p *AzureCredentialsProvider) GetTenantID() string {
 	return p.Identity.Spec.TenantID
 }
 
-func createAzureIdentityWithBindings(ctx context.Context, azureIdentity *infrav1.AzureClusterIdentity, resourceManagerEndpoint, activeDirectoryEndpoint string, clusterMeta metav1.ObjectMeta,
-	kubeClient client.Client) error {
-	azureIdentityType, err := getAzureIdentityType(azureIdentity)
-	if err != nil {
-		return err
-	}
-
-	// AzureIdentity and AzureIdentityBinding will no longer have an OwnerRef starting from capz release v0.5.0 because of the following:
-	// In Kubenetes v1.20+, if the garbage collector detects an invalid cross-namespace ownerReference, or a cluster-scoped dependent with
-	// an ownerReference referencing a namespaced kind, a warning Event with a reason of OwnerRefInvalidNamespace and an involvedObject
-	// of the invalid dependent is reported. You can check for that kind of Event by running kubectl get events -A --field-selector=reason=OwnerRefInvalidNamespace.
-
-	copiedIdentity := &aadpodv1.AzureIdentity{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "AzureIdentity",
-			APIVersion: "aadpodidentity.k8s.io/v1",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      identity.GetAzureIdentityName(clusterMeta.Name, clusterMeta.Namespace, azureIdentity.Name),
-			Namespace: system.GetManagerNamespace(),
-			Annotations: map[string]string{
-				aadpodv1.BehaviorKey: "namespaced",
-			},
-			Labels: map[string]string{
-				clusterv1.ClusterLabelName:                  clusterMeta.Name,
-				infrav1.ClusterLabelNamespace:               clusterMeta.Namespace,
-				clusterctl.ClusterctlMoveHierarchyLabelName: "true",
-			},
-		},
-		Spec: aadpodv1.AzureIdentitySpec{
-			Type:           azureIdentityType,
-			TenantID:       azureIdentity.Spec.TenantID,
-			ClientID:       azureIdentity.Spec.ClientID,
-			ClientPassword: azureIdentity.Spec.ClientSecret,
-			ResourceID:     azureIdentity.Spec.ResourceID,
-			ADResourceID:   resourceManagerEndpoint,
-			ADEndpoint:     activeDirectoryEndpoint,
-		},
-	}
-	err = kubeClient.Create(ctx, copiedIdentity)
-	if err != nil && !apierrors.IsAlreadyExists(err) {
-		return errors.Errorf("failed to create copied AzureIdentity %s in %s: %v", copiedIdentity.Name, system.GetManagerNamespace(), err)
-	}
-
-	azureIdentityBinding := &aadpodv1.AzureIdentityBinding{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "AzureIdentityBinding",
-			APIVersion: "aadpodidentity.k8s.io/v1",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-binding", copiedIdentity.Name),
-			Namespace: copiedIdentity.Namespace,
-			Labels: map[string]string{
-				clusterv1.ClusterLabelName:                  clusterMeta.Name,
-				infrav1.ClusterLabelNamespace:               clusterMeta.Namespace,
-				clusterctl.ClusterctlMoveHierarchyLabelName: "true",
-			},
-		},
-		Spec: aadpodv1.AzureIdentityBindingSpec{
-			AzureIdentity: copiedIdentity.Name,
-			Selector:      infrav1.AzureIdentityBindingSelector, //should be same as selector added on controller
-		},
-	}
-	err = kubeClient.Create(ctx, azureIdentityBinding)
-	if err != nil && !apierrors.IsAlreadyExists(err) {
-		return errors.Errorf("failed to create AzureIdentityBinding %s in %s: %v", copiedIdentity.Name, system.GetManagerNamespace(), err)
-	}
-
-	return nil
+// Type returns the auth mechanism used.
+func (p *AzureCredentialsProvider) Type() infrav1.IdentityType {
+	return p.Identity.Spec.Type
 }
 
-func getAzureIdentityType(identity *infrav1.AzureClusterIdentity) (aadpodv1.IdentityType, error) {
-	switch identity.Spec.Type {
-	case infrav1.ServicePrincipal:
-		return aadpodv1.ServicePrincipal, nil
-	case infrav1.UserAssignedMSI:
-		return aadpodv1.UserAssignedMSI, nil
+// hasClientSecret returns true if the identity has a Service Principal Client Secret.
+// This does not include managed identities.
+func (p *AzureCredentialsProvider) hasClientSecret() bool {
+	switch p.Identity.Spec.Type {
+	case infrav1.ServicePrincipal, infrav1.ManualServicePrincipal:
+		return true
+	case infrav1.ServicePrincipalCertificate:
+		return p.Identity.Spec.CertPath == ""
+	default:
+		return false
 	}
-
-	return 0, errors.New("AzureIdentity does not have a vaild type")
 }
 
 // IsClusterNamespaceAllowed indicates if the cluster namespace is allowed.
@@ -305,10 +259,8 @@ func IsClusterNamespaceAllowed(ctx context.Context, k8sClient client.Client, all
 		return true
 	}
 
-	for _, v := range allowedNamespaces.NamespaceList {
-		if v == namespace {
-			return true
-		}
+	if slices.Contains(allowedNamespaces.NamespaceList, namespace) {
+		return true
 	}
 
 	// Check if clusterNamespace is in the namespaces selected by the identity's allowedNamespaces selector.
@@ -334,4 +286,39 @@ func IsClusterNamespaceAllowed(ctx context.Context, k8sClient client.Client, all
 	}
 
 	return false
+}
+
+// azureCLICredentialOptions sets Subscription or TenantID, never both.
+// az account get-access-token rejects --tenant and --subscription together.
+func azureCLICredentialOptions(subscriptionID, tenantID string) *azidentity.AzureCLICredentialOptions {
+	switch {
+	case subscriptionID != "":
+		return &azidentity.AzureCLICredentialOptions{Subscription: subscriptionID}
+	case tenantID != "":
+		return &azidentity.AzureCLICredentialOptions{TenantID: tenantID}
+	default:
+		return &azidentity.AzureCLICredentialOptions{}
+	}
+}
+
+func parseCloudType(cloudType string) (cloud.Configuration, error) {
+	cloudType = strings.ToUpper(cloudType)
+	switch cloudType {
+	case "PUBLIC":
+		return cloud.AzurePublic, nil
+	case "CHINA":
+		return cloud.AzureChina, nil
+	case "USGOVERNMENT":
+		return cloud.AzureGovernment, nil
+	case "USSEC": //nolint:goconst
+		env, err := loadCloudEnvironmentFromFile()
+		if err != nil {
+			return cloud.Configuration{}, errors.Wrap(err, "failed to load cloud environment for USSec")
+		}
+		return cloud.Configuration{
+			ActiveDirectoryAuthorityHost: env.ActiveDirectoryEndpoint,
+		}, nil
+	default:
+		return cloud.AzurePublic, nil
+	}
 }

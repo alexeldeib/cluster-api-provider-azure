@@ -2,60 +2,51 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: default
 resources:
-  - ../prow
-  - ../../../addons/metrics-server/metrics-server-resource-set.yaml
-  - ../../../addons/windows/containerd-logging/containerd-logger-resource-set.yaml
-patchesStrategicMerge:
-  - ../patches/control-plane-image-ci-version.yaml
-  - ../patches/controller-manager.yaml
-  - ../patches/windows-containerd-patch.yaml
-  - ../patches/machine-deployment-worker-counts.yaml
-  - patches/machine-deployment-ci-version.yaml
-  - ../patches/metrics-server-enabled-cluster.yaml
-  - patches/controller-manager-featuregates.yaml
-  - ../patches/windows-containerd-enabled-cluster.yaml
-  - patches/machine-deployment-ci-version-windows-shared-gallery.yaml
+- ../prow
+- ../../../addons/metrics-server/metrics-server-resource-set.yaml
 patches:
-- target:
+- path: patches/oot-credential-provider.yaml
+  target:
     group: bootstrap.cluster.x-k8s.io
-    version: v1beta1
     kind: KubeadmConfigTemplate
     name: .*-md-0
     namespace: default
-  path: patches/kubeadm-bootstrap.yaml
-- target:
-    group: bootstrap.cluster.x-k8s.io
     version: v1beta1
-    kind: KubeadmConfigTemplate
-    name: .*-md-win
-    namespace: default
-  path: patches/kubeadm-bootstrap-windows.yaml
-- target:
+- path: patches/oot-credential-provider-kcp.yaml
+  target:
     group: controlplane.cluster.x-k8s.io
-    version: v1beta1
     kind: KubeadmControlPlane
     name: .*-control-plane
-  path: ../patches/control-plane-kubeadm-boostrap-ci-version.yaml
-- target:
-    group: infrastructure.cluster.x-k8s.io/v1beta1
     version: v1beta1
-    kind: AzureMachineTemplate
-    name: ${CLUSTER_NAME}-md-win
-  path: patches/drop-machine-deployment-windows-image-marketplace.yaml
+- path: patches/kubeadm-bootstrap.yaml
+  target:
+    group: bootstrap.cluster.x-k8s.io
+    kind: KubeadmConfigTemplate
+    name: .*-md-0
+    namespace: default
+    version: v1beta1
+- path: ../patches/control-plane-kubeadm-boostrap-ci-version.yaml
+  target:
+    group: controlplane.cluster.x-k8s.io
+    kind: KubeadmControlPlane
+    name: .*-control-plane
+    version: v1beta1
+- path: ../patches/control-plane-image-ci-version.yaml
+- path: ../patches/controller-manager.yaml
+- path: patches/machine-deployment-ci-version.yaml
+- path: patches/machine-deployment-ci-version-control-plane.yaml
+- path: ../patches/metrics-server-enabled-cluster.yaml
+- path: ../patches/uami-md-0.yaml
 configMapGenerator:
-  - name: cni-${CLUSTER_NAME}-calico
-    behavior: merge
-    files:
-      - kube-proxy-patch=../patches/windows-kubeproxy-ci.yaml
-  - name: metrics-server-${CLUSTER_NAME}
-    files:
-      - metrics-server=../../../addons/metrics-server/metrics-server.yaml
-  - name: containerd-logger-${CLUSTER_NAME}
-    files:
-      - containerd-windows-logger=../../../addons/windows/containerd-logging/containerd-logger.yaml
+- files:
+  - metrics-server=../../../addons/metrics-server/metrics-server.yaml
+  name: metrics-server-${CLUSTER_NAME}
 generatorOptions:
+  annotations:
+    note: generated
   disableNameSuffixHash: true
   labels:
     type: generated
-  annotations:
-    note: generated
+
+sortOptions:
+  order: fifo

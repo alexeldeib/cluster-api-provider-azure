@@ -17,9 +17,11 @@ limitations under the License.
 package inboundnatrules
 
 import (
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-02-01/network"
-	"github.com/Azure/go-autorest/autorest/to"
+	"context"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v4"
 	"github.com/pkg/errors"
+	"k8s.io/utils/ptr"
 )
 
 // InboundNatSpec defines the specification for an inbound NAT rule.
@@ -28,7 +30,7 @@ type InboundNatSpec struct {
 	LoadBalancerName          string
 	ResourceGroup             string
 	FrontendIPConfigurationID *string
-	PortsInUse                map[int32]struct{}
+	SSHFrontendPort           *int32
 }
 
 // ResourceName returns the name of the inbound NAT rule.
@@ -47,12 +49,12 @@ func (s *InboundNatSpec) OwnerResourceName() string {
 }
 
 // Parameters returns the parameters for the inbound NAT rule.
-func (s *InboundNatSpec) Parameters(existing interface{}) (parameters interface{}, err error) {
+func (s *InboundNatSpec) Parameters(_ context.Context, existing any) (parameters any, err error) {
 	if existing != nil {
-		if _, ok := existing.(network.InboundNatRule); !ok {
-			return nil, errors.Errorf("%T is not a network.InboundNatRule", existing)
+		if _, ok := existing.(armnetwork.InboundNatRule); !ok {
+			return nil, errors.Errorf("%T is not an armnetwork.InboundNatRule", existing)
 		}
-
+		// Skip updating the existing inbound NAT rule
 		return nil, nil
 	}
 
@@ -60,29 +62,24 @@ func (s *InboundNatSpec) Parameters(existing interface{}) (parameters interface{
 		return nil, errors.Errorf("FrontendIPConfigurationID is not set")
 	}
 
-	sshFrontendPort, err := getAvailablePort(s.PortsInUse)
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to find available SSH Frontend port for NAT Rule %s in load balancer %s", s.ResourceName(), s.OwnerResourceName())
-	}
-
-	rule := network.InboundNatRule{
-		Name: to.StringPtr(s.ResourceName()),
-		InboundNatRulePropertiesFormat: &network.InboundNatRulePropertiesFormat{
-			BackendPort:          to.Int32Ptr(22),
-			EnableFloatingIP:     to.BoolPtr(false),
-			IdleTimeoutInMinutes: to.Int32Ptr(4),
-			FrontendIPConfiguration: &network.SubResource{
+	rule := armnetwork.InboundNatRule{
+		Name: ptr.To(s.ResourceName()),
+		Properties: &armnetwork.InboundNatRulePropertiesFormat{
+			BackendPort:          ptr.To[int32](22),
+			EnableFloatingIP:     ptr.To(false),
+			IdleTimeoutInMinutes: ptr.To[int32](4),
+			FrontendIPConfiguration: &armnetwork.SubResource{
 				ID: s.FrontendIPConfigurationID,
 			},
-			Protocol:     network.TransportProtocolTCP,
-			FrontendPort: &sshFrontendPort,
+			Protocol:     ptr.To(armnetwork.TransportProtocolTCP),
+			FrontendPort: s.SSHFrontendPort,
 		},
 	}
 
 	return rule, nil
 }
 
-func getAvailablePort(portsInUse map[int32]struct{}) (int32, error) {
+func getAvailableSSHFrontendPort(portsInUse map[int32]struct{}) (int32, error) {
 	// NAT rules need to use a unique port. Since we need one NAT rule per control plane and we expect to have 1, 3, 5, maybe 9 control planes, there should never be more than 9 ports in use.
 	// This is an artificial limit of 20 ports that we can pick from, which should be plenty enough (in reality we should never reach that limit).
 	// These NAT rules are used for SSH purposes which is why we start at 22 and then use 2201, 2202, etc.

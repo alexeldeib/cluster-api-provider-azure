@@ -17,218 +17,169 @@ limitations under the License.
 package securitygroups
 
 import (
-	"context"
-	"net/http"
 	"testing"
 
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-02-01/network"
-	"github.com/Azure/go-autorest/autorest"
-	"github.com/Azure/go-autorest/autorest/to"
-	"github.com/golang/mock/gomock"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v4"
 	. "github.com/onsi/gomega"
+	"github.com/pkg/errors"
+	"go.uber.org/mock/gomock"
+	"k8s.io/utils/ptr"
+
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
+	"sigs.k8s.io/cluster-api-provider-azure/azure/services/async/mock_async"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/services/securitygroups/mock_securitygroups"
 	gomockinternal "sigs.k8s.io/cluster-api-provider-azure/internal/test/matchers/gomock"
+	"sigs.k8s.io/cluster-api-provider-azure/util/reconciler"
+)
+
+var (
+	annotation = azure.SecurityRuleLastAppliedAnnotation
+	fakeNSG    = NSGSpec{
+		Name:        "test-nsg",
+		Location:    "test-location",
+		ClusterName: "my-cluster",
+		SecurityRules: infrav1.SecurityRules{
+			securityRule1,
+		},
+		ResourceGroup: "test-group",
+	}
+	noRulesNSG = NSGSpec{
+		Name:          "test-nsg-2",
+		Location:      "test-location",
+		ClusterName:   "my-cluster",
+		SecurityRules: infrav1.SecurityRules{},
+		ResourceGroup: "test-group",
+	}
+	multipleRulesNSG = NSGSpec{
+		Name:        "multiple-rules-nsg",
+		Location:    "test-location",
+		ClusterName: "my-cluster",
+		SecurityRules: infrav1.SecurityRules{
+			securityRule1,
+			securityRule2,
+		},
+		ResourceGroup: "test-group",
+	}
+	securityRule1 = infrav1.SecurityRule{
+		Name:             "allow_ssh",
+		Description:      "Allow SSH",
+		Priority:         2200,
+		Protocol:         infrav1.SecurityGroupProtocolTCP,
+		Direction:        infrav1.SecurityRuleDirectionInbound,
+		Source:           ptr.To("*"),
+		SourcePorts:      ptr.To("*"),
+		Destination:      ptr.To("*"),
+		DestinationPorts: ptr.To("22"),
+		Action:           infrav1.SecurityRuleActionAllow,
+	}
+	securityRule2 = infrav1.SecurityRule{
+		Name:             "other_rule",
+		Description:      "Test Rule",
+		Priority:         500,
+		Protocol:         infrav1.SecurityGroupProtocolTCP,
+		Direction:        infrav1.SecurityRuleDirectionInbound,
+		Source:           ptr.To("*"),
+		SourcePorts:      ptr.To("*"),
+		Destination:      ptr.To("*"),
+		DestinationPorts: ptr.To("80"),
+		Action:           infrav1.SecurityRuleActionAllow,
+	}
+	errFake      = errors.New("this is an error")
+	notDoneError = azure.NewOperationNotDoneError(&infrav1.Future{})
 )
 
 func TestReconcileSecurityGroups(t *testing.T) {
 	testcases := []struct {
-		name   string
-		expect func(s *mock_securitygroups.MockNSGScopeMockRecorder, m *mock_securitygroups.MockclientMockRecorder)
+		name          string
+		expectedError string
+		expect        func(s *mock_securitygroups.MockNSGScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder)
 	}{
 		{
-			name: "security groups do not exist",
-			expect: func(s *mock_securitygroups.MockNSGScopeMockRecorder, m *mock_securitygroups.MockclientMockRecorder) {
-				s.NSGSpecs().Return([]azure.NSGSpec{
-					{
-						Name: "nsg-one",
-						SecurityRules: infrav1.SecurityRules{
-							{
-								Name:             "first-rule",
-								Description:      "a test rule",
-								Protocol:         infrav1.SecurityGroupProtocolAll,
-								Priority:         400,
-								SourcePorts:      to.StringPtr("*"),
-								DestinationPorts: to.StringPtr("*"),
-								Source:           to.StringPtr("*"),
-								Destination:      to.StringPtr("*"),
-								Direction:        infrav1.SecurityRuleDirectionInbound,
-							},
-							{
-								Name:             "second-rule",
-								Description:      "another test rule",
-								Protocol:         infrav1.SecurityGroupProtocolAll,
-								Priority:         450,
-								SourcePorts:      to.StringPtr("*"),
-								DestinationPorts: to.StringPtr("*"),
-								Source:           to.StringPtr("*"),
-								Destination:      to.StringPtr("*"),
-								Direction:        infrav1.SecurityRuleDirectionInbound,
-							},
-						},
-					},
-					{
-						Name:          "nsg-two",
-						SecurityRules: infrav1.SecurityRules{},
-					},
-				})
+			name:          "create single security group with single rule succeeds, should return no error",
+			expectedError: "",
+			expect: func(s *mock_securitygroups.MockNSGScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
 				s.IsVnetManaged().Return(true)
-				s.ResourceGroup().AnyTimes().Return("my-rg")
-				s.Location().AnyTimes().Return("test-location")
-				m.Get(gomockinternal.AContext(), "my-rg", "nsg-one").Return(network.SecurityGroup{}, autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not found"))
-				m.CreateOrUpdate(gomockinternal.AContext(), "my-rg", "nsg-one", gomockinternal.DiffEq(network.SecurityGroup{
-					SecurityGroupPropertiesFormat: &network.SecurityGroupPropertiesFormat{
-						SecurityRules: &[]network.SecurityRule{
-							{
-								SecurityRulePropertiesFormat: &network.SecurityRulePropertiesFormat{
-									Description:              to.StringPtr("a test rule"),
-									SourcePortRange:          to.StringPtr("*"),
-									DestinationPortRange:     to.StringPtr("*"),
-									SourceAddressPrefix:      to.StringPtr("*"),
-									DestinationAddressPrefix: to.StringPtr("*"),
-									Protocol:                 "*",
-									Direction:                "Inbound",
-									Access:                   "Allow",
-									Priority:                 to.Int32Ptr(400),
-								},
-								Name: to.StringPtr("first-rule"),
-							},
-							{
-								SecurityRulePropertiesFormat: &network.SecurityRulePropertiesFormat{
-									Description:              to.StringPtr("another test rule"),
-									SourcePortRange:          to.StringPtr("*"),
-									DestinationPortRange:     to.StringPtr("*"),
-									SourceAddressPrefix:      to.StringPtr("*"),
-									DestinationAddressPrefix: to.StringPtr("*"),
-									Protocol:                 "*",
-									Direction:                "Inbound",
-									Access:                   "Allow",
-									Priority:                 to.Int32Ptr(450),
-								},
-								Name: to.StringPtr("second-rule"),
-							},
-						},
-					},
-					Etag:     nil,
-					Location: to.StringPtr("test-location"),
-				}))
-				m.Get(gomockinternal.AContext(), "my-rg", "nsg-two").Return(network.SecurityGroup{}, autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not found"))
-				m.CreateOrUpdate(gomockinternal.AContext(), "my-rg", "nsg-two", gomockinternal.DiffEq(network.SecurityGroup{
-					SecurityGroupPropertiesFormat: &network.SecurityGroupPropertiesFormat{
-						SecurityRules: &[]network.SecurityRule{},
-					},
-					Etag:     nil,
-					Location: to.StringPtr("test-location"),
-				}))
+				s.NSGSpecs().Return([]azure.ResourceSpecGetter{&fakeNSG})
+				s.UpdateAnnotationJSON(annotation, map[string]any{fakeNSG.Name: map[string]string{securityRule1.Name: securityRule1.Description}}).Times(1)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakeNSG, serviceName).Return(nil, nil)
+				s.UpdatePutStatus(infrav1.SecurityGroupsReadyCondition, serviceName, nil)
 			},
-		}, {
-			name: "security group exists",
-			expect: func(s *mock_securitygroups.MockNSGScopeMockRecorder, m *mock_securitygroups.MockclientMockRecorder) {
-				s.NSGSpecs().Return([]azure.NSGSpec{
-					{
-						Name: "nsg-one",
-						SecurityRules: infrav1.SecurityRules{
-							{
-								Name:             "first-rule",
-								Description:      "a test rule",
-								Protocol:         "*",
-								Priority:         400,
-								SourcePorts:      to.StringPtr("*"),
-								DestinationPorts: to.StringPtr("*"),
-								Source:           to.StringPtr("*"),
-								Destination:      to.StringPtr("*"),
-								Direction:        infrav1.SecurityRuleDirectionOutbound,
-							},
-						},
-					},
-					{
-						Name:          "nsg-two",
-						SecurityRules: infrav1.SecurityRules{},
-					},
-				})
-				s.IsVnetManaged().AnyTimes().Return(true)
-				s.ResourceGroup().AnyTimes().Return("my-rg")
-				s.Location().AnyTimes().Return("test-location")
-				m.Get(gomockinternal.AContext(), "my-rg", "nsg-one").Return(network.SecurityGroup{
-					Response: autorest.Response{},
-					SecurityGroupPropertiesFormat: &network.SecurityGroupPropertiesFormat{
-						SecurityRules: &[]network.SecurityRule{
-							{
-								SecurityRulePropertiesFormat: &network.SecurityRulePropertiesFormat{
-									Description:              to.StringPtr("a different rule"),
-									Protocol:                 "*",
-									SourcePortRange:          to.StringPtr("*"),
-									DestinationPortRange:     to.StringPtr("*"),
-									SourceAddressPrefix:      to.StringPtr("*"),
-									DestinationAddressPrefix: to.StringPtr("*"),
-									Priority:                 to.Int32Ptr(300),
-									Access:                   network.SecurityRuleAccessDeny,
-									Direction:                network.SecurityRuleDirectionOutbound,
-								},
-								Name: to.StringPtr("foo-rule"),
-							},
-						},
-					},
-					Etag: to.StringPtr("test-etag"),
-					ID:   to.StringPtr("fake/nsg/id"),
-					Name: to.StringPtr("nsg-one"),
-				}, nil)
-				m.CreateOrUpdate(gomockinternal.AContext(), "my-rg", "nsg-one", gomockinternal.DiffEq(network.SecurityGroup{
-					SecurityGroupPropertiesFormat: &network.SecurityGroupPropertiesFormat{
-						SecurityRules: &[]network.SecurityRule{
-							{
-								SecurityRulePropertiesFormat: &network.SecurityRulePropertiesFormat{
-									Description:              to.StringPtr("a different rule"),
-									SourcePortRange:          to.StringPtr("*"),
-									DestinationPortRange:     to.StringPtr("*"),
-									SourceAddressPrefix:      to.StringPtr("*"),
-									DestinationAddressPrefix: to.StringPtr("*"),
-									Protocol:                 "*",
-									Direction:                "Outbound",
-									Access:                   "Deny",
-									Priority:                 to.Int32Ptr(300),
-								},
-								Name: to.StringPtr("foo-rule"),
-							},
-							{
-								SecurityRulePropertiesFormat: &network.SecurityRulePropertiesFormat{
-									Description:              to.StringPtr("a test rule"),
-									SourcePortRange:          to.StringPtr("*"),
-									DestinationPortRange:     to.StringPtr("*"),
-									SourceAddressPrefix:      to.StringPtr("*"),
-									DestinationAddressPrefix: to.StringPtr("*"),
-									Protocol:                 "*",
-									Direction:                "Outbound",
-									Access:                   "Allow",
-									Priority:                 to.Int32Ptr(400),
-								},
-								Name: to.StringPtr("first-rule"),
-							},
-						},
-					},
-					Etag:     to.StringPtr("test-etag"),
-					Location: to.StringPtr("test-location"),
-				}))
-				m.Get(gomockinternal.AContext(), "my-rg", "nsg-two").Return(network.SecurityGroup{
-					Response: autorest.Response{},
-					SecurityGroupPropertiesFormat: &network.SecurityGroupPropertiesFormat{
-						SecurityRules: &[]network.SecurityRule{},
-					},
-					Etag: to.StringPtr("test-etag"),
-					ID:   to.StringPtr("fake/nsg/two/id"),
-					Name: to.StringPtr("nsg-two"),
-				}, nil)
+		},
+		{
+			name:          "create single security group with multiple rules succeeds, should return no error",
+			expectedError: "",
+			expect: func(s *mock_securitygroups.MockNSGScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
+				s.IsVnetManaged().Return(true)
+				s.NSGSpecs().Return([]azure.ResourceSpecGetter{&multipleRulesNSG})
+				s.UpdateAnnotationJSON(annotation, map[string]any{multipleRulesNSG.Name: map[string]string{securityRule1.Name: securityRule1.Description, securityRule2.Name: securityRule2.Description}}).Times(1)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &multipleRulesNSG, serviceName).Return(nil, nil)
+				s.UpdatePutStatus(infrav1.SecurityGroupsReadyCondition, serviceName, nil)
 			},
-		}, {
-			name: "skipping network security group reconcile in custom VNet mode",
-			expect: func(s *mock_securitygroups.MockNSGScopeMockRecorder, m *mock_securitygroups.MockclientMockRecorder) {
+		},
+		{
+			name:          "create multiple security groups, should return no error",
+			expectedError: "",
+			expect: func(s *mock_securitygroups.MockNSGScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
+				s.IsVnetManaged().Return(true)
+				s.NSGSpecs().Return([]azure.ResourceSpecGetter{&fakeNSG, &noRulesNSG})
+				s.UpdateAnnotationJSON(annotation, map[string]any{fakeNSG.Name: map[string]string{securityRule1.Name: securityRule1.Description}}).Times(1)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakeNSG, serviceName).Return(nil, nil)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &noRulesNSG, serviceName).Return(nil, nil)
+				s.UpdatePutStatus(infrav1.SecurityGroupsReadyCondition, serviceName, nil)
+			},
+		},
+		{
+			name:          "first security groups create fails, should return error",
+			expectedError: errFake.Error(),
+			expect: func(s *mock_securitygroups.MockNSGScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
+				s.IsVnetManaged().Return(true)
+				s.NSGSpecs().Return([]azure.ResourceSpecGetter{&fakeNSG, &noRulesNSG})
+				s.UpdateAnnotationJSON(annotation, map[string]any{fakeNSG.Name: map[string]string{securityRule1.Name: securityRule1.Description}}).Times(1)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakeNSG, serviceName).Return(nil, errFake)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &noRulesNSG, serviceName).Return(nil, nil)
+				s.UpdatePutStatus(infrav1.SecurityGroupsReadyCondition, serviceName, errFake)
+			},
+		},
+		{
+			name:          "first sg create fails, second sg create not done, should return create error",
+			expectedError: errFake.Error(),
+			expect: func(s *mock_securitygroups.MockNSGScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
+				s.IsVnetManaged().Return(true)
+				s.NSGSpecs().Return([]azure.ResourceSpecGetter{&fakeNSG, &noRulesNSG})
+				s.UpdateAnnotationJSON(annotation, map[string]any{fakeNSG.Name: map[string]string{securityRule1.Name: securityRule1.Description}}).Times(1)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakeNSG, serviceName).Return(nil, errFake)
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &noRulesNSG, serviceName).Return(nil, notDoneError)
+				s.UpdatePutStatus(infrav1.SecurityGroupsReadyCondition, serviceName, errFake)
+			},
+		},
+		{
+			name:          "security groups create not done, should return not done error",
+			expectedError: notDoneError.Error(),
+			expect: func(s *mock_securitygroups.MockNSGScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
+				s.IsVnetManaged().Return(true)
+				s.NSGSpecs().Return([]azure.ResourceSpecGetter{&fakeNSG})
+				s.UpdateAnnotationJSON(annotation, map[string]any{fakeNSG.Name: map[string]string{securityRule1.Name: securityRule1.Description}})
+				r.CreateOrUpdateResource(gomockinternal.AContext(), &fakeNSG, serviceName).Return(nil, notDoneError)
+				s.UpdatePutStatus(infrav1.SecurityGroupsReadyCondition, serviceName, notDoneError)
+			},
+		},
+		{
+			name:          "vnet is not managed, should skip reconcile",
+			expectedError: "",
+			expect: func(s *mock_securitygroups.MockNSGScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
 				s.IsVnetManaged().Return(false)
 			},
 		},
 	}
 	for _, tc := range testcases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 			t.Parallel()
@@ -236,85 +187,89 @@ func TestReconcileSecurityGroups(t *testing.T) {
 			defer mockCtrl.Finish()
 
 			scopeMock := mock_securitygroups.NewMockNSGScope(mockCtrl)
-			clientMock := mock_securitygroups.NewMockclient(mockCtrl)
+			reconcilerMock := mock_async.NewMockReconciler(mockCtrl)
 
-			tc.expect(scopeMock.EXPECT(), clientMock.EXPECT())
+			tc.expect(scopeMock.EXPECT(), reconcilerMock.EXPECT())
 
 			s := &Service{
-				Scope:  scopeMock,
-				client: clientMock,
+				Scope:      scopeMock,
+				Reconciler: reconcilerMock,
 			}
 
-			g.Expect(s.Reconcile(context.TODO())).To(Succeed())
+			err := s.Reconcile(t.Context())
+			if tc.expectedError != "" {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(err).To(MatchError(tc.expectedError))
+			} else {
+				g.Expect(err).NotTo(HaveOccurred())
+			}
 		})
 	}
 }
 
 func TestDeleteSecurityGroups(t *testing.T) {
 	testcases := []struct {
-		name   string
-		expect func(s *mock_securitygroups.MockNSGScopeMockRecorder, m *mock_securitygroups.MockclientMockRecorder)
+		name          string
+		expectedError string
+		expect        func(s *mock_securitygroups.MockNSGScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder)
 	}{
 		{
-			name: "security groups exist",
-			expect: func(s *mock_securitygroups.MockNSGScopeMockRecorder, m *mock_securitygroups.MockclientMockRecorder) {
-				s.NSGSpecs().Return([]azure.NSGSpec{
-					{
-						Name: "nsg-one",
-						SecurityRules: infrav1.SecurityRules{
-							{
-								Name:             "first-rule",
-								Description:      "a test rule",
-								Protocol:         "all",
-								Priority:         400,
-								SourcePorts:      to.StringPtr("*"),
-								DestinationPorts: to.StringPtr("*"),
-								Source:           to.StringPtr("*"),
-								Destination:      to.StringPtr("*"),
-								Direction:        infrav1.SecurityRuleDirectionInbound,
-							},
-						},
-					},
-					{
-						Name:          "nsg-two",
-						SecurityRules: infrav1.SecurityRules{},
-					},
-				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+			name:          "delete multiple security groups succeeds, should return no error",
+			expectedError: "",
+			expect: func(s *mock_securitygroups.MockNSGScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
 				s.IsVnetManaged().Return(true)
-				m.Delete(gomockinternal.AContext(), "my-rg", "nsg-one")
-				m.Delete(gomockinternal.AContext(), "my-rg", "nsg-two")
+				s.NSGSpecs().Return([]azure.ResourceSpecGetter{&fakeNSG, &noRulesNSG})
+				r.DeleteResource(gomockinternal.AContext(), &fakeNSG, serviceName).Return(nil)
+				r.DeleteResource(gomockinternal.AContext(), &noRulesNSG, serviceName).Return(nil)
+				s.UpdateDeleteStatus(infrav1.SecurityGroupsReadyCondition, serviceName, nil)
 			},
 		},
 		{
-			name: "security group already deleted",
-			expect: func(s *mock_securitygroups.MockNSGScopeMockRecorder, m *mock_securitygroups.MockclientMockRecorder) {
-				s.NSGSpecs().Return([]azure.NSGSpec{
-					{
-						Name:          "nsg-one",
-						SecurityRules: infrav1.SecurityRules{},
-					},
-					{
-						Name:          "nsg-two",
-						SecurityRules: infrav1.SecurityRules{},
-					},
-				})
-				s.ResourceGroup().AnyTimes().Return("my-rg")
+			name:          "first security groups delete fails, should return an error",
+			expectedError: errFake.Error(),
+			expect: func(s *mock_securitygroups.MockNSGScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
 				s.IsVnetManaged().Return(true)
-				m.Delete(gomockinternal.AContext(), "my-rg", "nsg-one").
-					Return(autorest.NewErrorWithResponse("", "", &http.Response{StatusCode: 404}, "Not found"))
-				m.Delete(gomockinternal.AContext(), "my-rg", "nsg-two")
+				s.NSGSpecs().Return([]azure.ResourceSpecGetter{&fakeNSG, &noRulesNSG})
+				r.DeleteResource(gomockinternal.AContext(), &fakeNSG, serviceName).Return(errFake)
+				r.DeleteResource(gomockinternal.AContext(), &noRulesNSG, serviceName).Return(nil)
+				s.UpdateDeleteStatus(infrav1.SecurityGroupsReadyCondition, serviceName, errFake)
 			},
 		},
 		{
-			name: "skipping network security group delete in custom VNet mode",
-			expect: func(s *mock_securitygroups.MockNSGScopeMockRecorder, m *mock_securitygroups.MockclientMockRecorder) {
+			name:          "first security groups delete fails and second security groups create not done, should return an error",
+			expectedError: errFake.Error(),
+			expect: func(s *mock_securitygroups.MockNSGScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
+				s.IsVnetManaged().Return(true)
+				s.NSGSpecs().Return([]azure.ResourceSpecGetter{&fakeNSG, &noRulesNSG})
+				r.DeleteResource(gomockinternal.AContext(), &fakeNSG, serviceName).Return(errFake)
+				r.DeleteResource(gomockinternal.AContext(), &noRulesNSG, serviceName).Return(notDoneError)
+				s.UpdateDeleteStatus(infrav1.SecurityGroupsReadyCondition, serviceName, errFake)
+			},
+		},
+		{
+			name:          "security groups delete not done, should return not done error",
+			expectedError: notDoneError.Error(),
+			expect: func(s *mock_securitygroups.MockNSGScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
+				s.IsVnetManaged().Return(true)
+				s.NSGSpecs().Return([]azure.ResourceSpecGetter{&fakeNSG})
+				r.DeleteResource(gomockinternal.AContext(), &fakeNSG, serviceName).Return(notDoneError)
+				s.UpdateDeleteStatus(infrav1.SecurityGroupsReadyCondition, serviceName, notDoneError)
+			},
+		},
+		{
+			name:          "vnet is not managed, should skip delete",
+			expectedError: "",
+			expect: func(s *mock_securitygroups.MockNSGScopeMockRecorder, r *mock_async.MockReconcilerMockRecorder) {
+				s.DefaultedAzureServiceReconcileTimeout().Return(reconciler.DefaultAzureServiceReconcileTimeout)
 				s.IsVnetManaged().Return(false)
 			},
 		},
 	}
 	for _, tc := range testcases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
 			t.Parallel()
@@ -322,16 +277,67 @@ func TestDeleteSecurityGroups(t *testing.T) {
 			defer mockCtrl.Finish()
 
 			scopeMock := mock_securitygroups.NewMockNSGScope(mockCtrl)
-			clientMock := mock_securitygroups.NewMockclient(mockCtrl)
+			reconcilerMock := mock_async.NewMockReconciler(mockCtrl)
 
-			tc.expect(scopeMock.EXPECT(), clientMock.EXPECT())
+			tc.expect(scopeMock.EXPECT(), reconcilerMock.EXPECT())
 
 			s := &Service{
-				Scope:  scopeMock,
-				client: clientMock,
+				Scope:      scopeMock,
+				Reconciler: reconcilerMock,
 			}
 
-			g.Expect(s.Delete(context.TODO())).To(Succeed())
+			err := s.Delete(t.Context())
+			if tc.expectedError != "" {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(err).To(MatchError(tc.expectedError))
+			} else {
+				g.Expect(err).NotTo(HaveOccurred())
+			}
 		})
 	}
 }
+
+var (
+	ruleA = &armnetwork.SecurityRule{
+		Name: ptr.To("A"),
+		Properties: &armnetwork.SecurityRulePropertiesFormat{
+			Description:              ptr.To("this is rule A"),
+			Protocol:                 ptr.To(armnetwork.SecurityRuleProtocolTCP),
+			DestinationPortRange:     ptr.To("*"),
+			SourcePortRange:          ptr.To("*"),
+			DestinationAddressPrefix: ptr.To("*"),
+			SourceAddressPrefix:      ptr.To("*"),
+			Priority:                 ptr.To[int32](100),
+			Direction:                ptr.To(armnetwork.SecurityRuleDirectionInbound),
+			Access:                   ptr.To(armnetwork.SecurityRuleAccessAllow),
+		},
+	}
+	ruleB = &armnetwork.SecurityRule{
+		Name: ptr.To("B"),
+		Properties: &armnetwork.SecurityRulePropertiesFormat{
+			Description:              ptr.To("this is rule B"),
+			Protocol:                 ptr.To(armnetwork.SecurityRuleProtocolTCP),
+			DestinationPortRange:     ptr.To("*"),
+			SourcePortRange:          ptr.To("*"),
+			DestinationAddressPrefix: ptr.To("*"),
+			SourceAddressPrefix:      ptr.To("*"),
+			Priority:                 ptr.To[int32](100),
+			Direction:                ptr.To(armnetwork.SecurityRuleDirectionOutbound),
+			Access:                   ptr.To(armnetwork.SecurityRuleAccessAllow),
+		},
+	}
+	ruleBModified = &armnetwork.SecurityRule{
+		Name: ptr.To("B"),
+		Properties: &armnetwork.SecurityRulePropertiesFormat{
+			Description:              ptr.To("this is rule B"),
+			Protocol:                 ptr.To(armnetwork.SecurityRuleProtocolTCP),
+			DestinationPortRange:     ptr.To("80"),
+			SourcePortRange:          ptr.To("*"),
+			DestinationAddressPrefix: ptr.To("*"),
+			SourceAddressPrefix:      ptr.To("*"),
+			Priority:                 ptr.To[int32](100),
+			Direction:                ptr.To(armnetwork.SecurityRuleDirectionOutbound),
+			Access:                   ptr.To(armnetwork.SecurityRuleAccessAllow),
+		},
+	}
+)

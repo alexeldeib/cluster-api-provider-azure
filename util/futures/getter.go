@@ -17,8 +17,9 @@ limitations under the License.
 package futures
 
 import (
-	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 )
 
 // Getter interface defines methods that an object should implement in order to
@@ -30,16 +31,33 @@ type Getter interface {
 	GetFutures() infrav1.Futures
 }
 
+// GetByServiceAndType returns the future for the specified service and future type, if the future does not exists,
+// it returns nil.
+func GetByServiceAndType(from Getter, service, futureType string) infrav1.Futures {
+	futures := from.GetFutures()
+	if futures == nil {
+		return nil
+	}
+
+	var result infrav1.Futures
+	for _, f := range futures {
+		if f.ServiceName == service && f.Type == futureType {
+			result = append(result, f)
+		}
+	}
+	return result
+}
+
 // Get returns the future with the given name, if the future does not exists,
 // it returns nil.
-func Get(from Getter, name, service string) *infrav1.Future {
+func Get(from Getter, name, service, futureType string) *infrav1.Future {
 	futures := from.GetFutures()
 	if futures == nil {
 		return nil
 	}
 
 	for _, f := range futures {
-		if f.Name == name && f.ServiceName == service {
+		if f.Name == name && f.ServiceName == service && f.Type == futureType {
 			return &f
 		}
 	}
@@ -47,6 +65,6 @@ func Get(from Getter, name, service string) *infrav1.Future {
 }
 
 // Has returns true if a future with the given name exists.
-func Has(from Getter, name, service string) bool {
-	return Get(from, name, service) != nil
+func Has(from Getter, name, service, futureType string) bool {
+	return Get(from, name, service, futureType) != nil
 }

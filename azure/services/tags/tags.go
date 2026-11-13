@@ -19,21 +19,24 @@ package tags
 import (
 	"context"
 
-	"github.com/Azure/azure-sdk-for-go/services/resources/mgmt/2019-10-01/resources"
-	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	"github.com/pkg/errors"
+	"k8s.io/utils/ptr"
+
 	"sigs.k8s.io/cluster-api-provider-azure/azure"
 	"sigs.k8s.io/cluster-api-provider-azure/azure/converters"
 	"sigs.k8s.io/cluster-api-provider-azure/util/tele"
 )
+
+const serviceName = "tags"
 
 // TagScope defines the scope interface for a tags service.
 type TagScope interface {
 	azure.Authorizer
 	ClusterName() string
 	TagsSpecs() []azure.TagsSpec
-	AnnotationJSON(string) (map[string]interface{}, error)
-	UpdateAnnotationJSON(string, map[string]interface{}) error
+	AnnotationJSON(string) (map[string]any, error)
+	UpdateAnnotationJSON(string, map[string]any) error
 }
 
 // Service provides operations on Azure resources.
@@ -43,11 +46,28 @@ type Service struct {
 }
 
 // New creates a new service.
-func New(scope TagScope) *Service {
+func New(scope TagScope) (*Service, error) {
+	cli, err := NewClient(scope)
+	if err != nil {
+		return nil, err
+	}
 	return &Service{
 		Scope:  scope,
-		client: newClient(scope),
-	}
+		client: cli,
+	}, nil
+}
+
+// Name returns the service name.
+func (s *Service) Name() string {
+	return serviceName
+}
+
+// Some resource types are always assumed to be managed by CAPZ whether or not
+// they have the canonical "owned" tag applied to most resources. The annotation
+// key for those types should be listed here so their tags are always
+// interpreted as managed.
+var alwaysManagedAnnotations = map[string]struct{}{
+	azure.ManagedClusterTagsLastAppliedAnnotation: {},
 }
 
 // Reconcile ensures tags are correct.
@@ -65,7 +85,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			tags = existingTags.Properties.Tags
 		}
 
-		if !s.isResourceManaged(tags) {
+		if _, alwaysManaged := alwaysManagedAnnotations[tagsSpec.Annotation]; !alwaysManaged && !s.isResourceManaged(tags) {
 			log.V(4).Info("Skipping tags reconcile for not managed resource")
 			continue
 		}
@@ -74,16 +94,16 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		changed, createdOrUpdated, deleted, newAnnotation := tagsChanged(lastAppliedTags, tagsSpec.Tags, tags)
+		changed, createdOrUpdated, deleted, newAnnotation := TagsChanged(lastAppliedTags, tagsSpec.Tags, tags)
 		if changed {
 			log.V(2).Info("Updating tags")
 			if len(createdOrUpdated) > 0 {
 				createdOrUpdatedTags := make(map[string]*string)
 				for k, v := range createdOrUpdated {
-					createdOrUpdatedTags[k] = to.StringPtr(v)
+					createdOrUpdatedTags[k] = ptr.To(v)
 				}
 
-				if _, err := s.client.UpdateAtScope(ctx, tagsSpec.Scope, resources.TagsPatchResource{Operation: "Merge", Properties: &resources.Tags{Tags: createdOrUpdatedTags}}); err != nil {
+				if _, err := s.client.UpdateAtScope(ctx, tagsSpec.Scope, armresources.TagsPatchResource{Operation: ptr.To(armresources.TagsPatchOperationMerge), Properties: &armresources.Tags{Tags: createdOrUpdatedTags}}); err != nil {
 					return errors.Wrap(err, "cannot update tags")
 				}
 			}
@@ -91,19 +111,20 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			if len(deleted) > 0 {
 				deletedTags := make(map[string]*string)
 				for k, v := range deleted {
-					deletedTags[k] = to.StringPtr(v)
+					deletedTags[k] = ptr.To(v)
 				}
 
-				if _, err := s.client.UpdateAtScope(ctx, tagsSpec.Scope, resources.TagsPatchResource{Operation: "Delete", Properties: &resources.Tags{Tags: deletedTags}}); err != nil {
+				if _, err := s.client.UpdateAtScope(ctx, tagsSpec.Scope, armresources.TagsPatchResource{Operation: ptr.To(armresources.TagsPatchOperationDelete), Properties: &armresources.Tags{Tags: deletedTags}}); err != nil {
 					return errors.Wrap(err, "cannot update tags")
 				}
 			}
-
-			// We also need to update the annotation if anything changed.
-			if err = s.Scope.UpdateAnnotationJSON(tagsSpec.Annotation, newAnnotation); err != nil {
-				return err
-			}
 			log.V(2).Info("successfully updated tags")
+		}
+
+		// We also need to update the annotation even if nothing changed to
+		// ensure it's set immediately following resource creation.
+		if err := s.Scope.UpdateAnnotationJSON(tagsSpec.Annotation, newAnnotation); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -121,8 +142,8 @@ func (s *Service) Delete(ctx context.Context) error {
 	return nil
 }
 
-// tagsChanged determines which tags to delete and which to add.
-func tagsChanged(lastAppliedTags map[string]interface{}, desiredTags map[string]string, currentTags map[string]*string) (bool, map[string]string, map[string]string, map[string]interface{}) {
+// TagsChanged determines which tags to delete and which to add.
+func TagsChanged(lastAppliedTags map[string]any, desiredTags map[string]string, currentTags map[string]*string) (change bool, createOrUpdates map[string]string, deletes map[string]string, annotation map[string]any) {
 	// Bool tracking if we found any changed state.
 	changed := false
 
@@ -133,7 +154,7 @@ func tagsChanged(lastAppliedTags map[string]interface{}, desiredTags map[string]
 	deleted := map[string]string{}
 
 	// The new annotation that we need to set if anything is created/updated.
-	newAnnotation := map[string]interface{}{}
+	newAnnotation := map[string]any{}
 
 	// Loop over lastAppliedTags, checking if entries are in desiredTags.
 	// If an entry is present in lastAppliedTags but not in desiredTags, it has been deleted
@@ -186,4 +207,9 @@ func tagsChanged(lastAppliedTags map[string]interface{}, desiredTags map[string]
 	// We made it through the loop, and everything that was in desiredTags, was also
 	// in dst. Nothing changed.
 	return changed, createdOrUpdated, deleted, newAnnotation
+}
+
+// IsManaged returns always returns true as CAPZ does not support BYO tags.
+func (s *Service) IsManaged(_ context.Context) (bool, error) {
+	return true, nil
 }

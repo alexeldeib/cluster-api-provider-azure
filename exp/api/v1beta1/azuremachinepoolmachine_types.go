@@ -19,8 +19,7 @@ package v1beta1
 import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
-	"sigs.k8s.io/cluster-api/errors"
+	clusterv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
 )
@@ -28,6 +27,9 @@ import (
 const (
 	// AzureMachinePoolMachineFinalizer is used to ensure deletion of dependencies (nodes, infra).
 	AzureMachinePoolMachineFinalizer = "azuremachinepoolmachine.infrastructure.cluster.x-k8s.io"
+
+	// AzureMachinePoolMachineKind indicates the kind of an AzureMachinePoolMachine.
+	AzureMachinePoolMachineKind = "AzureMachinePoolMachine"
 )
 
 type (
@@ -38,7 +40,8 @@ type (
 		ProviderID string `json:"providerID"`
 
 		// InstanceID is the identification of the Machine Instance within the VMSS
-		InstanceID string `json:"instanceID"`
+		// +optional
+		InstanceID string `json:"instanceID,omitempty"`
 	}
 
 	// AzureMachinePoolMachineStatus defines the observed state of AzureMachinePoolMachine.
@@ -67,7 +70,7 @@ type (
 		// can be added as events to the MachinePool object and/or logged in the
 		// controller's output.
 		// +optional
-		FailureReason *errors.MachineStatusError `json:"failureReason,omitempty"`
+		FailureReason *string `json:"failureReason,omitempty"`
 
 		// FailureMessage will be set in the event that there is a terminal problem
 		// reconciling the MachinePool and will contain a more verbose string suitable
@@ -81,7 +84,7 @@ type (
 
 		// Conditions defines current service state of the AzureMachinePool.
 		// +optional
-		Conditions clusterv1.Conditions `json:"conditions,omitempty"`
+		Conditions clusterv1beta1.Conditions `json:"conditions,omitempty"`
 
 		// LongRunningOperationStates saves the state for Azure long running operations so they can be continued on the
 		// next reconciliation loop.
@@ -91,7 +94,8 @@ type (
 		// LatestModelApplied indicates the instance is running the most up-to-date VMSS model. A VMSS model describes
 		// the image version the VM is running. If the instance is not running the latest model, it means the instance
 		// may not be running the version of Kubernetes the Machine Pool has specified and needs to be updated.
-		LatestModelApplied bool `json:"latestModelApplied"`
+		// +optional
+		LatestModelApplied bool `json:"latestModelApplied,omitempty"`
 
 		// Ready is true when the provider resource is ready.
 		// +optional
@@ -106,6 +110,7 @@ type (
 	// +kubebuilder:printcolumn:name="State",type="string",JSONPath=".status.provisioningState",description="Azure VMSS VM provisioning state"
 	// +kubebuilder:printcolumn:name="Cluster",type="string",priority=1,JSONPath=".metadata.labels.cluster\\.x-k8s\\.io/cluster-name",description="Cluster to which this AzureMachinePoolMachine belongs"
 	// +kubebuilder:printcolumn:name="VMSS VM ID",type="string",priority=1,JSONPath=".spec.providerID",description="Azure VMSS VM ID"
+	// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp",description="Time duration since creation of this AzureMachinePoolMachine"
 	// +kubebuilder:storageversion
 
 	// AzureMachinePoolMachine is the Schema for the azuremachinepoolmachines API.
@@ -128,12 +133,12 @@ type (
 )
 
 // GetConditions returns the list of conditions for an AzureMachinePool API object.
-func (ampm *AzureMachinePoolMachine) GetConditions() clusterv1.Conditions {
+func (ampm *AzureMachinePoolMachine) GetConditions() clusterv1beta1.Conditions {
 	return ampm.Status.Conditions
 }
 
 // SetConditions will set the given conditions on an AzureMachinePool object.
-func (ampm *AzureMachinePoolMachine) SetConditions(conditions clusterv1.Conditions) {
+func (ampm *AzureMachinePoolMachine) SetConditions(conditions clusterv1beta1.Conditions) {
 	ampm.Status.Conditions = conditions
 }
 
@@ -148,5 +153,5 @@ func (ampm *AzureMachinePoolMachine) SetFutures(futures infrav1.Futures) {
 }
 
 func init() {
-	SchemeBuilder.Register(&AzureMachinePoolMachine{}, &AzureMachinePoolMachineList{})
+	objectTypes = append(objectTypes, &AzureMachinePoolMachine{}, &AzureMachinePoolMachineList{})
 }

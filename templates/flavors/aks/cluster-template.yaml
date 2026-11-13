@@ -33,6 +33,8 @@ spec:
   location: "${AZURE_LOCATION}"
   sshPublicKey: ${AZURE_SSH_PUBLIC_KEY_B64:=""}
   version: "${KUBERNETES_VERSION}"
+  oidcIssuerProfile:
+    enabled: true
 ---
 # Due to the nature of managed Kubernetes and the control plane implementation,
 # the infrastructure provider for AKS cluster is basically a no-op.
@@ -42,16 +44,16 @@ kind: AzureManagedCluster
 metadata:
   name: ${CLUSTER_NAME}
 ---
-# We provision a default machine pool with no boostrap data (AKS will provide it).
+# We provision a default machine pool with no bootstrap data (AKS will provide it).
 # We specify an AzureManagedMachinePool as the infrastructure machine it, which
 # will be reflected in Azure as VMSS node pools attached to an AKS cluster.
 apiVersion: cluster.x-k8s.io/v1beta1
 kind: MachinePool
 metadata:
-  name: "agentpool0"
+  name: "${CLUSTER_NAME}-pool0"
 spec:
   clusterName: "${CLUSTER_NAME}"
-  replicas: ${WORKER_MACHINE_COUNT}
+  replicas: ${WORKER_MACHINE_COUNT:=2}
   template:
     metadata: {}
     spec:
@@ -61,28 +63,28 @@ spec:
       infrastructureRef:
         apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
         kind: AzureManagedMachinePool
-        name: "agentpool0"
+        name: "${CLUSTER_NAME}-pool0"
       version: "${KUBERNETES_VERSION}"
 ---
-# The Azure-specific machine pool implementation drives the configuration of the
-# VMSS instances backing the pool.
+# This first Azure-specific machine pool implementation drives the configuration of the
+# AKS "System" node pool to schedule and run kube-system and other system pods
 apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
 kind: AzureManagedMachinePool
 metadata:
-  name: "agentpool0"
+  name: "${CLUSTER_NAME}-pool0"
 spec:
   mode: System
-  osDiskSizeGB: 30
   sku: "${AZURE_NODE_MACHINE_TYPE}"
+  name: pool0
 ---
 # Deploy a second agent pool with the same number of machines, but using potentially different infrastructure.
 apiVersion: cluster.x-k8s.io/v1beta1
 kind: MachinePool
 metadata:
-  name: "agentpool1"
+  name: "${CLUSTER_NAME}-pool1"
 spec:
   clusterName: "${CLUSTER_NAME}"
-  replicas: ${WORKER_MACHINE_COUNT}
+  replicas: ${WORKER_MACHINE_COUNT:=2}
   template:
     metadata: {}
     spec:
@@ -92,15 +94,16 @@ spec:
       infrastructureRef:
         apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
         kind: AzureManagedMachinePool
-        name: "agentpool1"
+        name: "${CLUSTER_NAME}-pool1"
       version: "${KUBERNETES_VERSION}"
 ---
-# The infrastructure backing the second pool will use the same VM sku, but a larger OS disk.
+# This first Azure-specific machine pool implementation drives the configuration of the
+# AKS "User" node pool to schedule and run user workloads
 apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
 kind: AzureManagedMachinePool
 metadata:
-  name: "agentpool1"
+  name: "${CLUSTER_NAME}-pool1"
 spec:
   mode: User
-  osDiskSizeGB: 40
   sku: "${AZURE_NODE_MACHINE_TYPE}"
+  name: pool1

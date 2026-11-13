@@ -1,3 +1,4 @@
+//go:build e2e
 // +build e2e
 
 /*
@@ -24,17 +25,16 @@ import (
 	"net"
 	"time"
 
-	"sigs.k8s.io/cluster-api/util"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-	k8snet "k8s.io/utils/net"
-
 	"github.com/hashicorp/go-retryablehttp"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	k8snet "k8s.io/utils/net"
 	"sigs.k8s.io/cluster-api/test/framework"
+	"sigs.k8s.io/cluster-api/util"
 
 	deploymentBuilder "sigs.k8s.io/cluster-api-provider-azure/test/e2e/kubernetes/deployment"
 	"sigs.k8s.io/cluster-api-provider-azure/test/e2e/kubernetes/job"
@@ -48,8 +48,8 @@ type AzureLBSpecInput struct {
 	Namespace             *corev1.Namespace
 	ClusterName           string
 	SkipCleanup           bool
-	IPv6                  bool
 	Windows               bool
+	IPFamilies            []corev1.IPFamily
 }
 
 // AzureLBSpec implements a test that verifies Azure internal and external load balancers can
@@ -83,10 +83,10 @@ func AzureLBSpec(ctx context.Context, inputGetter func() AzureLBSpecInput) {
 
 	if input.Windows {
 		var windowsVersion windows.OSVersion
-		Eventually(func() error {
-			version, err := node.GetWindowsVersion(ctx, clientset)
-			windowsVersion = version
-			return err
+		Eventually(func(g Gomega) {
+			var err error
+			windowsVersion, err = node.GetWindowsVersion(ctx, clientset)
+			g.Expect(err).NotTo(HaveOccurred())
 		}, 300*time.Second, 5*time.Second).Should(Succeed())
 		iisImage := windows.GetWindowsImage(windows.Httpd, windowsVersion)
 		webDeployment.SetImage(deploymentName, iisImage)
@@ -118,55 +118,88 @@ func AzureLBSpec(ctx context.Context, inputGetter func() AzureLBSpecInput) {
 		},
 	}
 
-	// TODO: fix and enable this. Internal LBs + IPv6 is currently in preview.
-	// https://docs.microsoft.com/en-us/azure/virtual-network/ipv6-dual-stack-standard-internal-load-balancer-powershell
-	if !input.IPv6 {
-		By("creating an internal Load Balancer service")
+	By("creating an internal Load Balancer service")
 
-		ilbService := webDeployment.GetService(ports, deploymentBuilder.InternalLoadbalancer)
-		Log("starting to create an internal Load Balancer service")
-		_, err = servicesClient.Create(ctx, ilbService, metav1.CreateOptions{})
-		Expect(err).NotTo(HaveOccurred())
-		ilbSvcInput := WaitForServiceAvailableInput{
-			Getter:    servicesClientAdapter{client: servicesClient},
-			Service:   ilbService,
-			Clientset: clientset,
+	ilbService := webDeployment.CreateServiceResourceSpec(ports, deploymentBuilder.InternalLoadbalancer, input.IPFamilies)
+	Log("starting to create an internal Load Balancer service")
+	Eventually(func(g Gomega) {
+		_, err := servicesClient.Create(ctx, ilbService, metav1.CreateOptions{})
+		if err != nil {
+			LogWarningf("failed creating service (%s):%s\n", ilbService.Name, err.Error())
 		}
-		WaitForServiceAvailable(ctx, ilbSvcInput, e2eConfig.GetIntervals(specName, "wait-service")...)
+		g.Expect(err).NotTo(HaveOccurred())
+	}, retryableOperationTimeout, retryableOperationSleepBetweenRetries).Should(Succeed())
+	ilbSvcInput := WaitForServiceAvailableInput{
+		Getter:    servicesClientAdapter{client: servicesClient},
+		Service:   ilbService,
+		Clientset: clientset,
+	}
+	WaitForServiceAvailable(ctx, ilbSvcInput, e2eConfig.GetIntervals(specName, "wait-service")...)
 
-		By("connecting to the internal LB service from a curl pod")
+	By("connecting to the internal LB service from a curl pod")
 
-		svc, err := servicesClient.Get(ctx, ilbService.Name, metav1.GetOptions{})
-		Expect(err).NotTo(HaveOccurred())
-		ilbIP := extractServiceIp(svc)
-
-		ilbJob := job.CreateCurlJob("curl-to-ilb-job", ilbIP)
-		Log("starting to create a curl to ilb job")
-		_, err = jobsClient.Create(ctx, ilbJob, metav1.CreateOptions{})
-		Expect(err).NotTo(HaveOccurred())
-		ilbJobInput := WaitForJobCompleteInput{
-			Getter:    jobsClientAdapter{client: jobsClient},
-			Job:       ilbJob,
-			Clientset: clientset,
+	var svc *corev1.Service
+	Eventually(func(g Gomega) {
+		var err error
+		svc, err = servicesClient.Get(ctx, ilbService.Name, metav1.GetOptions{})
+		if err != nil {
+			LogWarningf("failed getting service (%s):%s\n", ilbService.Name, err.Error())
 		}
-		WaitForJobComplete(ctx, ilbJobInput, e2eConfig.GetIntervals(specName, "wait-job")...)
+		g.Expect(err).NotTo(HaveOccurred())
+	}, retryableOperationTimeout, retryableOperationSleepBetweenRetries).Should(Succeed())
+	ilbIP := extractServiceIP(svc)
 
-		if !input.SkipCleanup {
-			By("deleting the ilb test resources")
-			Logf("deleting the ilb service: %s", ilbService.Name)
-			err = servicesClient.Delete(ctx, ilbService.Name, metav1.DeleteOptions{})
-			Expect(err).NotTo(HaveOccurred())
-			Logf("deleting the ilb job: %s", ilbJob.Name)
-			err = jobsClient.Delete(ctx, ilbJob.Name, metav1.DeleteOptions{})
-			Expect(err).NotTo(HaveOccurred())
+	ilbJob := job.CreateCurlJobResourceSpec("curl-to-ilb-job", ilbIP)
+	Log("starting to create a curl to ilb job")
+	Eventually(func(g Gomega) {
+		_, err := jobsClient.Create(ctx, ilbJob, metav1.CreateOptions{})
+		if err != nil {
+			LogWarningf("failed creating job (%s):%s\n", ilbJob.Name, err.Error())
 		}
+		g.Expect(err).NotTo(HaveOccurred())
+	}, retryableOperationTimeout, retryableOperationSleepBetweenRetries).Should(Succeed())
+	ilbJobInput := WaitForJobCompleteInput{
+		Getter:    jobsClientAdapter{client: jobsClient},
+		Job:       ilbJob,
+		Clientset: clientset,
+	}
+	WaitForJobComplete(ctx, ilbJobInput, e2eConfig.GetIntervals(specName, "wait-job")...)
+
+	if !input.SkipCleanup {
+		By("deleting the ilb test resources")
+		Logf("starting to delete the ilb service: %s", ilbService.Name)
+		Eventually(func(g Gomega) {
+			err := servicesClient.Delete(ctx, ilbService.Name, metav1.DeleteOptions{})
+			if err != nil {
+				LogWarningf("failed deleting service (%s):%s\n", ilbService.Name, err.Error())
+			}
+			g.Expect(err).NotTo(HaveOccurred())
+		}, retryableDeleteOperationTimeout, retryableOperationSleepBetweenRetries).Should(Succeed())
+		Logf("waiting for the ilb service to be deleted: %s", ilbService.Name)
+		Eventually(func(g Gomega) {
+			_, err := servicesClient.Get(ctx, ilbService.GetName(), metav1.GetOptions{})
+			g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		}, deleteOperationTimeout, retryableOperationSleepBetweenRetries).Should(Succeed())
+		Logf("deleting the ilb job: %s", ilbJob.Name)
+		Eventually(func(g Gomega) {
+			err := jobsClient.Delete(ctx, ilbJob.Name, metav1.DeleteOptions{})
+			if err != nil {
+				LogWarningf("failed deleting job (%s):%s\n", ilbJob.Name, err.Error())
+			}
+			g.Expect(err).NotTo(HaveOccurred())
+		}, deleteOperationTimeout, retryableOperationSleepBetweenRetries).Should(Succeed())
 	}
 
 	By("creating an external Load Balancer service")
-	elbService := webDeployment.GetService(ports, deploymentBuilder.ExternalLoadbalancer)
+	elbService := webDeployment.CreateServiceResourceSpec(ports, deploymentBuilder.ExternalLoadbalancer, input.IPFamilies)
 	Log("starting to create an external Load Balancer service")
-	_, err = servicesClient.Create(ctx, elbService, metav1.CreateOptions{})
-	Expect(err).NotTo(HaveOccurred())
+	Eventually(func(g Gomega) {
+		_, err := servicesClient.Create(ctx, elbService, metav1.CreateOptions{})
+		if err != nil {
+			LogWarningf("failed creating service (%s):%s\n", elbService.Name, err.Error())
+		}
+		g.Expect(err).NotTo(HaveOccurred())
+	}, retryableOperationTimeout, retryableOperationSleepBetweenRetries).Should(Succeed())
 	elbSvcInput := WaitForServiceAvailableInput{
 		Getter:    servicesClientAdapter{client: servicesClient},
 		Service:   elbService,
@@ -175,14 +208,25 @@ func AzureLBSpec(ctx context.Context, inputGetter func() AzureLBSpecInput) {
 	WaitForServiceAvailable(ctx, elbSvcInput, e2eConfig.GetIntervals(specName, "wait-service")...)
 
 	By("connecting to the external LB service from a curl pod")
-	svc, err := servicesClient.Get(ctx, elbService.Name, metav1.GetOptions{})
-	Expect(err).NotTo(HaveOccurred())
+	Eventually(func(g Gomega) {
+		var err error
+		svc, err = servicesClient.Get(ctx, elbService.Name, metav1.GetOptions{})
+		if err != nil {
+			LogWarningf("failed getting service (%s):%s\n", elbService.Name, err.Error())
+		}
+		g.Expect(err).NotTo(HaveOccurred())
+	}, retryableOperationTimeout, retryableOperationSleepBetweenRetries).Should(Succeed())
 
-	elbIP := extractServiceIp(svc)
+	elbIP := extractServiceIP(svc)
 	Log("starting to create curl-to-elb job")
-	elbJob := job.CreateCurlJob("curl-to-elb-job"+util.RandomString(6), elbIP)
-	_, err = jobsClient.Create(ctx, elbJob, metav1.CreateOptions{})
-	Expect(err).NotTo(HaveOccurred())
+	elbJob := job.CreateCurlJobResourceSpec("curl-to-elb-job"+util.RandomString(6), elbIP)
+	Eventually(func(g Gomega) {
+		_, err := jobsClient.Create(ctx, elbJob, metav1.CreateOptions{})
+		if err != nil {
+			LogWarningf("failed creating job (%s):%s\n", elbJob.Name, err.Error())
+		}
+		g.Expect(err).NotTo(HaveOccurred())
+	}, retryableOperationTimeout, retryableOperationSleepBetweenRetries).Should(Succeed())
 	elbJobInput := WaitForJobCompleteInput{
 		Getter:    jobsClientAdapter{client: jobsClient},
 		Job:       elbJob,
@@ -190,7 +234,9 @@ func AzureLBSpec(ctx context.Context, inputGetter func() AzureLBSpecInput) {
 	}
 	WaitForJobComplete(ctx, elbJobInput, e2eConfig.GetIntervals(specName, "wait-job")...)
 
-	if !input.IPv6 {
+	// connecting directly to the external LB service only works for IPv4
+	// for IPv6 this is only possible when externalTrafficPolicy is set to "Local"
+	if k8snet.IsIPv4String(elbIP) {
 		By("connecting directly to the external LB service")
 		url := fmt.Sprintf("http://%s", elbIP)
 		Log("starting attempts to connect directly to the external LB service")
@@ -208,17 +254,37 @@ func AzureLBSpec(ctx context.Context, inputGetter func() AzureLBSpecInput) {
 	}
 	By("deleting the test resources")
 	Logf("starting to delete external LB service %s", elbService.Name)
-	err = servicesClient.Delete(ctx, elbService.Name, metav1.DeleteOptions{})
-	Expect(err).NotTo(HaveOccurred())
+	Eventually(func(g Gomega) {
+		err := servicesClient.Delete(ctx, elbService.Name, metav1.DeleteOptions{})
+		if err != nil {
+			LogWarningf("failed deleting service (%s):%s\n", elbService.Name, err.Error())
+		}
+		g.Expect(err).NotTo(HaveOccurred())
+	}, retryableDeleteOperationTimeout, retryableOperationSleepBetweenRetries).Should(Succeed())
+	Logf("waiting for the external LB service to be deleted: %s", elbService.Name)
+	Eventually(func(g Gomega) {
+		_, err := servicesClient.Get(ctx, elbService.GetName(), metav1.GetOptions{})
+		g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	}, deleteOperationTimeout, retryableOperationSleepBetweenRetries).Should(Succeed())
 	Logf("starting to delete deployment %s", deployment.Name)
-	err = webDeployment.Client(clientset).Delete(ctx, deployment.Name, metav1.DeleteOptions{})
-	Expect(err).NotTo(HaveOccurred())
+	Eventually(func(g Gomega) {
+		err := webDeployment.Client(clientset).Delete(ctx, deployment.Name, metav1.DeleteOptions{})
+		if err != nil {
+			LogWarningf("failed deleting deployment (%s):%s\n", deployment.Name, err.Error())
+		}
+		g.Expect(err).NotTo(HaveOccurred())
+	}, deleteOperationTimeout, retryableOperationSleepBetweenRetries).Should(Succeed())
 	Logf("starting to delete job %s", elbJob.Name)
-	err = jobsClient.Delete(ctx, elbJob.Name, metav1.DeleteOptions{})
-	Expect(err).NotTo(HaveOccurred())
+	Eventually(func(g Gomega) {
+		err := jobsClient.Delete(ctx, elbJob.Name, metav1.DeleteOptions{})
+		if err != nil {
+			LogWarningf("failed deleting job (%s):%s\n", elbJob.Name, err.Error())
+		}
+		g.Expect(err).NotTo(HaveOccurred())
+	}, deleteOperationTimeout, retryableOperationSleepBetweenRetries).Should(Succeed())
 }
 
-func extractServiceIp(svc *corev1.Service) string {
+func extractServiceIP(svc *corev1.Service) string {
 	var ilbIP string
 	for _, i := range svc.Status.LoadBalancer.Ingress {
 		if net.ParseIP(i.IP) != nil {

@@ -17,9 +17,8 @@ limitations under the License.
 package v1beta1
 
 import (
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1"
 )
 
 const (
@@ -33,6 +32,8 @@ const (
 
 // AzureClusterSpec defines the desired state of AzureCluster.
 type AzureClusterSpec struct {
+	AzureClusterClassSpec `json:",inline"`
+
 	// NetworkSpec encapsulates all things related to Azure network.
 	// +optional
 	NetworkSpec NetworkSpec `json:"networkSpec,omitempty"`
@@ -40,45 +41,19 @@ type AzureClusterSpec struct {
 	// +optional
 	ResourceGroup string `json:"resourceGroup,omitempty"`
 
-	// +optional
-	SubscriptionID string `json:"subscriptionID,omitempty"`
-
-	Location string `json:"location"`
-
-	// ControlPlaneEndpoint represents the endpoint used to communicate with the control plane. It is not recommended to set
-	// this when creating an AzureCluster as CAPZ will set this for you. However, if it is set, CAPZ will not change it.
-	// +optional
-	ControlPlaneEndpoint clusterv1.APIEndpoint `json:"controlPlaneEndpoint,omitempty"`
-
-	// AdditionalTags is an optional set of tags to add to Azure resources managed by the Azure provider, in addition to the
-	// ones added by default.
-	// +optional
-	AdditionalTags Tags `json:"additionalTags,omitempty"`
-
-	// IdentityRef is a reference to an AzureIdentity to be used when reconciling this cluster
-	// +optional
-	IdentityRef *corev1.ObjectReference `json:"identityRef,omitempty"`
-
-	// AzureEnvironment is the name of the AzureCloud to be used.
-	// The default value that would be used by most users is "AzurePublicCloud", other values are:
-	// - ChinaCloud: "AzureChinaCloud"
-	// - GermanCloud: "AzureGermanCloud"
-	// - PublicCloud: "AzurePublicCloud"
-	// - USGovernmentCloud: "AzureUSGovernmentCloud"
-	// +optional
-	AzureEnvironment string `json:"azureEnvironment,omitempty"`
-
 	// BastionSpec encapsulates all things related to the Bastions in the cluster.
 	// +optional
 	BastionSpec BastionSpec `json:"bastionSpec,omitempty"`
 
-	// CloudProviderConfigOverrides is an optional set of configuration values that can be overridden in azure cloud provider config.
-	// This is only a subset of options that are available in azure cloud provider config.
-	// Some values for the cloud provider config are inferred from other parts of cluster api provider azure spec, and may not be available for overrides.
-	// See: https://kubernetes-sigs.github.io/cloud-provider-azure/install/configs
-	// Note: All cloud provider config values can be customized by creating the secret beforehand. CloudProviderConfigOverrides is only used when the secret is managed by the Azure Provider.
+	// ControlPlaneEnabled enables control plane components in the cluster.
+	// +kubebuilder:default=true
 	// +optional
-	CloudProviderConfigOverrides *CloudProviderConfigOverrides `json:"cloudProviderConfigOverrides,omitempty"`
+	ControlPlaneEnabled bool `json:"controlPlaneEnabled,omitempty"`
+
+	// ControlPlaneEndpoint represents the endpoint used to communicate with the control plane. It is not recommended to set
+	// this when creating an AzureCluster as CAPZ will set this for you. However, if it is set, CAPZ will not change it.
+	// +optional
+	ControlPlaneEndpoint clusterv1beta1.APIEndpoint `json:"controlPlaneEndpoint,omitempty"`
 }
 
 // AzureClusterStatus defines the observed state of AzureCluster.
@@ -87,10 +62,10 @@ type AzureClusterStatus struct {
 	// A FailureDomain maps to Availability Zone with an Azure Region (if the region support them). An
 	// Availability Zone is a separate data center within a region and they can be used to ensure
 	// the cluster is more resilient to failure.
-	// See: https://docs.microsoft.com/en-us/azure/availability-zones/az-overview
+	// See: https://learn.microsoft.com/azure/reliability/availability-zones-overview
 	// This list will be used by Cluster API to try and spread the machines across the failure domains.
 	// +optional
-	FailureDomains clusterv1.FailureDomains `json:"failureDomains,omitempty"`
+	FailureDomains clusterv1beta1.FailureDomains `json:"failureDomains,omitempty"`
 
 	// Ready is true when the provider resource is ready.
 	// +optional
@@ -98,7 +73,7 @@ type AzureClusterStatus struct {
 
 	// Conditions defines current service state of the AzureCluster.
 	// +optional
-	Conditions clusterv1.Conditions `json:"conditions,omitempty"`
+	Conditions clusterv1beta1.Conditions `json:"conditions,omitempty"`
 
 	// LongRunningOperationStates saves the states for Azure long-running operations so they can be continued on the
 	// next reconciliation loop.
@@ -115,6 +90,7 @@ type AzureClusterStatus struct {
 // +kubebuilder:printcolumn:name="SubscriptionID",type="string",priority=1,JSONPath=".spec.subscriptionID"
 // +kubebuilder:printcolumn:name="Location",type="string",priority=1,JSONPath=".spec.location"
 // +kubebuilder:printcolumn:name="Endpoint",type="string",priority=1,JSONPath=".spec.controlPlaneEndpoint.host",description="Control Plane Endpoint"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp",description="Time duration since creation of this AzureCluster"
 // +kubebuilder:resource:path=azureclusters,scope=Namespaced,categories=cluster-api
 // +kubebuilder:storageversion
 // +kubebuilder:subresource:status
@@ -138,12 +114,12 @@ type AzureClusterList struct {
 }
 
 // GetConditions returns the list of conditions for an AzureCluster API object.
-func (c *AzureCluster) GetConditions() clusterv1.Conditions {
+func (c *AzureCluster) GetConditions() clusterv1beta1.Conditions {
 	return c.Status.Conditions
 }
 
 // SetConditions will set the given conditions on an AzureCluster object.
-func (c *AzureCluster) SetConditions(conditions clusterv1.Conditions) {
+func (c *AzureCluster) SetConditions(conditions clusterv1beta1.Conditions) {
 	c.Status.Conditions = conditions
 }
 
@@ -158,5 +134,5 @@ func (c *AzureCluster) SetFutures(futures Futures) {
 }
 
 func init() {
-	SchemeBuilder.Register(&AzureCluster{}, &AzureClusterList{})
+	objectTypes = append(objectTypes, &AzureCluster{}, &AzureClusterList{})
 }
